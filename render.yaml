@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: amazon-jobs-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: EMAIL_FROM
+        value: YOUR_GMAIL@gmail.com
+      - key: EMAIL_TO
+        value: YOUR_GMAIL@gmail.com
+      - key: EMAIL_PASS
+        value: YOUR_GMAIL_APP_PASSWORD
+      - key: CHECK_EVERY
+        value: 300
