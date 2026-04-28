@@ -3,11 +3,13 @@ import os
 import json
 import logging
 import aiohttp
+import re
 from datetime import datetime, timedelta
+from playwright.async_api import async_playwright
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("CHAT_ID", "1027065157")
+BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
+CHAT_ID          = os.environ.get("CHAT_ID", "1027065157")
 BRIGHT_DATA_USER = os.environ.get("BRIGHT_DATA_USER", "")
 BRIGHT_DATA_PASS = os.environ.get("BRIGHT_DATA_PASS", "")
 
@@ -20,44 +22,6 @@ active_jobs = {}
 bot_paused  = False
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-# ─── AMAZON GRAPHQL ───────────────────────────────────────────────────────────
-AMAZON_URL = "https://www.jobsatamazon.co.uk/graphql"
-
-GRAPHQL_QUERY = """
-query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
-  searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
-    nextToken
-    jobCards {
-      jobId
-      jobTitle
-      jobType
-      employmentType
-      city
-      state
-      postalCode
-      locationName
-      totalPayRateMin
-      totalPayRateMax
-      currencyCode
-      __typename
-    }
-    __typename
-  }
-}
-"""
-
-HEADERS = {
-    "authority":          "www.jobsatamazon.co.uk",
-    "accept":             "*/*",
-    "accept-language":    "en-GB,en;q=0.9",
-    "content-type":       "application/json",
-    "country":            "United Kingdom",
-    "iscanary":           "false",
-    "origin":             "https://www.jobsatamazon.co.uk",
-    "referer":            "https://www.jobsatamazon.co.uk/",
-    "user-agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-}
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
 async def tg_send(text, reply_markup=None):
@@ -73,14 +37,14 @@ async def tg_send(text, reply_markup=None):
 async def tg_alert(job):
     expiry = job.get("expiry")
     mins   = int((expiry - datetime.utcnow()).total_seconds() / 60) if expiry else 120
-    pay    = job.get("pay", "?")
-    
+
     text = f"""🚨 <b>NEW AMAZON JOB — ACT NOW!</b>
 ━━━━━━━━━━━━━━━━━━━━━
 📍 <b>{job.get('location', 'Unknown')}</b>
-💰 <b>£{pay}/hr</b>
+💰 <b>£{job.get('pay', '?')}/hr</b>
 ⏱️ {job.get('contract', '?')}
-🌍 UK Wide Job
+📅 Starts: {job.get('firstDay', 'TBC')}
+🕘 Shift: {job.get('schedule', 'TBC')}
 ⏳ <b>{mins} mins remaining</b>
 ━━━━━━━━━━━━━━━━━━━━━
 ⚡ <b>Tap APPLY NOW instantly!</b>
@@ -97,64 +61,161 @@ async def tg_alert(job):
     }
     await tg_send(text, markup)
 
-# ─── SCRAPER ─────────────────────────────────────────────────────────────────
+# ─── PLAYWRIGHT SCRAPER ───────────────────────────────────────────────────────
 async def fetch_jobs():
-    """Call Amazon's GraphQL API directly"""
+    """Scrape Amazon jobs page using real browser"""
     jobs = []
-    
-    payload = {
-        "operationName": "searchJobCardsByLocation",
-        "query": GRAPHQL_QUERY,
-        "variables": {
-            "searchJobRequest": {
-                "locale": "en-GB",
-                "country": "United Kingdom",
-                "keyWords": "warehouse",
-                "equalFilters": [],
-                "containFilters": [],
-                "pageSize": 100
-            }
-        }
-    }
-
-    proxy      = None
-    proxy_auth = None
-    if BRIGHT_DATA_USER and BRIGHT_DATA_PASS:
-        proxy      = "http://brd.superproxy.io:33335"
-        proxy_auth = aiohttp.BasicAuth(BRIGHT_DATA_USER, BRIGHT_DATA_PASS)
-
     try:
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.post(
-                AMAZON_URL,
-                json=payload,
-                headers=HEADERS,
-                proxy=proxy,
-                proxy_auth=proxy_auth,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
-                if resp.status == 200:
-                    data      = await resp.json()
-                    job_cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
-                    log.info(f"✅ API returned {len(job_cards)} jobs")
-                    for card in job_cards:
-                        job = parse_card(card)
-                        if job:
-                            jobs.append(job)
-                else:
-                    log.warning(f"API status: {resp.status}")
+        proxy = None
+        if BRIGHT_DATA_USER and BRIGHT_DATA_PASS:
+            proxy = {
+                "server":   f"http://brd.superproxy.io:33335",
+                "username": BRIGHT_DATA_USER,
+                "password": BRIGHT_DATA_PASS
+            }
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
+
+            ctx_args = {
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                "locale": "en-GB",
+            }
+            if proxy:
+                ctx_args["proxy"] = proxy
+
+            context = await browser.new_context(**ctx_args)
+            page    = await context.new_page()
+
+            # Intercept GraphQL responses
+            captured_jobs = []
+
+            async def handle_response(response):
+                try:
+                    if "graphql" in response.url and response.status == 200:
+                        data      = await response.json()
+                        job_cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
+                        if job_cards:
+                            log.info(f"✅ Intercepted {len(job_cards)} jobs from GraphQL!")
+                            captured_jobs.extend(job_cards)
+                except:
+                    pass
+
+            page.on("response", handle_response)
+
+            # Visit Amazon jobs search page
+            await page.goto(
+                "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
+                wait_until="networkidle",
+                timeout=30000
+            )
+            await page.wait_for_timeout(5000)
+
+            # Try clicking "Search" or scrolling to trigger more loads
+            try:
+                await page.keyboard.press("End")
+                await page.wait_for_timeout(2000)
+            except:
+                pass
+
+            await browser.close()
+
+            # Parse captured jobs
+            for card in captured_jobs:
+                job = parse_card(card)
+                if job:
+                    jobs.append(job)
+
+            # If no jobs from interception try direct API with session
+            if not jobs:
+                jobs = await fetch_via_api()
+
+            log.info(f"📦 Total jobs found: {len(jobs)}")
+
     except Exception as e:
-        log.error(f"API error: {e}")
+        log.error(f"Scraper error: {e}")
+        jobs = await fetch_via_api()
+
+    return jobs
+
+async def fetch_via_api():
+    """Try Amazon GraphQL API with different search terms"""
+    jobs = []
+    search_terms = ["warehouse operative", "warehouse", "pick pack ship", ""]
+
+    for term in search_terms:
+        try:
+            payload = {
+                "operationName": "searchJobCardsByLocation",
+                "query": """query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+                  searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+                    nextToken
+                    jobCards {
+                      jobId jobTitle jobType employmentType
+                      city state postalCode locationName
+                      totalPayRateMin totalPayRateMax
+                      __typename
+                    }
+                    __typename
+                  }
+                }""",
+                "variables": {
+                    "searchJobRequest": {
+                        "locale": "en-GB",
+                        "country": "United Kingdom",
+                        "keyWords": term,
+                        "equalFilters": [],
+                        "containFilters": [],
+                        "pageSize": 100,
+                        "sortBy": "RELEVANCE",
+                        "descending": True
+                    }
+                }
+            }
+
+            headers = {
+                "accept":         "*/*",
+                "accept-language": "en-GB,en;q=0.9",
+                "content-type":   "application/json",
+                "country":        "United Kingdom",
+                "origin":         "https://www.jobsatamazon.co.uk",
+                "referer":        "https://www.jobsatamazon.co.uk/",
+                "user-agent":     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://www.jobsatamazon.co.uk/graphql",
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    ssl=False
+                ) as resp:
+                    if resp.status == 200:
+                        data      = await resp.json()
+                        job_cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
+                        log.info(f"API '{term}': {len(job_cards)} jobs")
+                        for card in job_cards:
+                            job = parse_card(card)
+                            if job and job["id"] not in [j["id"] for j in jobs]:
+                                jobs.append(job)
+                        if jobs:
+                            break
+        except Exception as e:
+            log.warning(f"API error for '{term}': {e}")
+            continue
 
     return jobs
 
 def parse_card(card):
     try:
-        job_id   = str(card.get("jobId", ""))
+        job_id = str(card.get("jobId", ""))
         if not job_id:
             return None
-        title    = card.get("jobTitle", "Warehouse Job")
+
         city     = card.get("city", card.get("locationName", "Unknown"))
         postcode = card.get("postalCode", "")
         pay      = float(card.get("totalPayRateMax") or card.get("totalPayRateMin") or 0)
@@ -164,10 +225,11 @@ def parse_card(card):
 
         return {
             "id":       job_id,
-            "title":    title,
             "location": location,
             "pay":      round(pay, 2),
             "contract": contract,
+            "firstDay": "TBC",
+            "schedule": "TBC",
             "link":     link,
             "found_at": datetime.utcnow().isoformat(),
             "expiry":   datetime.utcnow() + timedelta(hours=2)
@@ -183,13 +245,18 @@ async def check_jobs():
         return
 
     jobs = await fetch_jobs()
+    new_count = 0
     for job in jobs:
         jid = job["id"]
         if jid not in known_jobs:
             known_jobs[jid] = job
             active_jobs[jid] = job["expiry"]
+            new_count += 1
             log.info(f"🆕 NEW: {job['location']} £{job['pay']}/hr")
             await tg_alert(job)
+
+    if new_count == 0:
+        log.info(f"✅ No new jobs — tracking {len(known_jobs)} total")
 
 async def check_reminders():
     now = datetime.utcnow()
@@ -239,12 +306,12 @@ async def process_update(update):
     if text == "/start":
         await tg_send("""🚀 <b>Amazon Shift Holder SUPERBOT!</b>
 ━━━━━━━━━━━━━━━━━━━━━
-⚡ Using Amazon's own API
-🌍 Watching ALL UK jobs
+⚡ Real browser scraping
+🌍 ALL UK warehouse jobs
 🚨 Every alert = URGENT
-🔄 Checking every 1 SECOND
+🔄 Checking every 30 seconds
 ━━━━━━━━━━━━━━━━━━━━━
-Bot is running! Send /status to check!""")
+Send /test to verify!""")
 
     elif text == "/status":
         status = "⏸️ PAUSED" if bot_paused else "✅ RUNNING"
@@ -252,16 +319,15 @@ Bot is running! Send /status to check!""")
 ━━━━━━━━━━━━━━━━━━━
 Status: {status}
 Watching: ALL UK jobs 🌍
-Speed: Every 1 SECOND ⚡🔥
 Jobs found: {len(known_jobs)}
 Active: {len(active_jobs)}
 ━━━━━━━━━━━━━━━━━━━""")
 
     elif text == "/jobs":
         if not active_jobs:
-            await tg_send("📭 No active jobs right now. Bot is watching... 👀")
+            await tg_send("📭 No active jobs right now. Bot watching... 👀")
         else:
-            txt = f"📋 <b>{len(active_jobs)} Active Jobs:</b>\n━━━━━━━━━━━\n"
+            txt = f"📋 <b>{len(active_jobs)} Active Jobs:</b>\n"
             for jid in active_jobs:
                 job  = known_jobs.get(jid, {})
                 mins = int((active_jobs[jid] - datetime.utcnow()).total_seconds() / 60)
@@ -274,57 +340,49 @@ Active: {len(active_jobs)}
 
     elif text == "/resume":
         bot_paused = False
-        await tg_send("▶️ Bot resumed! Watching every 1 second! ⚡🔥")
+        await tg_send("▶️ Bot resumed! 🔥")
 
     elif text == "/test":
-        await tg_send("""🧪 <b>Test Alert — Bot Is Working!</b>
-━━━━━━━━━━━━━━━━━━━━━
-🚨 NEW AMAZON JOB — ACT NOW!
-━━━━━━━━━━━━━━━━━━━━━
-📍 Birmingham B26 3QJ
-💰 £15.30/hr
-⏱️ Full Time
-🌍 UK Wide Job
-⏳ 120 mins remaining
-━━━━━━━━━━━━━━━━━━━━━
-✅ Bot is working perfectly! 🔥""")
+        await tg_alert({
+            "id": "TEST001",
+            "location": "Test Location UK",
+            "pay": 15.30,
+            "contract": "Full Time",
+            "firstDay": "2026-05-08",
+            "schedule": "Mon-Fri 9:00-17:00",
+            "link": "https://www.jobsatamazon.co.uk",
+            "expiry": datetime.utcnow() + timedelta(hours=2)
+        })
+        await tg_send("✅ <b>Test complete — Bot is working!</b>")
 
     elif text == "/help":
-        await tg_send("""🤖 <b>Amazon Superbot Commands</b>
-━━━━━━━━━━━━━━━━━━━━━
-/start   — Welcome message
-/status  — Bot status
-/jobs    — Active jobs
-/test    — Test notification
-/pause   — Pause alerts
-/resume  — Resume alerts
-/help    — This message
-━━━━━━━━━━━━━━━━━━━━━
-⚡ Speed: Every 1 SECOND
-🌍 Coverage: ALL UK jobs
-🚨 All alerts URGENT""")
+        await tg_send("""🤖 <b>Commands</b>
+/start   /status  /jobs
+/test    /pause   /resume  /help""")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("🚀 Amazon SUPERBOT Starting — 1 second checks!")
+    log.info("🚀 Amazon SUPERBOT Starting!")
     asyncio.create_task(handle_updates())
-    
-    await asyncio.sleep(2)
-    await tg_send("""🚀 <b>Amazon Shift Holder SUPERBOT ONLINE!</b>
-━━━━━━━━━━━━━━━━━━━━━
-⚡ Using Amazon's own GraphQL API
-🌍 Watching ALL UK warehouse jobs
-🚨 Every job = URGENT alert
-🔄 Checking every 1 SECOND 🔥
-━━━━━━━━━━━━━━━━━━━━━
-Send /test to verify it's working!
-Send /help for all commands!""")
 
+    await asyncio.sleep(2)
+    await tg_send("""🚀 <b>Amazon SUPERBOT ONLINE!</b>
+━━━━━━━━━━━━━━━━━━━━━
+⚡ Real browser scraping
+🌍 ALL UK warehouse jobs
+🚨 Instant alerts
+━━━━━━━━━━━━━━━━━━━━━
+Send /test to verify!""")
+
+    # First run immediately
+    await check_jobs()
+
+    # Then check every 30 seconds
+    # (Playwright browser takes ~10-15 secs per check)
     while True:
-        await check_jobs()
         await check_reminders()
-        log.info("⚡ 1s check done")
-        await asyncio.sleep(1)
+        await asyncio.sleep(30)
+        await check_jobs()
 
 if __name__ == "__main__":
     asyncio.run(main())
