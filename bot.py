@@ -10,177 +10,166 @@ from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-BOT_TOKEN       = os.environ.get("BOT_TOKEN", "8713464696:AAG9F4SudtujRHaBePItPBuZq3dEYxV648E")
-CHAT_ID         = os.environ.get("CHAT_ID", "1027065157")
+BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
+CHAT_ID          = os.environ.get("CHAT_ID", "1027065157")
 BRIGHT_DATA_USER = os.environ.get("BRIGHT_DATA_USER", "")
 BRIGHT_DATA_PASS = os.environ.get("BRIGHT_DATA_PASS", "")
-BRIGHT_DATA_HOST = "brd.superproxy.io:22225"
-CAPTCHA_KEY     = os.environ.get("CAPTCHA_KEY", "")
+BRIGHT_DATA_HOST = "brd.superproxy.io:33335"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
-known_jobs      = {}   # job_id -> job dict
-active_jobs     = {}   # job_id -> expiry datetime
-bot_paused      = False
-awaiting_location = False  # True when bot is waiting for user to type location
+known_jobs   = {}
+active_jobs  = {}
+bot_paused   = False
+awaiting_location = False
+awaiting_loc_num  = 0  # which location slot we're filling
 
-# User location (saved after /start setup)
-user_location = {
-    "city": os.environ.get("USER_CITY", ""),
-    "lat": float(os.environ.get("USER_LAT", 0)),
-    "lng": float(os.environ.get("USER_LNG", 0)),
+# Three location priorities
+user_locations = {
+    1: {"city": "", "lat": 0.0, "lng": 0.0},
+    2: {"city": "", "lat": 0.0, "lng": 0.0},
+    3: {"city": "", "lat": 0.0, "lng": 0.0},
 }
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
 async def tg_send(text, reply_markup=None):
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
-    async with aiohttp.ClientSession() as s:
-        await s.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
 
 async def tg_alert(job, status="new"):
-    """Send job alert with urgency based on distance"""
-    dist    = job.get("distance_miles", 999)
-    score   = job.get("score", 0)
-    expiry  = job.get("expiry")
-    mins    = int((expiry - datetime.utcnow()).total_seconds() / 60) if expiry else 120
+    loc_num  = job.get("loc_priority", 0)
+    dist     = job.get("distance_miles", 999)
+    score    = job.get("score", 0)
+    expiry   = job.get("expiry")
+    mins     = int((expiry - datetime.utcnow()).total_seconds() / 60) if expiry else 120
+    city_name = user_locations.get(loc_num, {}).get("city", "your area") if loc_num else "UK"
 
-    # Distance emoji
-    if dist < 30:
-        dist_emoji = "🔴"
-        urgency    = "URGENT — NEARBY JOB!"
-    elif dist < 80:
-        dist_emoji = "🟡"
-        urgency    = "NEW JOB ALERT!"
+    if loc_num == 1:
+        urgency = "🔴 1ST CHOICE — URGENT!"
+    elif loc_num == 2:
+        urgency = "🟡 2ND CHOICE — ACT FAST!"
+    elif loc_num == 3:
+        urgency = "🟢 3RD CHOICE — AVAILABLE!"
     else:
-        dist_emoji = "🟢"
-        urgency    = "JOB AVAILABLE"
+        urgency = "📋 NEW JOB FOUND!"
 
-    # Status header
-    if status == "new":
-        header = f"🚨 <b>{urgency}</b>"
-    elif status == "reminder":
-        header = f"⚠️ <b>REMINDER — {mins} mins left!</b>"
+    if status == "reminder":
+        urgency = f"⚠️ REMINDER — {mins} mins left!"
     elif status == "final":
-        header = f"🔴 <b>FINAL WARNING — {mins} mins left!</b>"
+        urgency = f"🚨 FINAL WARNING — {mins} mins left!"
     elif status == "submitted":
-        header = "✅ <b>SHIFT SUBMITTED SUCCESSFULLY!</b>"
-    else:
-        header = f"📋 <b>JOB UPDATE</b>"
+        urgency = "✅ APPLICATION SUBMITTED!"
 
-    text = f"""{header}
+    text = f"""🚨 <b>{urgency}</b>
 ━━━━━━━━━━━━━━━━━━━━━
-📍 <b>{job.get('location', 'Unknown')}</b> · {job.get('postcode', '')}
+📍 <b>{job.get('location', 'Unknown')}</b>
 💰 <b>£{job.get('pay', '?')}/hr</b>
 ⏱️ {job.get('contract', '?')} · {job.get('hours', '?')}hrs/week
 📅 Starts: {job.get('firstDay', 'TBC')}
 🕘 Shift: {job.get('schedule', 'TBC')}
 ⭐ Score: <b>{score}/100</b>
-{dist_emoji} Distance: <b>{dist} miles from {user_location['city']}</b>
+📏 <b>{dist} miles</b> from {city_name}
 ⏳ <b>{mins} mins remaining</b>
+━━━━━━━━━━━━━━━━━━━━━
+⚡ <b>Bot navigating application...</b>
 ━━━━━━━━━━━━━━━━━━━━━"""
 
-    if status == "submitted":
-        text += f"\n🎉 <b>Application sent automatically!</b>\n━━━━━━━━━━━━━━━━━━━━━"
-        markup = {
-            "inline_keyboard": [[
-                {"text": "📋 View Application", "url": job.get("link", "https://www.jobsatamazon.co.uk")}
-            ]]
-        }
-    else:
-        text += f"\n⚡ <b>Bot is processing application...</b>\n━━━━━━━━━━━━━━━━━━━━━"
-        markup = {
-            "inline_keyboard": [
-                [{"text": "🔗 View Job", "url": job.get("link", "https://www.jobsatamazon.co.uk")}],
-                [
-                    {"text": "✅ Applied", "callback_data": f"applied_{job['id']}"},
-                    {"text": "⏭️ Skip", "callback_data": f"skip_{job['id']}"}
-                ]
+    markup = {
+        "inline_keyboard": [
+            [{"text": "🚀 OPEN APPLICATION", "url": job.get("link", "https://www.jobsatamazon.co.uk")}],
+            [
+                {"text": "✅ APPLIED", "callback_data": f"applied_{job['id']}"},
+                {"text": "⏭️ SKIP",    "callback_data": f"skip_{job['id']}"}
             ]
-        }
-
+        ]
+    }
     await tg_send(text, markup)
 
 # ─── LOCATION SETUP ──────────────────────────────────────────────────────────
-async def ask_for_location():
-    """Ask user to enter their location"""
-    global awaiting_location
+async def ask_location(slot_num):
+    global awaiting_location, awaiting_loc_num
     awaiting_location = True
-    await tg_send("""🤖 <b>Welcome to Amazon Shift Holder!</b>
-━━━━━━━━━━━━━━━━━━━━━
-I watch <b>jobsatamazon.co.uk</b> 24/7
-and apply for shifts automatically!
+    awaiting_loc_num  = slot_num
+    slot_names = {1: "1ST CHOICE 🔴", 2: "2ND CHOICE 🟡", 3: "3RD CHOICE 🟢"}
+    await tg_send(f"""📍 <b>Enter your {slot_names[slot_num]} location:</b>
 
-📍 <b>First — what is your city or postcode?</b>
-
-Examples:
+Type a UK city or postcode:
 • Birmingham
+• Coventry  
 • B1 1BB
-• Coventry
-• Manchester
-━━━━━━━━━━━━━━━━━━━━━
-<i>Type your city or postcode now:</i>""")
+• Leicester""")
 
-async def save_location(city_or_postcode):
-    """Geocode user input and save coordinates"""
-    global user_location, awaiting_location
+async def save_location(slot_num, city_input):
+    global awaiting_location, awaiting_loc_num
     try:
         geolocator = Nominatim(user_agent="amazon-shift-holder")
-        location   = geolocator.geocode(f"{city_or_postcode}, UK")
-
+        location   = geolocator.geocode(f"{city_input}, UK")
         if location:
-            user_location = {
-                "city": city_or_postcode.title(),
+            user_locations[slot_num] = {
+                "city": city_input.title(),
                 "lat":  location.latitude,
                 "lng":  location.longitude
             }
             awaiting_location = False
-            log.info(f"Location set: {user_location}")
 
-            await tg_send(f"""✅ <b>Location set to {user_location['city']}!</b>
-━━━━━━━━━━━━━━━━━━━━━
-🔴 Under 30 miles = URGENT alert
-🟡 30-80 miles = NORMAL alert
-🟢 Over 80 miles = QUIET alert
-━━━━━━━━━━━━━━━━━━━━━
-🚀 <b>Bot is now LIVE!</b>
-Watching Amazon jobs near <b>{user_location['city']}</b>
-
-Send /help for all commands""")
+            # Check if we need more locations
+            if slot_num < 3:
+                filled = sum(1 for l in user_locations.values() if l["city"])
+                await tg_send(f"✅ <b>{city_input.title()}</b> saved as choice {slot_num}!")
+                await ask_location(slot_num + 1)
+            else:
+                awaiting_location = False
+                locs = "\n".join([
+                    f"{'🔴' if i==1 else '🟡' if i==2 else '🟢'} Choice {i}: <b>{user_locations[i]['city']}</b>"
+                    for i in range(1,4) if user_locations[i]['city']
+                ])
+                await tg_send(f"""✅ <b>All locations saved!</b>
+━━━━━━━━━━━━━━━━━━━
+{locs}
+━━━━━━━━━━━━━━━━━━━
+🚀 <b>Bot is now watching ALL UK jobs!</b>
+Alerting for your 3 priority areas!""")
         else:
-            await tg_send(f"""❌ Couldn't find <b>{city_or_postcode}</b>
-
-Please try again with:
-• A UK city name (e.g. Birmingham)
-• A postcode (e.g. B1 1BB)""")
+            await tg_send(f"❌ Couldn't find <b>{city_input}</b>. Please try again!")
     except Exception as e:
         log.error(f"Geocode error: {e}")
-        # Fallback - use typed city name without coordinates
-        user_location = {"city": city_or_postcode.title(), "lat": 52.4862, "lng": -1.8904}
+        user_locations[slot_num] = {"city": city_input.title(), "lat": 52.4862, "lng": -1.8904}
         awaiting_location = False
-        await tg_send(f"""✅ <b>Location set to {user_location['city']}!</b>
-🚀 Bot is now watching for jobs!""")
+        await tg_send(f"✅ <b>{city_input.title()}</b> saved!")
+        if slot_num < 3:
+            await ask_location(slot_num + 1)
 
-# ─── DISTANCE CALC ───────────────────────────────────────────────────────────
-def calc_distance(job_lat, job_lng):
-    """Calculate distance in miles from user location"""
-    try:
-        if not user_location["lat"] or not user_location["lng"]:
-            return 999
-        user_coords = (user_location["lat"], user_location["lng"])
-        job_coords  = (job_lat, job_lng)
-        return round(geodesic(user_coords, job_coords).miles, 1)
-    except:
-        return 999
+# ─── DISTANCE & PRIORITY ─────────────────────────────────────────────────────
+def get_location_priority(job_lat, job_lng):
+    """Returns (priority_number, distance_miles) for closest user location"""
+    best_priority = 0
+    best_distance = 9999
+    job_coords = (job_lat, job_lng)
+
+    for num in range(1, 4):
+        loc = user_locations[num]
+        if not loc["city"]:
+            continue
+        try:
+            user_coords = (loc["lat"], loc["lng"])
+            dist = round(geodesic(user_coords, job_coords).miles, 1)
+            if dist < best_distance:
+                best_distance = dist
+                best_priority = num
+        except:
+            continue
+
+    return best_priority, best_distance
 
 # ─── JOB SCORING ─────────────────────────────────────────────────────────────
 def score_job(job):
@@ -190,24 +179,19 @@ def score_job(job):
     contract = job.get("contract", "").lower()
     distance = job.get("distance_miles", 999)
 
-    # Pay (40pts)
     if pay >= 15.30:   score += 40
     elif pay >= 14.30: score += 30
     elif pay >= 13.00: score += 20
     else:              score += 10
 
-    # Hours (25pts)
     if hours >= 40:   score += 25
     elif hours >= 30: score += 18
     elif hours >= 20: score += 10
-    else:             score += 5
 
-    # Contract (20pts)
     if "full" in contract:    score += 20
     elif "reduced" in contract: score += 12
     elif "part" in contract:  score += 8
 
-    # Distance (15pts)
     if distance < 20:    score += 15
     elif distance < 50:  score += 10
     elif distance < 100: score += 5
@@ -216,8 +200,10 @@ def score_job(job):
     return min(score, 100)
 
 # ─── SCRAPER ─────────────────────────────────────────────────────────────────
+AMAZON_SEARCH_URL = "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&category=warehouse&jobType=all"
+
 async def scrape_jobs():
-    """Scrape Amazon UK jobs"""
+    jobs = []
     try:
         proxy = None
         if BRIGHT_DATA_USER and BRIGHT_DATA_PASS:
@@ -233,7 +219,8 @@ async def scrape_jobs():
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
             )
             ctx_args = {
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "viewport": {"width": 1280, "height": 800}
             }
             if proxy:
                 ctx_args["proxy"] = proxy
@@ -241,50 +228,62 @@ async def scrape_jobs():
             context = await browser.new_context(**ctx_args)
             page    = await context.new_page()
 
-            # Intercept API responses
-            api_data = []
+            # Intercept API calls
+            api_jobs = []
             async def handle_response(response):
-                if "job" in response.url.lower() and response.status == 200:
-                    try:
+                try:
+                    if response.status == 200 and any(x in response.url for x in ["job", "search", "posting"]):
                         ct = response.headers.get("content-type", "")
                         if "json" in ct:
                             data = await response.json()
-                            api_data.append(data)
-                    except:
-                        pass
+                            parsed = parse_api_response(data)
+                            api_jobs.extend(parsed)
+                except:
+                    pass
             page.on("response", handle_response)
 
-            await page.goto(
-                "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
-                wait_until="networkidle",
-                timeout=30000
-            )
-            await page.wait_for_timeout(4000)
+            await page.goto(AMAZON_SEARCH_URL, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(5000)
+
+            if api_jobs:
+                jobs = api_jobs
+            else:
+                jobs = await fallback_scrape()
+
             await browser.close()
-
-            # Parse intercepted API data
-            jobs = []
-            for data in api_data:
-                parsed = parse_api_response(data)
-                jobs.extend(parsed)
-
-            if not jobs:
-                jobs = await fallback_api_scrape()
-
-            return jobs
-
     except Exception as e:
         log.error(f"Scrape error: {e}")
-        return await fallback_api_scrape()
+        jobs = await fallback_scrape()
 
-async def fallback_api_scrape():
+    # Filter ONLY Warehouse Operative
+    warehouse_jobs = [j for j in jobs if is_warehouse_operative(j)]
+    log.info(f"Found {len(jobs)} total jobs, {len(warehouse_jobs)} Warehouse Operative")
+    return warehouse_jobs
+
+def is_warehouse_operative(job):
+    """Only return true for Warehouse Operative roles"""
+    title = job.get("title", "").lower()
+    role  = job.get("role", "").lower()
+    combined = title + " " + role
+    
+    # Must contain warehouse operative
+    if "warehouse operative" in combined:
+        return True
+    if "warehouse" in combined and "operative" in combined:
+        return True
+    return False
+
+async def fallback_scrape():
     """Direct API fallback"""
     jobs = []
     urls = [
-        "https://hiring.amazon.co.uk/api/v1/search?country=GBR&locale=en-GB&pageSize=100",
+        "https://hiring.amazon.co.uk/api/v1/search?country=GBR&locale=en-GB&pageSize=100&jobType=warehouse",
         "https://www.jobsatamazon.co.uk/api/jobs?country=GB&pageSize=100",
     ]
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+        "Accept": "application/json"
+    }
     async with aiohttp.ClientSession() as session:
         for url in urls:
             try:
@@ -299,49 +298,63 @@ async def fallback_api_scrape():
     return jobs
 
 def parse_api_response(data):
-    """Parse API response into job format"""
-    jobs     = []
+    jobs = []
     raw_jobs = []
 
     if isinstance(data, list):
         raw_jobs = data
     elif isinstance(data, dict):
-        for key in ["jobs", "data", "results", "jobPostings", "hits"]:
+        for key in ["jobs", "data", "results", "jobPostings", "hits", "items"]:
             if key in data:
                 raw_jobs = data[key]
                 break
 
     for raw in raw_jobs:
         try:
-            job_id   = str(raw.get("jobId", raw.get("id", raw.get("requisitionId", ""))))
+            # Handle multiple ID formats
+            job_id = str(
+                raw.get("jobId") or
+                raw.get("id") or
+                raw.get("requisitionId") or
+                raw.get("jobReqId") or
+                raw.get("externalJobId") or
+                ""
+            )
             if not job_id:
                 continue
 
-            location = raw.get("city", raw.get("locationName", "Unknown"))
-            postcode = raw.get("postalCode", raw.get("zipCode", ""))
-            pay      = float(raw.get("salaryMax", raw.get("maximumPayRate", 14.30)))
-            contract = raw.get("employmentType", raw.get("scheduleType", "Full-time"))
-            hours    = int(raw.get("hoursPerWeek", raw.get("weeklyHours", 40)))
-            first_day = raw.get("firstDayOnSite", raw.get("startDate", "TBC"))
-            schedule = raw.get("shiftCode", raw.get("schedule", ""))
-            lat      = float(raw.get("latitude", 52.4862))
-            lng      = float(raw.get("longitude", -1.8904))
-            distance = calc_distance(lat, lng)
-            link     = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}&locale=en-GB&recommended=1&intcmpid=searchalljobsleft"
+            title    = raw.get("title", raw.get("jobTitle", raw.get("positionTitle", "Warehouse Operative")))
+            location = raw.get("city", raw.get("locationName", raw.get("location", {}).get("city", "Unknown")))
+            postcode = raw.get("postalCode", raw.get("zipCode", raw.get("location", {}).get("postalCode", "")))
+            pay      = float(raw.get("salaryMax", raw.get("maximumPayRate", raw.get("payRateMax", 14.30))))
+            contract = raw.get("employmentType", raw.get("scheduleType", raw.get("jobType", "Full-time")))
+            hours    = int(raw.get("hoursPerWeek", raw.get("weeklyHours", raw.get("hoursPerWeek", 40))))
+            first_day = raw.get("firstDayOnSite", raw.get("startDate", raw.get("targetHireDate", "TBC")))
+            schedule = raw.get("shiftCode", raw.get("schedule", raw.get("shiftDescription", "")))
+            lat      = float(raw.get("latitude", raw.get("lat", raw.get("location", {}).get("latitude", 52.4862))))
+            lng      = float(raw.get("longitude", raw.get("lng", raw.get("location", {}).get("longitude", -1.8904))))
+
+            # Build proper link
+            link = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}&locale=en-GB&recommended=1&intcmpid=searchalljobsleft"
+
+            # Get priority based on user locations
+            priority, distance = get_location_priority(lat, lng)
 
             job = {
-                "id":             job_id,
-                "location":       location,
-                "postcode":       postcode,
-                "pay":            pay,
-                "contract":       contract,
-                "hours":          hours,
-                "firstDay":       first_day,
-                "schedule":       schedule,
+                "id":           job_id,
+                "title":        title,
+                "role":         title,
+                "location":     f"{location} {postcode}".strip(),
+                "pay":          pay,
+                "contract":     contract,
+                "hours":        hours,
+                "firstDay":     first_day,
+                "schedule":     schedule,
                 "distance_miles": distance,
-                "link":           link,
-                "found_at":       datetime.utcnow().isoformat(),
-                "expiry":         datetime.utcnow() + timedelta(hours=2)
+                "loc_priority": priority,
+                "link":         link,
+                "found_at":     datetime.utcnow().isoformat(),
+                "expiry":       datetime.utcnow() + timedelta(hours=2)
             }
             job["score"] = score_job(job)
             jobs.append(job)
@@ -353,7 +366,6 @@ def parse_api_response(data):
 
 # ─── AUTOMATION ──────────────────────────────────────────────────────────────
 async def automate_application(job):
-    """Navigate Amazon application and auto-submit"""
     log.info(f"🤖 Automating: {job['location']} £{job['pay']}/hr")
     try:
         async with async_playwright() as p:
@@ -365,60 +377,77 @@ async def automate_application(job):
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page = await context.new_page()
-
-            # Go to job page
             await page.goto(job["link"], wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(2000)
 
-            # Step 1 — Click Apply
-            for selector in ["button:has-text('Apply')", "a:has-text('Apply')", "[data-test='apply-button']", ".apply-button"]:
-                btn = await page.query_selector(selector)
-                if btn:
-                    await btn.click()
-                    log.info("✅ Clicked Apply")
-                    await page.wait_for_timeout(2000)
-                    break
+            # Click Apply
+            for sel in ["button:has-text('Apply')", "a:has-text('Apply')", ".apply-button", "[data-test='apply-button']"]:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click()
+                        log.info("✅ Clicked Apply")
+                        await page.wait_for_timeout(2000)
+                        break
+                except: pass
 
-            # Step 2 — Click Next
-            for selector in ["button:has-text('Next')", "[data-test='next-button']", ".next-button"]:
-                btn = await page.query_selector(selector)
-                if btn:
-                    await btn.click()
-                    log.info("✅ Clicked Next")
-                    await page.wait_for_timeout(2000)
-                    break
+            # Click Next
+            for sel in ["button:has-text('Next')", "[data-test='next-button']"]:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click()
+                        log.info("✅ Clicked Next")
+                        await page.wait_for_timeout(2000)
+                        break
+                except: pass
 
-            # Step 3 — Click Start Application
-            for selector in ["button:has-text('Start Application')", "[data-test='start-application']"]:
-                btn = await page.query_selector(selector)
-                if btn:
-                    await btn.click()
-                    log.info("✅ Clicked Start Application")
-                    await page.wait_for_timeout(2000)
-                    break
+            # Click Start Application
+            for sel in ["button:has-text('Start Application')", "[data-test='start-application']"]:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click()
+                        log.info("✅ Clicked Start Application")
+                        await page.wait_for_timeout(2000)
+                        break
+                except: pass
 
-            # Notify user — bot has reached application
-            await tg_alert(job, "submitted")
-            log.info(f"✅ Application processed: {job['location']}")
+            current_url = page.url
+            log.info(f"✅ Reached: {current_url}")
+
+            # Notify user
+            await tg_send(f"""✅ <b>Application Ready!</b>
+━━━━━━━━━━━━━━━━━━━
+📍 {job['location']}
+💰 £{job['pay']}/hr
+━━━━━━━━━━━━━━━━━━━
+👆 <b>YOUR TURN — Fill details & SUBMIT!</b>
+⏳ {int((job['expiry'] - datetime.utcnow()).total_seconds() / 60)} mins remaining""",
+            {"inline_keyboard": [[
+                {"text": "🚀 OPEN & SUBMIT", "url": job["link"]}
+            ]]})
+
             await browser.close()
-
     except Exception as e:
         log.error(f"Automation error: {e}")
-        await tg_send(f"""⚠️ <b>Bot needs your help!</b>
-Job in <b>{job.get('location')}</b> found but 
-automation hit an issue.
-Please apply manually:
-<a href="{job.get('link')}">Tap here to apply</a>""")
+        await tg_send(f"""⚠️ <b>Apply manually!</b>
+📍 {job.get('location')}
+💰 £{job.get('pay')}/hr
+<a href="{job.get('link')}">TAP TO APPLY →</a>""")
 
 # ─── MAIN CHECK LOOP ─────────────────────────────────────────────────────────
 async def check_for_new_jobs():
     global known_jobs, active_jobs
     if bot_paused:
         return
-    if not user_location["city"]:
-        return  # Don't check until location is set
 
-    log.info(f"🔍 Checking Amazon jobs near {user_location['city']}...")
+    # Need at least one location set
+    has_location = any(l["city"] for l in user_locations.values())
+    if not has_location:
+        return
+
+    log.info("🔍 Checking Amazon Warehouse Operative jobs...")
     jobs = await scrape_jobs()
 
     for job in jobs:
@@ -426,52 +455,27 @@ async def check_for_new_jobs():
         if jid not in known_jobs:
             known_jobs[jid] = job
             active_jobs[jid] = job["expiry"]
-            log.info(f"🆕 {job['location']} £{job['pay']}/hr {job['distance_miles']}mi Score:{job['score']}")
-
-            # Alert user
+            log.info(f"🆕 {job['title']} | {job['location']} | £{job['pay']}/hr | Priority:{job['loc_priority']} | {job['distance_miles']}mi")
             await tg_alert(job, "new")
-
-            # Start automation
             asyncio.create_task(automate_application(job))
 
 async def check_reminders():
-    """Send reminders for jobs in 2hr window"""
     now = datetime.utcnow()
     for jid, expiry in list(active_jobs.items()):
-        job      = known_jobs.get(jid)
-        if not job:
-            continue
-        mins_left = int((expiry - now).total_seconds() / 60)
-
-        if 58 <= mins_left <= 62:
-            await tg_alert(job, "reminder")
-        elif 28 <= mins_left <= 32:
-            await tg_alert(job, "final")
-        elif mins_left <= 0:
-            del active_jobs[jid]
-
-# ─── SMART TIMING ────────────────────────────────────────────────────────────
-def get_check_interval():
-    """Faster checks during Amazon peak posting hours"""
-    uk_time = datetime.now(pytz.timezone("Europe/London"))
-    hour    = uk_time.hour
-    if 22 <= hour <= 23 or hour == 0:
-        return 10   # 🔥 Peak hours — every 10 seconds!
-    elif 18 <= hour < 22:
-        return 30   # Evening — every 30 seconds
-    else:
-        return 60   # Off-peak — every 60 seconds
+        job = known_jobs.get(jid)
+        if not job: continue
+        mins = int((expiry - now).total_seconds() / 60)
+        if 58 <= mins <= 62:   await tg_alert(job, "reminder")
+        elif 28 <= mins <= 32: await tg_alert(job, "final")
+        elif mins <= 0:        del active_jobs[jid]
 
 # ─── TELEGRAM COMMANDS ───────────────────────────────────────────────────────
 async def handle_updates():
-    """Poll Telegram for messages & button taps"""
     offset = 0
     while True:
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"{TELEGRAM_API}/getUpdates?offset={offset}&timeout=10"
-                ) as r:
+                async with s.get(f"{TELEGRAM_API}/getUpdates?offset={offset}&timeout=10") as r:
                     data = await r.json()
                     for update in data.get("result", []):
                         offset = update["update_id"] + 1
@@ -481,61 +485,71 @@ async def handle_updates():
         await asyncio.sleep(2)
 
 async def process_update(update):
-    global bot_paused, awaiting_location
+    global bot_paused, awaiting_location, awaiting_loc_num
 
-    # Handle button taps
     if "callback_query" in update:
         cb   = update["callback_query"]
         data = cb.get("data", "")
         if data.startswith("applied_"):
             jid = data.replace("applied_", "")
-            if jid in active_jobs:
-                del active_jobs[jid]
-            await tg_send("✅ Marked as applied! Good luck Yonas! 💪🔥")
+            if jid in active_jobs: del active_jobs[jid]
+            await tg_send("✅ Applied! Good luck Yonas! 💪🔥")
         elif data.startswith("skip_"):
             jid = data.replace("skip_", "")
-            if jid in active_jobs:
-                del active_jobs[jid]
-            await tg_send("⏭️ Skipped. Watching for next job... 👀")
+            if jid in active_jobs: del active_jobs[jid]
+            await tg_send("⏭️ Skipped. Watching for next one... 👀")
         return
 
-    # Handle text messages
     msg  = update.get("message", {})
     text = msg.get("text", "").strip()
 
-    # If waiting for location input
+    # Handle location input
     if awaiting_location and text and not text.startswith("/"):
-        await save_location(text)
+        await save_location(awaiting_loc_num, text)
         return
 
     cmd = text.lower()
 
     if cmd == "/start":
-        await ask_for_location()
+        await tg_send("""🤖 <b>Welcome to Amazon Shift Holder!</b>
+━━━━━━━━━━━━━━━━━━━━━
+I watch <b>jobsatamazon.co.uk</b> 24/7
+for <b>Warehouse Operative</b> jobs only!
 
-    elif cmd == "/location":
-        if user_location["city"]:
-            await tg_send(f"""📍 <b>Your Location</b>
-━━━━━━━━━━━━━━━
-City: <b>{user_location['city']}</b>
-━━━━━━━━━━━━━━━
-To change: /changelocation""")
-        else:
-            await ask_for_location()
+Let's set up your 3 priority locations!
+━━━━━━━━━━━━━━━━━━━━━""")
+        await ask_location(1)
 
-    elif cmd == "/changelocation":
-        await ask_for_location()
+    elif cmd == "/locations":
+        locs = ""
+        for i in range(1, 4):
+            loc = user_locations[i]
+            emoji = "🔴" if i==1 else "🟡" if i==2 else "🟢"
+            city = loc["city"] if loc["city"] else "Not set"
+            locs += f"{emoji} Choice {i}: <b>{city}</b>\n"
+        await tg_send(f"""📍 <b>Your Location Priorities</b>
+━━━━━━━━━━━━━━━
+{locs}━━━━━━━━━━━━━━━
+Use /change1, /change2, /change3 to update""")
+
+    elif cmd == "/change1":
+        await ask_location(1)
+    elif cmd == "/change2":
+        await ask_location(2)
+    elif cmd == "/change3":
+        await ask_location(3)
 
     elif cmd == "/status":
         status = "⏸️ PAUSED" if bot_paused else "✅ RUNNING"
-        loc    = user_location['city'] or "Not set"
+        locs = " | ".join([user_locations[i]["city"] for i in range(1,4) if user_locations[i]["city"]]) or "Not set"
         await tg_send(f"""📊 <b>Bot Status</b>
 ━━━━━━━━━━━━━━━━━━━
 Status: {status}
-Location: 📍 {loc}
-Jobs tracked: {len(known_jobs)}
-Active windows: {len(active_jobs)}
-Check interval: {get_check_interval()} seconds
+Watching: Warehouse Operative only
+Locations: {locs}
+Jobs found: {len(known_jobs)}
+Active: {len(active_jobs)}
+Check: every 10 seconds 🔥
 ━━━━━━━━━━━━━━━━━━━""")
 
     elif cmd == "/jobs":
@@ -551,65 +565,71 @@ Check interval: {get_check_interval()} seconds
 
     elif cmd == "/pause":
         bot_paused = True
-        await tg_send("⏸️ Bot paused.\nSend /resume to restart.")
+        await tg_send("⏸️ Bot paused. Send /resume to restart.")
 
     elif cmd == "/resume":
         bot_paused = False
-        await tg_send(f"▶️ Bot resumed!\nWatching near {user_location['city']}... 👀")
+        await tg_send("▶️ Bot resumed! Watching for Warehouse Operative jobs... 👀")
 
     elif cmd == "/stats":
+        locs = "\n".join([f"{'🔴' if i==1 else '🟡' if i==2 else '🟢'} {user_locations[i]['city']}" for i in range(1,4) if user_locations[i]["city"]])
         await tg_send(f"""📊 <b>Your Stats</b>
 ━━━━━━━━━━━━━━━━━━━
-📍 Location: {user_location['city'] or 'Not set'}
-🔍 Jobs found: {len(known_jobs)}
-⏳ Active now: {len(active_jobs)}
-🤖 Status: {'Paused' if bot_paused else 'Running'}
-⚡ Check every: {get_check_interval()} secs
+{locs}
+Jobs found: {len(known_jobs)}
+Active now: {len(active_jobs)}
+Status: {'Paused' if bot_paused else 'Running'}
 ━━━━━━━━━━━━━━━━━━━
 Keep going Yonas! 💪""")
 
     elif cmd == "/help":
         await tg_send("""🤖 <b>Amazon Shift Holder Commands</b>
 ━━━━━━━━━━━━━━━━━━━━━
-/start          — Setup & welcome
-/location       — View your location
-/changelocation — Change location
-/status         — Bot status
-/jobs           — Active job windows
-/pause          — Pause alerts
-/resume         — Resume alerts
-/stats          — Your statistics
-/help           — This message
-━━━━━━━━━━━━━━━━━━━━━""")
+/start      — Setup locations
+/locations  — View your 3 cities
+/change1    — Change 1st choice
+/change2    — Change 2nd choice
+/change3    — Change 3rd choice
+/status     — Bot status
+/jobs       — Active jobs
+/pause      — Pause alerts
+/resume     — Resume alerts
+/stats      — Your stats
+/help       — This message
+━━━━━━━━━━━━━━━━━━━━━
+Watching: <b>Warehouse Operative only</b>
+Checking: <b>Every 10 seconds</b> 🔥""")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("🚀 Amazon Shift Holder Starting...")
-
-    # Start Telegram command handler
+    log.info("🚀 Amazon Shift Holder v2 Starting...")
     asyncio.create_task(handle_updates())
 
-    # If no location set — ask on startup
-    if not user_location["city"]:
+    has_location = any(l["city"] for l in user_locations.values())
+    if not has_location:
         await asyncio.sleep(2)
-        await ask_for_location()
+        await tg_send("""🚀 <b>Amazon Shift Holder ONLINE!</b>
+━━━━━━━━━━━━━━━━━━━━━
+🏭 Watching: Warehouse Operative ONLY
+⚡ Checking: Every 10 seconds
+🌍 Coverage: All UK
+━━━━━━━━━━━━━━━━━━━━━""")
+        await ask_location(1)
     else:
+        locs = " | ".join([user_locations[i]["city"] for i in range(1,4) if user_locations[i]["city"]])
         await tg_send(f"""🚀 <b>Amazon Shift Holder ONLINE!</b>
 ━━━━━━━━━━━━━━━━━━━━━
-📍 Location: {user_location['city']}
-✅ Watching jobsatamazon.co.uk
-⚡ Smart timing active
-⏰ 2hr window tracking ON
-━━━━━━━━━━━━━━━━━━━━━
-Send /help for commands""")
+🏭 Watching: Warehouse Operative only
+⚡ Checking: Every 10 seconds
+📍 Locations: {locs}
+━━━━━━━━━━━━━━━━━━━━━""")
 
-    # Main loop
+    # ALWAYS check every 10 seconds!
     while True:
         await check_for_new_jobs()
         await check_reminders()
-        interval = get_check_interval()
-        log.info(f"💤 Next check in {interval}s")
-        await asyncio.sleep(interval)
+        log.info("💤 Next check in 10s")
+        await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())
