@@ -3,8 +3,9 @@ import os
 import json
 import logging
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta
 from playwright.async_api import async_playwright
+from collections import defaultdict
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -14,43 +15,42 @@ SBR_WS    = os.environ.get("SBR_WS", "")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-known_jobs = {}
-bot_paused = False
+# ─── STATE ───────────────────────────────────────────────────────────────────
+known_jobs    = {}
+bot_paused    = False
+job_history   = []  # All jobs ever found
+posting_times = defaultdict(list)  # Track when jobs post by location
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ─── AMAZON WAREHOUSE SITES ───────────────────────────────────────────────────
-# All known Amazon UK warehouse codes
-WAREHOUSE_CODES = [
-    # West Midlands
-    "BHX1","BHX2","BHX3","BHX4","BHX5",
-    # East Midlands
-    "EMA1","EMA2","EMA3","EMA4",
-    # London/South
-    "LTN1","LTN7","LCY2","LCY3","LCY4",
-    # Bristol/South West
-    "BRS1","BRS2","BRS3",
-    # Manchester/North West
-    "MAN1","MAN2","MAN3","MAN4","MAN5",
-    # Yorkshire/North
-    "LBA1","LBA2","LBA3","LBA4",
-    # Scotland
-    "EDI1","EDI2","EDI3","EDI4",
-    # Wales
-    "CWL1","CWL2",
-    # North East
-    "MME1","MME2",
-    # Other
-    "BFS1","STN1","STN2",
-]
-
-# Main search URLs — ALL UK jobs
-SEARCH_URLS = [
-    # Main page — ALL UK warehouse jobs
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&category=warehouse",
-    # Backup — all jobs no filter
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
-]
+# ─── GRAPHQL QUERY ────────────────────────────────────────────────────────────
+GRAPHQL_QUERY = """
+query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+  searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+    nextToken
+    jobCards {
+      jobId
+      jobTitle
+      jobType
+      employmentType
+      city
+      state
+      postalCode
+      locationName
+      geoClusterDescription
+      totalPayRateMin
+      totalPayRateMax
+      firstDayOnSite
+      hoursPerWeek
+      shiftCode
+      scheduleCount
+      currencyCode
+      __typename
+    }
+    __typename
+  }
+}
+"""
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
 async def tg_send(text, reply_markup=None):
@@ -63,9 +63,42 @@ async def tg_send(text, reply_markup=None):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
+# ─── JOB SCORING ─────────────────────────────────────────────────────────────
+def score_job(job):
+    score = 0
+    pay      = job.get("pay", 0)
+    contract = job.get("contract", "").lower()
+    hours    = int(job.get("hours", 0)) if str(job.get("hours", "0")).isdigit() else 0
+
+    # Pay score
+    if pay >= 15.30:   score += 40
+    elif pay >= 14.30: score += 30
+    else:              score += 15
+
+    # Contract score
+    if "full" in contract:    score += 35
+    elif "reduced" in contract: score += 25
+    elif "part" in contract:  score += 15
+
+    # Hours score
+    if hours >= 40:   score += 25
+    elif hours >= 30: score += 18
+    elif hours >= 20: score += 10
+
+    return min(score, 100)
+
+def get_star_rating(score):
+    if score >= 85: return "⭐⭐⭐ EXCELLENT"
+    elif score >= 65: return "⭐⭐ GOOD"
+    else: return "⭐ OK"
+
+# ─── ALERT ───────────────────────────────────────────────────────────────────
 async def tg_alert(job, status="new"):
+    score  = job.get("score", 0)
+    stars  = get_star_rating(score)
+
     if status == "new":
-        header = "🚨 <b>NEW AMAZON JOB — ACT NOW!</b>"
+        header = f"🚨 <b>NEW AMAZON JOB — ACT NOW!</b>\n{stars} | Score: {score}/100"
     elif status == "navigating":
         header = "⚡ <b>BOT NAVIGATING APPLICATION...</b>"
     elif status == "ready":
@@ -99,6 +132,166 @@ async def tg_alert(job, status="new"):
     }
     await tg_send(text, markup)
 
+# ─── SCRAPER ─────────────────────────────────────────────────────────────────
+async def fetch_jobs():
+    all_jobs = {}
+    if not SBR_WS:
+        log.error("❌ SBR_WS not configured!")
+        return []
+
+    try:
+        async with async_playwright() as p:
+            browser  = await p.chromium.connect_over_cdp(SBR_WS)
+            context  = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page     = await context.new_page()
+            captured = []
+
+            async def handle_response(response):
+                try:
+                    if "graphql" in response.url and response.status == 200:
+                        data  = await response.json()
+                        cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
+                        if cards:
+                            log.info(f"🎯 Intercepted {len(cards)} jobs!")
+                            captured.extend(cards)
+                except:
+                    pass
+
+            page.on("response", handle_response)
+
+            await page.goto(
+                "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
+                wait_until="networkidle",
+                timeout=60000
+            )
+            await page.wait_for_timeout(5000)
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(3000)
+
+            # If no intercept try injection
+            if not captured:
+                log.info("💉 Injecting GraphQL call...")
+                for variables in [
+                    {"locale": "en-GB", "country": "United Kingdom", "keyWords": "warehouse operative", "equalFilters": [], "containFilters": [], "pageSize": 100},
+                    {"locale": "en-GB", "country": "United Kingdom", "keyWords": "", "equalFilters": [], "containFilters": [], "pageSize": 100}
+                ]:
+                    try:
+                        result = await page.evaluate(f"""
+                            async () => {{
+                                const r = await fetch('/graphql', {{
+                                    method: 'POST',
+                                    headers: {{'Content-Type': 'application/json', 'country': 'United Kingdom', 'accept': '*/*'}},
+                                    body: JSON.stringify({{
+                                        operationName: 'searchJobCardsByLocation',
+                                        query: `{GRAPHQL_QUERY.replace('`', '')}`,
+                                        variables: {{searchJobRequest: {json.dumps(variables)}}}
+                                    }})
+                                }});
+                                return await r.json();
+                            }}
+                        """)
+                        cards = result.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
+                        if cards:
+                            log.info(f"💉 Got {len(cards)} jobs via injection!")
+                            captured.extend(cards)
+                            break
+                    except Exception as e:
+                        log.warning(f"Injection error: {e}")
+
+            await browser.close()
+
+            for card in captured:
+                job = parse_card(card)
+                if job and job["id"] not in all_jobs:
+                    all_jobs[job["id"]] = job
+
+    except Exception as e:
+        log.error(f"Scraper error: {e}")
+
+    log.info(f"✅ Total jobs: {len(all_jobs)}")
+    return list(all_jobs.values())
+
+def parse_card(card):
+    try:
+        job_id = str(card.get("jobId", ""))
+        if not job_id:
+            return None
+
+        title    = card.get("jobTitle", "Warehouse Operative")
+        city     = card.get("city", "Unknown")
+        state    = card.get("state", "England")
+        postcode = card.get("postalCode", "")
+        geo      = card.get("geoClusterDescription", "")
+        pay      = float(card.get("totalPayRateMax") or card.get("totalPayRateMin") or 0)
+        contract = card.get("employmentType", card.get("jobType", ""))
+        hours    = str(card.get("hoursPerWeek", "TBC"))
+        first_day = card.get("firstDayOnSite", "TBC")
+        schedule  = card.get("shiftCode", "TBC")
+
+        # Skip non-warehouse jobs
+        skip = ["customer service", "vcc", "virtual", "remote", "manager", "software", "engineer"]
+        if any(s in title.lower() for s in skip):
+            return None
+
+        # Full location
+        if geo and postcode:
+            location = f"{city}, {state} ({geo}) {postcode}"
+        elif geo:
+            location = f"{city}, {state} ({geo})"
+        elif postcode:
+            location = f"{city}, {state} {postcode}"
+        else:
+            location = f"{city}, {state}"
+
+        link = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}&locale=en-GB&recommended=1&intcmpid=searchalljobsleft"
+
+        job = {
+            "id":       job_id,
+            "title":    title,
+            "location": location,
+            "pay":      round(pay, 2),
+            "contract": contract,
+            "duration": "Seasonal",
+            "firstDay": first_day,
+            "schedule": schedule,
+            "hours":    hours,
+            "link":     link,
+            "found_at": datetime.utcnow().isoformat(),
+        }
+        job["score"] = score_job(job)
+        return job
+    except Exception as e:
+        log.warning(f"Parse error: {e}")
+        return None
+
+# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+async def check_jobs():
+    global known_jobs, job_history, posting_times
+    if bot_paused:
+        return 0
+
+    jobs      = await fetch_jobs()
+    new_count = 0
+
+    for job in jobs:
+        jid = job["id"]
+        if jid not in known_jobs:
+            known_jobs[jid] = job
+            new_count += 1
+
+            # Track history & posting times
+            job_history.append(job)
+            hour = datetime.utcnow().hour
+            posting_times[job["location"][:20]].append(hour)
+
+            log.info(f"🆕 NEW: {job['location']} £{job['pay']}/hr Score:{job['score']}")
+            await tg_alert(job, "new")
+            asyncio.create_task(auto_navigate(job))
+
+    if new_count == 0:
+        log.info(f"✅ No new jobs — {len(known_jobs)} tracked")
+    return new_count
+
 # ─── AUTO NAVIGATION ─────────────────────────────────────────────────────────
 async def auto_navigate(job):
     log.info(f"🤖 Navigating: {job['location']}")
@@ -112,7 +305,6 @@ async def auto_navigate(job):
             await page.goto(job["link"], wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(2000)
 
-            # Click Apply
             for sel in ["button:has-text('Apply')", "a:has-text('Apply')", "[data-test='apply-button']"]:
                 try:
                     btn = await page.query_selector(sel)
@@ -123,7 +315,6 @@ async def auto_navigate(job):
                         break
                 except: pass
 
-            # Click Next
             for sel in ["button:has-text('Next')", "[data-test='next-button']"]:
                 try:
                     btn = await page.query_selector(sel)
@@ -134,7 +325,6 @@ async def auto_navigate(job):
                         break
                 except: pass
 
-            # Click Start Application
             for sel in ["button:has-text('Start Application')", "[data-test='start-application']"]:
                 try:
                     btn = await page.query_selector(sel)
@@ -153,132 +343,28 @@ async def auto_navigate(job):
         log.error(f"Navigation error: {e}")
         await tg_alert(job, "failed")
 
-# ─── MAIN SCRAPER ────────────────────────────────────────────────────────────
-async def fetch_jobs():
-    all_jobs = {}
-    if not SBR_WS:
-        log.error("❌ SBR_WS not configured!")
-        return []
+# ─── DAILY SUMMARY ───────────────────────────────────────────────────────────
+async def send_daily_summary():
+    while True:
+        now = datetime.utcnow()
+        # Send at 8am UK time
+        if now.hour == 7 and now.minute == 0:
+            today_jobs = [j for j in job_history
+                         if j.get("found_at", "")[:10] == now.strftime("%Y-%m-%d")]
 
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(SBR_WS)
-            context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            page    = await context.new_page()
-
-            for url in SEARCH_URLS:
-                try:
-                    captured = []
-
-                    async def handle_response(response):
-                        try:
-                            if "graphql" in response.url and response.status == 200:
-                                data  = await response.json()
-                                cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
-                                if cards:
-                                    log.info(f"🎯 Got {len(cards)} jobs!")
-                                    captured.extend(cards)
-                        except: pass
-
-                    page.on("response", handle_response)
-                    await page.goto(url, wait_until="networkidle", timeout=30000)
-                    await page.wait_for_timeout(5000)
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(3000)
-
-                    for card in captured:
-                        job = parse_card(card)
-                        if job and job["id"] not in all_jobs:
-                            all_jobs[job["id"]] = job
-
-                    page.remove_listener("response", handle_response)
-                    
-                    # If we got jobs from first URL no need for backup
-                    if all_jobs:
-                        log.info(f"✅ Got {len(all_jobs)} jobs from main search!")
-                        break
-
-                except Exception as e:
-                    log.warning(f"URL error: {e}")
-                    continue
-
-            await browser.close()
-
-    except Exception as e:
-        log.error(f"Scraping error: {e}")
-
-    log.info(f"✅ Total unique jobs: {len(all_jobs)}")
-    return list(all_jobs.values())
-
-def parse_card(card):
-    try:
-        job_id = str(card.get("jobId", ""))
-        if not job_id:
-            return None
-
-        title    = card.get("jobTitle", "Warehouse Operative")
-        city     = card.get("city", "Unknown")
-        state    = card.get("state", "England")
-        postcode = card.get("postalCode", "")
-        geo      = card.get("geoClusterDescription", "")
-        pay      = float(card.get("totalPayRateMax") or card.get("totalPayRateMin") or 0)
-        contract = card.get("employmentType", card.get("jobType", ""))
-        first_day = card.get("firstDayOnSite", "TBC")
-        schedule  = card.get("shiftCode", "TBC")
-        hours     = str(card.get("hoursPerWeek", "TBC"))
-
-        # Full location exactly like Amazon portal
-        if geo and postcode:
-            location = f"{city}, {state} ({geo}) {postcode}"
-        elif geo:
-            location = f"{city}, {state} ({geo})"
-        elif postcode:
-            location = f"{city}, {state} {postcode}"
-        else:
-            location = f"{city}, {state}"
-
-        # Skip non-warehouse jobs
-        skip_keywords = ["customer service", "vcc", "virtual", "online", "remote", "manager", "hr ", "finance", "it ", "software", "engineer"]
-        if any(kw in title.lower() for kw in skip_keywords):
-            return None
-
-        link = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}&locale=en-GB&recommended=1&intcmpid=searchalljobsleft"
-
-        return {
-            "id":       job_id,
-            "title":    title,
-            "location": location,
-            "pay":      round(pay, 2),
-            "contract": contract,
-            "duration": "Seasonal",
-            "firstDay": first_day,
-            "schedule": schedule,
-            "hours":    hours,
-            "link":     link,
-            "found_at": datetime.utcnow().isoformat(),
-        }
-    except Exception as e:
-        log.warning(f"Parse error: {e}")
-        return None
-
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
-async def check_jobs():
-    global known_jobs
-    if bot_paused:
-        return 0
-    jobs      = await fetch_jobs()
-    new_count = 0
-    for job in jobs:
-        jid = job["id"]
-        if jid not in known_jobs:
-            known_jobs[jid] = job
-            new_count += 1
-            log.info(f"🆕 NEW: {job['location']} £{job['pay']}/hr")
-            await tg_alert(job, "new")
-            asyncio.create_task(auto_navigate(job))
-    if new_count == 0:
-        log.info(f"✅ No new jobs — {len(known_jobs)} total tracked")
-    return new_count
+            if today_jobs:
+                best = max(today_jobs, key=lambda x: x.get("score", 0))
+                avg_pay = sum(j.get("pay", 0) for j in today_jobs) / len(today_jobs)
+                await tg_send(f"""📊 <b>Daily Summary</b>
+━━━━━━━━━━━━━━━━━
+📅 {now.strftime('%Y-%m-%d')}
+🆕 Jobs found: {len(today_jobs)}
+💰 Avg pay: £{avg_pay:.2f}/hr
+⭐ Best job: {best.get('location', 'Unknown')} £{best.get('pay', '?')}/hr
+━━━━━━━━━━━━━━━━━
+Keep going Yonas! 💪""")
+            await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
 async def handle_updates():
@@ -303,16 +389,18 @@ async def process_update(update):
         if data.startswith("applied_"):
             await tg_send("✅ Applied! Good luck Yonas! 💪🔥")
         elif data.startswith("skip_"):
-            await tg_send("⏭️ Skipped! Watching for next... 👀")
+            await tg_send("⏭️ Skipped! 👀")
         return
 
     msg  = update.get("message", {})
     text = msg.get("text", "").strip().lower()
 
     if text == "/start":
-        await tg_send("""🚀 <b>Amazon SUPERBOT!</b>
+        await tg_send("""🚀 <b>Amazon SUPERBOT v2!</b>
 ⚡ Bright Data Scraping Browser
-🌍 ALL UK warehouse locations
+🌍 ALL UK warehouse jobs
+⭐ Smart job scoring
+📊 Daily summaries
 🤖 Auto-navigates application
 👆 You just tap SUBMIT!
 Send /scrape to check now!""")
@@ -324,13 +412,13 @@ Send /scrape to check now!""")
 ━━━━━━━━━━━━━━━━━
 Status: {status}
 Scraping Browser: {sbr_status}
-Coverage: ALL UK warehouses
-Known warehouses: {len(WAREHOUSE_CODES)}+
 Jobs tracked: {len(known_jobs)}
+Total history: {len(job_history)}
+Check speed: every 5 seconds ⚡
 ━━━━━━━━━━━━━━━━━""")
 
     elif text == "/scrape":
-        await tg_send("🔍 <b>Scanning ALL UK Amazon warehouses...</b>")
+        await tg_send("🔍 <b>Scanning ALL UK Amazon jobs...</b>")
         count = await check_jobs()
         await tg_send(f"""✅ <b>Scan complete!</b>
 New jobs: {count}
@@ -341,14 +429,40 @@ Total tracked: {len(known_jobs)}
         if not known_jobs:
             await tg_send("📭 No jobs yet. Send /scrape!")
         else:
-            txt = f"📋 <b>Last {min(5,len(known_jobs))} Jobs Found:</b>\n━━━━━━━━━━━\n"
+            txt = f"📋 <b>Last {min(5,len(known_jobs))} Jobs:</b>\n━━━━━━━━━━━\n"
             for job in list(known_jobs.values())[-5:]:
-                txt += f"📍 {job.get('location')}\n💰 £{job.get('pay')}/hr | 📅 {job.get('firstDay')}\n\n"
+                stars = get_star_rating(job.get("score", 0))
+                txt += f"{stars}\n📍 {job.get('location')}\n💰 £{job.get('pay')}/hr | 📅{job.get('firstDay')}\n\n"
+            await tg_send(txt)
+
+    elif text == "/history":
+        if not job_history:
+            await tg_send("📭 No history yet!")
+        else:
+            total = len(job_history)
+            avg   = sum(j.get("pay", 0) for j in job_history) / total
+            best  = max(job_history, key=lambda x: x.get("score", 0))
+            await tg_send(f"""📊 <b>Job History</b>
+━━━━━━━━━━━━━━━━━
+Total found: {total}
+Avg pay: £{avg:.2f}/hr
+Best: {best.get('location', '?')} £{best.get('pay', '?')}/hr
+━━━━━━━━━━━━━━━━━""")
+
+    elif text == "/predict":
+        if not posting_times:
+            await tg_send("📭 Not enough data yet!\nKeep bot running to learn patterns!")
+        else:
+            txt = "🧠 <b>Posting Patterns</b>\n━━━━━━━━━━━━━━━\n"
+            for loc, times in list(posting_times.items())[:5]:
+                if times:
+                    common = max(set(times), key=times.count)
+                    txt += f"📍 {loc}\n⏰ Usually posts at {common}:00 UTC\n\n"
             await tg_send(txt)
 
     elif text == "/test":
-        test_job = {
-            "id": "TEST001",
+        await tg_alert({
+            "id": "JOB-UK-0000000214",
             "title": "Warehouse Operative",
             "location": "Rugby, England (Coventry, Rugby, Daventry Area) CV23 0XF",
             "pay": 14.30,
@@ -357,10 +471,9 @@ Total tracked: {len(known_jobs)}
             "firstDay": "2026-05-10",
             "schedule": "Sun, Mon, Tue, Wed, Thu 18:30-2:30",
             "hours": "40",
-            "link": "https://www.jobsatamazon.co.uk",
-        }
-        await tg_alert(test_job, "new")
-        await tg_send("✅ Alert format correct! Send /scrape for real jobs!")
+            "score": 85,
+            "link": "https://www.jobsatamazon.co.uk/app#/jobDetail?jobId=JOB-UK-0000000214&locale=en-GB",
+        }, "new")
 
     elif text == "/pause":
         bot_paused = True
@@ -371,24 +484,38 @@ Total tracked: {len(known_jobs)}
         await tg_send("▶️ Resumed! 🔥")
 
     elif text == "/help":
-        await tg_send("""/scrape  /status  /jobs
-/test    /pause   /resume  /help""")
+        await tg_send("""🤖 <b>Commands</b>
+/scrape   — Scan now
+/status   — Bot status
+/jobs     — Recent jobs
+/history  — All time stats
+/predict  — Posting patterns
+/test     — Test alert
+/pause    — Pause
+/resume   — Resume
+/help     — This message""")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("🚀 Amazon SUPERBOT Starting — ALL UK warehouses!")
+    log.info("🚀 Amazon SUPERBOT v2 Starting!")
     asyncio.create_task(handle_updates())
+    asyncio.create_task(send_daily_summary())
+
     await asyncio.sleep(2)
-    await tg_send(f"""🚀 <b>Amazon SUPERBOT ONLINE!</b>
+    await tg_send("""🚀 <b>Amazon SUPERBOT v2 ONLINE!</b>
 ⚡ Bright Data Scraping Browser
-🌍 ALL UK warehouse locations
-📦 {len(WAREHOUSE_CODES)}+ warehouse codes monitored
+🌍 ALL UK warehouse jobs
+⭐ Smart scoring system
+📊 Daily summaries at 8am
 🤖 Auto-navigates application
 👆 You just tap SUBMIT!
 Send /scrape to check now!""")
+
     await check_jobs()
+
+    # Check every 5 seconds!
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(5)
         await check_jobs()
 
 if __name__ == "__main__":
