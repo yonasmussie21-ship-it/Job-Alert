@@ -106,11 +106,12 @@ async def tg_alert(job, status="new"):
     else:
         header = "⚠️ <b>APPLY MANUALLY!</b>"
 
+    pay_str = job.get('pay_display') or f"{job.get('pay', '?'):.2f}"
     text = f"""{header}
 ━━━━━━━━━━━━━━━━━━━━━
 📍 <b>{job.get('location', 'Unknown')}</b>
 📦 {job.get('title', 'Warehouse Operative')}
-💰 <b>£{job.get('pay', '?')}/hr</b>
+💰 <b>£{pay_str}/hr</b>
 ⏱️ {job.get('duration', 'Seasonal')} | {job.get('contract', '?')}
 💼 Pick, pack and ship parcels
 📅 First Day: <b>{job.get('firstDay', 'TBC')}</b>
@@ -217,31 +218,49 @@ def parse_card(card):
         if not job_id:
             return None
 
-        title    = card.get("jobTitle", "Warehouse Operative")
-        city     = card.get("city", "Unknown")
-        state    = card.get("state", "England")
-        postcode = card.get("postalCode", "")
-        geo      = card.get("geoClusterDescription", "")
+        title    = card.get("jobTitle", "Warehouse Operative") or "Warehouse Operative"
+        city     = card.get("city") or card.get("locationName") or ""
+        state    = card.get("state") or "England"
+        postcode = card.get("postalCode") or ""
+        geo      = card.get("geoClusterDescription") or ""
         pay      = float(card.get("totalPayRateMax") or card.get("totalPayRateMin") or 0)
-        contract = card.get("employmentType", card.get("jobType", ""))
-        hours    = str(card.get("hoursPerWeek", "TBC"))
-        first_day = card.get("firstDayOnSite", "TBC")
-        schedule  = card.get("shiftCode", "TBC")
+        
+        # Fix contract - get both duration and type
+        employment = card.get("employmentType") or ""
+        job_type   = card.get("jobType") or ""
+        # employmentType has full-time/part-time, jobType has Seasonal
+        if employment and employment.lower() not in ["seasonal", "temporary"]:
+            contract = employment  # Full-time, Part-time, Reduced
+            duration = job_type or "Seasonal"
+        else:
+            contract = employment or job_type or "Full-time"
+            duration = "Seasonal"
+
+        hours     = str(int(card.get("hoursPerWeek") or 0)) if card.get("hoursPerWeek") else "TBC"
+        first_day = card.get("firstDayOnSite") or "TBC"
+        schedule  = card.get("shiftCode") or "TBC"
 
         # Skip non-warehouse jobs
         skip = ["customer service", "vcc", "virtual", "remote", "manager", "software", "engineer"]
         if any(s in title.lower() for s in skip):
             return None
 
-        # Full location
+        # Fix pay display
+        pay_display = f"{pay:.2f}"
+
+        # Full location - handle None values
+        parts = []
+        if city: parts.append(city)
+        if state and state != city: parts.append(state)
+        
         if geo and postcode:
-            location = f"{city}, {state} ({geo}) {postcode}"
+            location = f"{', '.join(parts)} ({geo}) {postcode}".strip()
         elif geo:
-            location = f"{city}, {state} ({geo})"
+            location = f"{', '.join(parts)} ({geo})".strip()
         elif postcode:
-            location = f"{city}, {state} {postcode}"
+            location = f"{', '.join(parts)} {postcode}".strip()
         else:
-            location = f"{city}, {state}"
+            location = ", ".join(parts) or "Unknown UK Location"
 
         link = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}&locale=en-GB&recommended=1&intcmpid=searchalljobsleft"
 
@@ -250,8 +269,9 @@ def parse_card(card):
             "title":    title,
             "location": location,
             "pay":      round(pay, 2),
+            "pay_display": pay_display,
             "contract": contract,
-            "duration": "Seasonal",
+            "duration": duration,
             "firstDay": first_day,
             "schedule": schedule,
             "hours":    hours,
@@ -263,6 +283,74 @@ def parse_card(card):
     except Exception as e:
         log.warning(f"Parse error: {e}")
         return None
+
+# ─── FETCH FULL JOB DETAILS ──────────────────────────────────────────────────
+async def fetch_job_details(job):
+    """Fetch schedule, first day, hours from job detail page"""
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(SBR_WS)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page    = await context.new_page()
+
+            captured = {}
+
+            async def handle_response(response):
+                try:
+                    if "graphql" in response.url and response.status == 200:
+                        data = await response.json()
+                        # Check for schedule data
+                        schedules = (data.get("data", {}).get("getSchedules") or
+                                    data.get("data", {}).get("jobSchedules") or
+                                    data.get("data", {}).get("schedules"))
+                        if schedules:
+                            captured["schedules"] = schedules
+
+                        # Check for job detail
+                        detail = (data.get("data", {}).get("getJobDetails") or
+                                 data.get("data", {}).get("jobDetail"))
+                        if detail:
+                            captured["detail"] = detail
+                except:
+                    pass
+
+            page.on("response", handle_response)
+
+            await page.goto(job["link"], wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(4000)
+
+            # Extract from page text
+            import re
+            content_text = await page.inner_text("body")
+
+            # First Day
+            day_match = re.search(r'First Day[: ]+([0-9]{4}-[0-9]{2}-[0-9]{2})', content_text)
+            if day_match:
+                job["firstDay"] = day_match.group(1)
+
+            # Schedule
+            sched_match = re.search(r'Schedule[: ]+([A-Za-z, ]+[0-9]{1,2}:[0-9]{2}[^\n]+)', content_text)
+            if sched_match:
+                job["schedule"] = sched_match.group(1).strip()[:60]
+
+            # Hours
+            hours_match = re.search(r'Hours/Week[: ]+([0-9]+)', content_text)
+            if hours_match:
+                job["hours"] = hours_match.group(1)
+
+            # Contract type
+            for ct in ["Full-time", "Part-time", "Reduced", "Flex"]:
+                if ct.lower() in content_text.lower():
+                    job["contract"] = ct
+                    break
+
+            await browser.close()
+            log.info(f"✅ Details fetched: {job.get('firstDay')} | {job.get('schedule','TBC')[:30]}")
+
+    except Exception as e:
+        log.warning(f"Detail fetch error: {e}")
+
+    return job
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 async def check_jobs():
@@ -285,6 +373,11 @@ async def check_jobs():
             posting_times[job["location"][:20]].append(hour)
 
             log.info(f"🆕 NEW: {job['location']} £{job['pay']}/hr Score:{job['score']}")
+            
+            # Fetch full details first then alert
+            job = await fetch_job_details(job)
+            known_jobs[jid] = job  # Update with full details
+            
             await tg_alert(job, "new")
             asyncio.create_task(auto_navigate(job))
 
