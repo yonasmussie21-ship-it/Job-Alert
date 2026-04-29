@@ -355,10 +355,15 @@ Active: {len(active_jobs)}
         })
         await tg_send("✅ <b>Test complete — Bot is working!</b>")
 
+    elif text == "/scrape":
+        await tg_send("🔍 <b>Forcing scrape NOW...</b>")
+        await check_jobs()
+        await tg_send(f"✅ Scrape done! Jobs found: {len(known_jobs)}")
+
     elif text == "/help":
         await tg_send("""🤖 <b>Commands</b>
 /start   /status  /jobs
-/test    /pause   /resume  /help""")
+/test    /scrape  /pause   /resume  /help""")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
