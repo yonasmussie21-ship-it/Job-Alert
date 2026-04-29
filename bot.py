@@ -3,7 +3,7 @@ import os
 import json
 import logging
 import aiohttp
-from datetime import datetime, timedelta
+from datetime import datetime
 from playwright.async_api import async_playwright
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
@@ -14,23 +14,42 @@ SBR_WS    = os.environ.get("SBR_WS", "")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-known_jobs  = {}
-bot_paused  = False
+known_jobs = {}
+bot_paused = False
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ─── ALL UK SEARCH URLS ───────────────────────────────────────────────────────
-UK_SEARCH_URLS = [
+# ─── AMAZON WAREHOUSE SITES ───────────────────────────────────────────────────
+# All known Amazon UK warehouse codes
+WAREHOUSE_CODES = [
+    # West Midlands
+    "BHX1","BHX2","BHX3","BHX4","BHX5",
+    # East Midlands
+    "EMA1","EMA2","EMA3","EMA4",
+    # London/South
+    "LTN1","LTN7","LCY2","LCY3","LCY4",
+    # Bristol/South West
+    "BRS1","BRS2","BRS3",
+    # Manchester/North West
+    "MAN1","MAN2","MAN3","MAN4","MAN5",
+    # Yorkshire/North
+    "LBA1","LBA2","LBA3","LBA4",
+    # Scotland
+    "EDI1","EDI2","EDI3","EDI4",
+    # Wales
+    "CWL1","CWL2",
+    # North East
+    "MME1","MME2",
+    # Other
+    "BFS1","STN1","STN2",
+]
+
+# Main search URLs — ALL UK jobs
+SEARCH_URLS = [
+    # Main page — ALL UK warehouse jobs
+    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&category=warehouse",
+    # Backup — all jobs no filter
     "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&city=London",
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&city=Birmingham",
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&city=Manchester",
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&city=Glasgow",
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&city=Belfast",
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&city=Bristol",
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&city=Leeds",
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&city=Sheffield",
-    "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR&city=Nottingham",
 ]
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
@@ -51,8 +70,8 @@ async def tg_alert(job, status="new"):
         header = "⚡ <b>BOT NAVIGATING APPLICATION...</b>"
     elif status == "ready":
         header = "✅ <b>READY — TAP SUBMIT NOW!</b>"
-    elif status == "failed":
-        header = "⚠️ <b>APPLY MANUALLY — BOT NEEDS HELP!</b>"
+    else:
+        header = "⚠️ <b>APPLY MANUALLY!</b>"
 
     text = f"""{header}
 ━━━━━━━━━━━━━━━━━━━━━
@@ -67,9 +86,7 @@ async def tg_alert(job, status="new"):
 ━━━━━━━━━━━━━━━━━━━━━"""
 
     if status == "ready":
-        text += "\n👆 <b>Everything filled — just tap SUBMIT!</b>\n━━━━━━━━━━━━━━━━━━━━━"
-    elif status == "failed":
-        text += "\n👆 <b>Tap link to apply manually!</b>\n━━━━━━━━━━━━━━━━━━━━━"
+        text += "\n👆 <b>TAP SUBMIT to complete!</b>\n━━━━━━━━━━━━━━━━━━━━━"
 
     markup = {
         "inline_keyboard": [
@@ -84,89 +101,61 @@ async def tg_alert(job, status="new"):
 
 # ─── AUTO NAVIGATION ─────────────────────────────────────────────────────────
 async def auto_navigate(job):
-    """Bot navigates application — you just tap Submit!"""
-    log.info(f"🤖 Auto-navigating: {job['location']}")
+    log.info(f"🤖 Navigating: {job['location']}")
     await tg_alert(job, "navigating")
-
     try:
         async with async_playwright() as p:
             browser = await p.chromium.connect_over_cdp(SBR_WS)
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             page    = await context.new_page()
 
-            # Go to job page
             await page.goto(job["link"], wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(2000)
 
-            # Step 1 — Click Apply
-            applied = False
-            for sel in [
-                "button:has-text('Apply')",
-                "a:has-text('Apply')",
-                "[data-test='apply-button']",
-                ".apply-button",
-                "button.btn-primary"
-            ]:
+            # Click Apply
+            for sel in ["button:has-text('Apply')", "a:has-text('Apply')", "[data-test='apply-button']"]:
                 try:
                     btn = await page.query_selector(sel)
                     if btn:
                         await btn.click()
+                        await page.wait_for_timeout(2000)
                         log.info("✅ Clicked Apply")
-                        await page.wait_for_timeout(2000)
-                        applied = True
                         break
-                except:
-                    pass
+                except: pass
 
-            # Step 2 — Click Next
-            for sel in ["button:has-text('Next')", "[data-test='next-button']", "button.next"]:
+            # Click Next
+            for sel in ["button:has-text('Next')", "[data-test='next-button']"]:
                 try:
                     btn = await page.query_selector(sel)
                     if btn:
                         await btn.click()
+                        await page.wait_for_timeout(2000)
                         log.info("✅ Clicked Next")
-                        await page.wait_for_timeout(2000)
                         break
-                except:
-                    pass
+                except: pass
 
-            # Step 3 — Click Start Application
-            for sel in [
-                "button:has-text('Start Application')",
-                "[data-test='start-application']",
-                "button:has-text('Start')"
-            ]:
+            # Click Start Application
+            for sel in ["button:has-text('Start Application')", "[data-test='start-application']"]:
                 try:
                     btn = await page.query_selector(sel)
                     if btn:
                         await btn.click()
-                        log.info("✅ Clicked Start Application")
                         await page.wait_for_timeout(2000)
+                        log.info("✅ Clicked Start Application")
                         break
-                except:
-                    pass
+                except: pass
 
-            # Get current URL for user
-            current_url = page.url
-            log.info(f"✅ Bot reached: {current_url}")
-
-            # Update job link to current page
-            job["link"] = current_url if current_url != "about:blank" else job["link"]
-
+            job["link"] = page.url if page.url != "about:blank" else job["link"]
             await browser.close()
-
-            # Alert user — ready to submit!
             await tg_alert(job, "ready")
-            log.info(f"✅ Application ready for: {job['location']}")
 
     except Exception as e:
         log.error(f"Navigation error: {e}")
         await tg_alert(job, "failed")
 
-# ─── SCRAPING BROWSER ────────────────────────────────────────────────────────
+# ─── MAIN SCRAPER ────────────────────────────────────────────────────────────
 async def fetch_jobs():
     all_jobs = {}
-
     if not SBR_WS:
         log.error("❌ SBR_WS not configured!")
         return []
@@ -177,7 +166,7 @@ async def fetch_jobs():
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             page    = await context.new_page()
 
-            for url in UK_SEARCH_URLS:
+            for url in SEARCH_URLS:
                 try:
                     captured = []
 
@@ -187,16 +176,15 @@ async def fetch_jobs():
                                 data  = await response.json()
                                 cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
                                 if cards:
-                                    log.info(f"🎯 Got {len(cards)} jobs")
+                                    log.info(f"🎯 Got {len(cards)} jobs!")
                                     captured.extend(cards)
-                        except:
-                            pass
+                        except: pass
 
                     page.on("response", handle_response)
                     await page.goto(url, wait_until="networkidle", timeout=30000)
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(5000)
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(3000)
 
                     for card in captured:
                         job = parse_card(card)
@@ -204,6 +192,11 @@ async def fetch_jobs():
                             all_jobs[job["id"]] = job
 
                     page.remove_listener("response", handle_response)
+                    
+                    # If we got jobs from first URL no need for backup
+                    if all_jobs:
+                        log.info(f"✅ Got {len(all_jobs)} jobs from main search!")
+                        break
 
                 except Exception as e:
                     log.warning(f"URL error: {e}")
@@ -214,9 +207,8 @@ async def fetch_jobs():
     except Exception as e:
         log.error(f"Scraping error: {e}")
 
-    jobs = list(all_jobs.values())
-    log.info(f"✅ Total unique jobs: {len(jobs)}")
-    return jobs
+    log.info(f"✅ Total unique jobs: {len(all_jobs)}")
+    return list(all_jobs.values())
 
 def parse_card(card):
     try:
@@ -231,8 +223,11 @@ def parse_card(card):
         geo      = card.get("geoClusterDescription", "")
         pay      = float(card.get("totalPayRateMax") or card.get("totalPayRateMin") or 0)
         contract = card.get("employmentType", card.get("jobType", ""))
+        first_day = card.get("firstDayOnSite", "TBC")
+        schedule  = card.get("shiftCode", "TBC")
+        hours     = str(card.get("hoursPerWeek", "TBC"))
 
-        # Full location like Amazon portal
+        # Full location exactly like Amazon portal
         if geo and postcode:
             location = f"{city}, {state} ({geo}) {postcode}"
         elif geo:
@@ -251,9 +246,9 @@ def parse_card(card):
             "pay":      round(pay, 2),
             "contract": contract,
             "duration": "Seasonal",
-            "firstDay": card.get("firstDayOnSite", "TBC"),
-            "schedule": card.get("shiftCode", "TBC"),
-            "hours":    str(card.get("hoursPerWeek", "TBC")),
+            "firstDay": first_day,
+            "schedule": schedule,
+            "hours":    hours,
             "link":     link,
             "found_at": datetime.utcnow().isoformat(),
         }
@@ -274,12 +269,10 @@ async def check_jobs():
             known_jobs[jid] = job
             new_count += 1
             log.info(f"🆕 NEW: {job['location']} £{job['pay']}/hr")
-            # Send initial alert
             await tg_alert(job, "new")
-            # Auto navigate in background
             asyncio.create_task(auto_navigate(job))
     if new_count == 0:
-        log.info(f"✅ No new jobs — tracking {len(known_jobs)} total")
+        log.info(f"✅ No new jobs — {len(known_jobs)} total tracked")
     return new_count
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
@@ -314,7 +307,7 @@ async def process_update(update):
     if text == "/start":
         await tg_send("""🚀 <b>Amazon SUPERBOT!</b>
 ⚡ Bright Data Scraping Browser
-🌍 ALL UK locations
+🌍 ALL UK warehouse locations
 🤖 Auto-navigates application
 👆 You just tap SUBMIT!
 Send /scrape to check now!""")
@@ -326,42 +319,43 @@ Send /scrape to check now!""")
 ━━━━━━━━━━━━━━━━━
 Status: {status}
 Scraping Browser: {sbr_status}
-Regions: {len(UK_SEARCH_URLS)} UK areas
+Coverage: ALL UK warehouses
+Known warehouses: {len(WAREHOUSE_CODES)}+
 Jobs tracked: {len(known_jobs)}
 ━━━━━━━━━━━━━━━━━""")
 
     elif text == "/scrape":
-        await tg_send(f"🔍 <b>Searching {len(UK_SEARCH_URLS)} UK regions...</b>")
+        await tg_send("🔍 <b>Scanning ALL UK Amazon warehouses...</b>")
         count = await check_jobs()
-        await tg_send(f"""✅ <b>Done!</b>
+        await tg_send(f"""✅ <b>Scan complete!</b>
 New jobs: {count}
 Total tracked: {len(known_jobs)}
-{"🎉 Alerts sent + navigating!" if count > 0 else "⏳ No new jobs yet!"}""")
+{"🎉 Alerts sent!" if count > 0 else "⏳ No new jobs right now!"}""")
 
     elif text == "/jobs":
         if not known_jobs:
-            await tg_send("📭 No jobs found yet. Send /scrape!")
+            await tg_send("📭 No jobs yet. Send /scrape!")
         else:
-            txt = f"📋 <b>{len(known_jobs)} Jobs Found:</b>\n━━━━━━━━━━━\n"
-            for jid, job in list(known_jobs.items())[-10:]:
-                txt += f"📍 {job.get('location')}\n💰 £{job.get('pay')}/hr · 📅{job.get('firstDay')}\n\n"
+            txt = f"📋 <b>Last {min(5,len(known_jobs))} Jobs Found:</b>\n━━━━━━━━━━━\n"
+            for job in list(known_jobs.values())[-5:]:
+                txt += f"📍 {job.get('location')}\n💰 £{job.get('pay')}/hr | 📅 {job.get('firstDay')}\n\n"
             await tg_send(txt)
 
     elif text == "/test":
         test_job = {
             "id": "TEST001",
             "title": "Warehouse Operative",
-            "location": "Nottingham, England (Nottingham-Mansfield Area) NG16 3UA",
+            "location": "Rugby, England (Coventry, Rugby, Daventry Area) CV23 0XF",
             "pay": 14.30,
             "contract": "Full-time",
             "duration": "Seasonal",
-            "firstDay": "2026-05-15",
-            "schedule": "Fri, Sat, Sun, Mon 19:30-6:00",
+            "firstDay": "2026-05-10",
+            "schedule": "Sun, Mon, Tue, Wed, Thu 18:30-2:30",
             "hours": "40",
             "link": "https://www.jobsatamazon.co.uk",
         }
         await tg_alert(test_job, "new")
-        await tg_send("✅ Bot working! Send /scrape for real jobs!")
+        await tg_send("✅ Alert format correct! Send /scrape for real jobs!")
 
     elif text == "/pause":
         bot_paused = True
@@ -377,12 +371,13 @@ Total tracked: {len(known_jobs)}
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("🚀 Amazon SUPERBOT Starting!")
+    log.info("🚀 Amazon SUPERBOT Starting — ALL UK warehouses!")
     asyncio.create_task(handle_updates())
     await asyncio.sleep(2)
     await tg_send(f"""🚀 <b>Amazon SUPERBOT ONLINE!</b>
 ⚡ Bright Data Scraping Browser
-🌍 {len(UK_SEARCH_URLS)} UK regions
+🌍 ALL UK warehouse locations
+📦 {len(WAREHOUSE_CODES)}+ warehouse codes monitored
 🤖 Auto-navigates application
 👆 You just tap SUBMIT!
 Send /scrape to check now!""")
