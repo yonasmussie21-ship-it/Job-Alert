@@ -237,6 +237,11 @@ def parse_card(card):
         else:
             location = f"{city}, {state}"
 
+        # Skip non-warehouse jobs
+        skip_keywords = ["customer service", "vcc", "virtual", "online", "remote", "manager", "hr ", "finance", "it ", "software", "engineer"]
+        if any(kw in title.lower() for kw in skip_keywords):
+            return None
+
         link = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}&locale=en-GB&recommended=1&intcmpid=searchalljobsleft"
 
         return {
