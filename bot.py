@@ -3,8 +3,29 @@ import os
 import json
 import logging
 import aiohttp
-import re
+import subprocess
+import sys
 from datetime import datetime, timedelta
+
+# ─── INSTALL PLAYWRIGHT BROWSER ON STARTUP ───────────────────────────────────
+def install_playwright():
+    """Install chromium browser if not present"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            print("✅ Playwright chromium installed successfully!")
+        else:
+            print(f"⚠️ Playwright install output: {result.stdout} {result.stderr}")
+    except Exception as e:
+        print(f"⚠️ Playwright install error: {e}")
+
+# Install immediately on startup
+print("🔧 Installing Playwright chromium...")
+install_playwright()
+
 from playwright.async_api import async_playwright
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
@@ -37,7 +58,6 @@ async def tg_send(text, reply_markup=None):
 async def tg_alert(job):
     expiry = job.get("expiry")
     mins   = int((expiry - datetime.utcnow()).total_seconds() / 60) if expiry else 120
-
     text = f"""🚨 <b>NEW AMAZON JOB — ACT NOW!</b>
 ━━━━━━━━━━━━━━━━━━━━━
 📍 <b>{job.get('location', 'Unknown')}</b>
@@ -49,7 +69,6 @@ async def tg_alert(job):
 ━━━━━━━━━━━━━━━━━━━━━
 ⚡ <b>Tap APPLY NOW instantly!</b>
 ━━━━━━━━━━━━━━━━━━━━━"""
-
     markup = {
         "inline_keyboard": [
             [{"text": "🚀 APPLY NOW", "url": job.get("link", "https://www.jobsatamazon.co.uk")}],
@@ -61,131 +80,122 @@ async def tg_alert(job):
     }
     await tg_send(text, markup)
 
-# ─── PLAYWRIGHT SCRAPER ───────────────────────────────────────────────────────
+# ─── SCRAPER ─────────────────────────────────────────────────────────────────
 async def fetch_jobs():
-    """Scrape Amazon jobs page using real browser"""
     jobs = []
+
+    # Method 1: Playwright
     try:
-        proxy = None
-        if BRIGHT_DATA_USER and BRIGHT_DATA_PASS:
-            proxy = {
-                "server":   f"http://brd.superproxy.io:33335",
-                "username": BRIGHT_DATA_USER,
-                "password": BRIGHT_DATA_PASS
-            }
+        jobs = await scrape_playwright()
+        if jobs:
+            log.info(f"✅ Playwright: {len(jobs)} jobs")
+            return jobs
+    except Exception as e:
+        log.error(f"Playwright error: {e}")
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-            )
+    # Method 2: Direct API
+    try:
+        jobs = await scrape_api()
+        if jobs:
+            log.info(f"✅ API: {len(jobs)} jobs")
+            return jobs
+    except Exception as e:
+        log.error(f"API error: {e}")
 
-            ctx_args = {
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-                "locale": "en-GB",
-            }
-            if proxy:
-                ctx_args["proxy"] = proxy
+    log.warning("⚠️ All methods returned 0 jobs")
+    return []
 
-            context = await browser.new_context(**ctx_args)
-            page    = await context.new_page()
+async def scrape_playwright():
+    jobs = []
+    proxy = None
+    if BRIGHT_DATA_USER and BRIGHT_DATA_PASS:
+        proxy = {
+            "server":   "http://brd.superproxy.io:33335",
+            "username": BRIGHT_DATA_USER,
+            "password": BRIGHT_DATA_PASS
+        }
 
-            # Intercept GraphQL responses
-            captured_jobs = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        )
+        ctx_args = {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "locale": "en-GB",
+        }
+        if proxy:
+            ctx_args["proxy"] = proxy
 
-            async def handle_response(response):
-                try:
-                    if "graphql" in response.url and response.status == 200:
-                        data      = await response.json()
-                        job_cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
-                        if job_cards:
-                            log.info(f"✅ Intercepted {len(job_cards)} jobs from GraphQL!")
-                            captured_jobs.extend(job_cards)
-                except:
-                    pass
+        context = await browser.new_context(**ctx_args)
+        page    = await context.new_page()
+        captured = []
 
-            page.on("response", handle_response)
-
-            # Visit Amazon jobs search page
-            await page.goto(
-                "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
-                wait_until="networkidle",
-                timeout=30000
-            )
-            await page.wait_for_timeout(5000)
-
-            # Try clicking "Search" or scrolling to trigger more loads
+        async def handle_response(response):
             try:
-                await page.keyboard.press("End")
-                await page.wait_for_timeout(2000)
+                if "graphql" in response.url and response.status == 200:
+                    data  = await response.json()
+                    cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
+                    if cards:
+                        log.info(f"🎯 Intercepted {len(cards)} jobs!")
+                        captured.extend(cards)
             except:
                 pass
 
-            await browser.close()
+        page.on("response", handle_response)
 
-            # Parse captured jobs
-            for card in captured_jobs:
-                job = parse_card(card)
-                if job:
-                    jobs.append(job)
+        await page.goto(
+            "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
+            wait_until="networkidle",
+            timeout=30000
+        )
+        await page.wait_for_timeout(5000)
+        await browser.close()
 
-            # If no jobs from interception try direct API with session
-            if not jobs:
-                jobs = await fetch_via_api()
-
-            log.info(f"📦 Total jobs found: {len(jobs)}")
-
-    except Exception as e:
-        log.error(f"Scraper error: {e}")
-        jobs = await fetch_via_api()
+        for card in captured:
+            job = parse_card(card)
+            if job:
+                jobs.append(job)
 
     return jobs
 
-async def fetch_via_api():
-    """Try Amazon GraphQL API with different search terms"""
+async def scrape_api():
     jobs = []
-    search_terms = ["warehouse operative", "warehouse", "pick pack ship", ""]
+    headers = {
+        "accept":          "*/*",
+        "accept-language": "en-GB,en;q=0.9",
+        "content-type":    "application/json",
+        "country":         "United Kingdom",
+        "origin":          "https://www.jobsatamazon.co.uk",
+        "referer":         "https://www.jobsatamazon.co.uk/",
+        "user-agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/146.0.0.0",
+    }
+    query = """query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+      searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+        jobCards {
+          jobId jobTitle jobType employmentType
+          city state postalCode locationName
+          totalPayRateMin totalPayRateMax __typename
+        } __typename
+      }
+    }"""
 
-    for term in search_terms:
+    for keyword in ["warehouse operative", "warehouse", ""]:
         try:
             payload = {
                 "operationName": "searchJobCardsByLocation",
-                "query": """query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
-                  searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
-                    nextToken
-                    jobCards {
-                      jobId jobTitle jobType employmentType
-                      city state postalCode locationName
-                      totalPayRateMin totalPayRateMax
-                      __typename
-                    }
-                    __typename
-                  }
-                }""",
+                "query": query,
                 "variables": {
                     "searchJobRequest": {
                         "locale": "en-GB",
                         "country": "United Kingdom",
-                        "keyWords": term,
+                        "keyWords": keyword,
                         "equalFilters": [],
                         "containFilters": [],
-                        "pageSize": 100,
-                        "sortBy": "RELEVANCE",
-                        "descending": True
+                        "pageSize": 100
                     }
                 }
             }
-
-            headers = {
-                "accept":         "*/*",
-                "accept-language": "en-GB,en;q=0.9",
-                "content-type":   "application/json",
-                "country":        "United Kingdom",
-                "origin":         "https://www.jobsatamazon.co.uk",
-                "referer":        "https://www.jobsatamazon.co.uk/",
-                "user-agent":     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            }
-
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     "https://www.jobsatamazon.co.uk/graphql",
@@ -195,19 +205,17 @@ async def fetch_via_api():
                     ssl=False
                 ) as resp:
                     if resp.status == 200:
-                        data      = await resp.json()
-                        job_cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
-                        log.info(f"API '{term}': {len(job_cards)} jobs")
-                        for card in job_cards:
+                        data  = await resp.json()
+                        cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
+                        log.info(f"API '{keyword}': {len(cards)} jobs")
+                        for card in cards:
                             job = parse_card(card)
-                            if job and job["id"] not in [j["id"] for j in jobs]:
+                            if job:
                                 jobs.append(job)
                         if jobs:
-                            break
+                            return jobs
         except Exception as e:
-            log.warning(f"API error for '{term}': {e}")
-            continue
-
+            log.warning(f"API '{keyword}' error: {e}")
     return jobs
 
 def parse_card(card):
@@ -215,35 +223,28 @@ def parse_card(card):
         job_id = str(card.get("jobId", ""))
         if not job_id:
             return None
-
         city     = card.get("city", card.get("locationName", "Unknown"))
         postcode = card.get("postalCode", "")
         pay      = float(card.get("totalPayRateMax") or card.get("totalPayRateMin") or 0)
         contract = card.get("employmentType", card.get("jobType", ""))
         location = f"{city} {postcode}".strip()
         link     = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}&locale=en-GB&recommended=1&intcmpid=searchalljobsleft"
-
         return {
-            "id":       job_id,
-            "location": location,
-            "pay":      round(pay, 2),
-            "contract": contract,
-            "firstDay": "TBC",
-            "schedule": "TBC",
-            "link":     link,
+            "id": job_id, "location": location,
+            "pay": round(pay, 2), "contract": contract,
+            "firstDay": "TBC", "schedule": "TBC",
+            "link": link,
             "found_at": datetime.utcnow().isoformat(),
-            "expiry":   datetime.utcnow() + timedelta(hours=2)
+            "expiry": datetime.utcnow() + timedelta(hours=2)
         }
-    except Exception as e:
-        log.warning(f"Parse error: {e}")
+    except:
         return None
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 async def check_jobs():
     global known_jobs, active_jobs
     if bot_paused:
-        return
-
+        return 0
     jobs = await fetch_jobs()
     new_count = 0
     for job in jobs:
@@ -254,9 +255,9 @@ async def check_jobs():
             new_count += 1
             log.info(f"🆕 NEW: {job['location']} £{job['pay']}/hr")
             await tg_alert(job)
-
     if new_count == 0:
         log.info(f"✅ No new jobs — tracking {len(known_jobs)} total")
+    return len(jobs)
 
 async def check_reminders():
     now = datetime.utcnow()
@@ -265,11 +266,11 @@ async def check_reminders():
         if not job: continue
         mins = int((expiry - now).total_seconds() / 60)
         if 28 <= mins <= 32:
-            await tg_send(f"🚨 <b>FINAL WARNING — 30 mins left!</b>\n📍 {job['location']}\n💰 £{job['pay']}/hr\n<a href='{job['link']}'>APPLY NOW →</a>")
+            await tg_send(f"🚨 <b>FINAL WARNING!</b>\n📍 {job['location']}\n💰 £{job['pay']}/hr\n<a href='{job['link']}'>APPLY NOW →</a>")
         elif mins <= 0:
             del active_jobs[jid]
 
-# ─── TELEGRAM COMMANDS ───────────────────────────────────────────────────────
+# ─── COMMANDS ─────────────────────────────────────────────────────────────────
 async def handle_updates():
     offset = 0
     while True:
@@ -286,7 +287,6 @@ async def handle_updates():
 
 async def process_update(update):
     global bot_paused
-
     if "callback_query" in update:
         cb   = update["callback_query"]
         data = cb.get("data", "")
@@ -297,97 +297,80 @@ async def process_update(update):
         elif data.startswith("skip_"):
             jid = data.replace("skip_", "")
             if jid in active_jobs: del active_jobs[jid]
-            await tg_send("⏭️ Skipped! Watching for next... 👀")
+            await tg_send("⏭️ Skipped! 👀")
         return
 
     msg  = update.get("message", {})
     text = msg.get("text", "").strip().lower()
 
     if text == "/start":
-        await tg_send("""🚀 <b>Amazon Shift Holder SUPERBOT!</b>
-━━━━━━━━━━━━━━━━━━━━━
-⚡ Real browser scraping
+        await tg_send("""🚀 <b>Amazon SUPERBOT!</b>
 🌍 ALL UK warehouse jobs
-🚨 Every alert = URGENT
-🔄 Checking every 30 seconds
-━━━━━━━━━━━━━━━━━━━━━
-Send /test to verify!""")
+🚨 Instant alerts
+Send /scrape to check now!""")
 
     elif text == "/status":
         status = "⏸️ PAUSED" if bot_paused else "✅ RUNNING"
         await tg_send(f"""📊 <b>Bot Status</b>
-━━━━━━━━━━━━━━━━━━━
 Status: {status}
-Watching: ALL UK jobs 🌍
 Jobs found: {len(known_jobs)}
-Active: {len(active_jobs)}
-━━━━━━━━━━━━━━━━━━━""")
+Active: {len(active_jobs)}""")
+
+    elif text == "/scrape":
+        await tg_send("🔍 <b>Scraping Amazon NOW...</b>")
+        count = await check_jobs()
+        await tg_send(f"""✅ <b>Scrape complete!</b>
+Jobs found: {count}
+Total tracked: {len(known_jobs)}
+{"🎉 Alerts sent!" if count > 0 else "⏳ No new jobs yet!"}""")
 
     elif text == "/jobs":
         if not active_jobs:
-            await tg_send("📭 No active jobs right now. Bot watching... 👀")
+            await tg_send("📭 No active jobs. Send /scrape!")
         else:
-            txt = f"📋 <b>{len(active_jobs)} Active Jobs:</b>\n"
+            txt = f"📋 <b>{len(active_jobs)} Jobs:</b>\n"
             for jid in active_jobs:
                 job  = known_jobs.get(jid, {})
                 mins = int((active_jobs[jid] - datetime.utcnow()).total_seconds() / 60)
-                txt += f"📍 {job.get('location')} · £{job.get('pay')}/hr · ⏳{mins}mins\n"
+                txt += f"📍 {job.get('location')} · £{job.get('pay')}/hr · ⏳{mins}m\n"
             await tg_send(txt)
-
-    elif text == "/pause":
-        bot_paused = True
-        await tg_send("⏸️ Bot paused. Send /resume to restart.")
-
-    elif text == "/resume":
-        bot_paused = False
-        await tg_send("▶️ Bot resumed! 🔥")
 
     elif text == "/test":
         await tg_alert({
-            "id": "TEST001",
-            "location": "Test Location UK",
-            "pay": 15.30,
-            "contract": "Full Time",
-            "firstDay": "2026-05-08",
-            "schedule": "Mon-Fri 9:00-17:00",
+            "id": "TEST001", "location": "Test Location UK",
+            "pay": 15.30, "contract": "Full Time",
+            "firstDay": "2026-05-08", "schedule": "Mon-Fri 9:00-17:00",
             "link": "https://www.jobsatamazon.co.uk",
             "expiry": datetime.utcnow() + timedelta(hours=2)
         })
-        await tg_send("✅ <b>Test complete — Bot is working!</b>")
+        await tg_send("✅ Bot working! Send /scrape for real jobs!")
 
-    elif text == "/scrape":
-        await tg_send("🔍 <b>Forcing scrape NOW...</b>")
-        await check_jobs()
-        await tg_send(f"✅ Scrape done! Jobs found: {len(known_jobs)}")
+    elif text == "/pause":
+        bot_paused = True
+        await tg_send("⏸️ Paused. /resume to restart.")
+
+    elif text == "/resume":
+        bot_paused = False
+        await tg_send("▶️ Resumed! 🔥")
 
     elif text == "/help":
-        await tg_send("""🤖 <b>Commands</b>
-/start   /status  /jobs
-/test    /scrape  /pause   /resume  /help""")
+        await tg_send("""/scrape  /status  /jobs
+/test    /pause   /resume  /help""")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
     log.info("🚀 Amazon SUPERBOT Starting!")
     asyncio.create_task(handle_updates())
-
     await asyncio.sleep(2)
     await tg_send("""🚀 <b>Amazon SUPERBOT ONLINE!</b>
-━━━━━━━━━━━━━━━━━━━━━
-⚡ Real browser scraping
 🌍 ALL UK warehouse jobs
-🚨 Instant alerts
-━━━━━━━━━━━━━━━━━━━━━
-Send /test to verify!""")
-
-    # First run immediately
+🔄 Checking every 30 seconds
+Send /scrape to check right now!""")
     await check_jobs()
-
-    # Then check every 30 seconds
-    # (Playwright browser takes ~10-15 secs per check)
     while True:
-        await check_reminders()
         await asyncio.sleep(30)
         await check_jobs()
+        await check_reminders()
 
 if __name__ == "__main__":
     asyncio.run(main())
