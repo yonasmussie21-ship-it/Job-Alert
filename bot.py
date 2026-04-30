@@ -594,6 +594,8 @@ Send /scrape to check now!""")
     elif text == "/status":
         status  = "⏸️ PAUSED" if bot_paused else "✅ RUNNING"
         session = f"🍪 {len(session_cookies)} cookies" if session_cookies else "⚠️ No session"
+        now_hour = datetime.utcnow().hour
+        speed = "3s 🔥 BEAST MODE" if (now_hour >= 18 or now_hour < 1) else "10s 💤 Off peak"
         await tg_send(f"""📊 <b>Bot Status</b>
 ━━━━━━━━━━━━━━━━━
 Status: {status}
@@ -601,7 +603,7 @@ Proxy: ✅ Decodo GB 🇬🇧
 Session: {session}
 Jobs tracked: {len(known_jobs)}
 History: {len(job_history)}
-Speed: 10s ⚡
+Speed: {speed}
 ━━━━━━━━━━━━━━━━━""")
 
     elif text == "/scrape":
@@ -697,7 +699,14 @@ Send /scrape to check now!""")
     await check_jobs()
 
     while True:
-        await asyncio.sleep(10)
+        # ⚡ KING MODE — smart speed based on time
+        now_hour = datetime.utcnow().hour
+        # Peak hours 18:00-01:00 UTC (7pm-2am UK) = BEAST MODE 3s
+        # Off peak = 10s to save resources
+        if now_hour >= 18 or now_hour < 1:
+            await asyncio.sleep(3)   # 🔥 BEAST MODE
+        else:
+            await asyncio.sleep(10)  # 💤 Off peak
         await check_jobs()
 
 if __name__ == "__main__":
