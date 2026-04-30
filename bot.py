@@ -3,31 +3,33 @@ import os
 import json
 import logging
 import aiohttp
-from datetime import datetime, timedelta
+import re
+from datetime import datetime
 from playwright.async_api import async_playwright
 from collections import defaultdict
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
-CHAT_ID      = os.environ.get("CHAT_ID", "1027065157")
-DECODO_USER  = os.environ.get("DECODO_USER", "")
-DECODO_PASS  = os.environ.get("DECODO_PASS", "")
-DECODO_HOST  = os.environ.get("DECODO_HOST", "gb.decodo.com")
-DECODO_PORT  = os.environ.get("DECODO_PORT", "30000")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+CHAT_ID     = os.environ.get("CHAT_ID", "1027065157")
+DECODO_USER = os.environ.get("DECODO_USER", "")
+DECODO_PASS = os.environ.get("DECODO_PASS", "")
+DECODO_HOST = os.environ.get("DECODO_HOST", "gb.decodo.com")
+DECODO_PORT = os.environ.get("DECODO_PORT", "30000")
 
 PROXY_SERVER = f"http://{DECODO_HOST}:{DECODO_PORT}"
-PROXY_AUTH   = {"username": DECODO_USER, "password": DECODO_PASS}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
-known_jobs    = {}
-bot_paused    = False
-job_history   = []
-posting_times = defaultdict(list)
+known_jobs      = {}
+bot_paused      = False
+job_history     = []
+posting_times   = defaultdict(list)
+session_cookies = []
+auth_token      = ""
 
-TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ─── GRAPHQL QUERY ────────────────────────────────────────────────────────────
 GRAPHQL_QUERY = """
@@ -71,7 +73,7 @@ async def tg_send(text, reply_markup=None):
 
 # ─── JOB SCORING ─────────────────────────────────────────────────────────────
 def score_job(job):
-    score = 0
+    score    = 0
     pay      = job.get("pay", 0)
     contract = job.get("contract", "").lower()
     hours    = int(job.get("hours", 0)) if str(job.get("hours", "0")).isdigit() else 0
@@ -109,7 +111,7 @@ async def tg_alert(job, status="new"):
     else:
         header = "⚠️ <b>APPLY MANUALLY!</b>"
 
-    pay_str = job.get('pay_display') or f"{job.get('pay', '?'):.2f}"
+    pay_str = job.get("pay_display") or f"{job.get('pay', '?'):.2f}"
     text = f"""{header}
 ━━━━━━━━━━━━━━━━━━━━━
 📍 <b>{job.get('location', 'Unknown')}</b>
@@ -136,30 +138,112 @@ async def tg_alert(job, status="new"):
     }
     await tg_send(text, markup)
 
-# ─── SCRAPER (Decodo Residential Proxy) ──────────────────────────────────────
+# ─── SMART SESSION BUILDER ────────────────────────────────────────────────────
+async def build_session():
+    """
+    Visit Amazon like a real human first.
+    Collect real cookies + auth tokens.
+    King move — real session = real data.
+    """
+    global session_cookies, auth_token
+    log.info("👑 Building real Amazon session...")
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled"
+                ]
+            )
+            context = await browser.new_context(
+                proxy={"server": PROXY_SERVER, "username": DECODO_USER, "password": DECODO_PASS},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+                timezone_id="Europe/London",
+                viewport={"width": 1280, "height": 800},
+                extra_http_headers={"Accept-Language": "en-GB,en;q=0.9"}
+            )
+
+            # Hide automation
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+            """)
+
+            page = await context.new_page()
+
+            # Step 1: Visit homepage like human
+            log.info("🏠 Visiting homepage...")
+            await page.goto("https://www.jobsatamazon.co.uk", wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
+            await page.evaluate("window.scrollTo(0, 300)")
+            await page.wait_for_timeout(1000)
+
+            # Step 2: Navigate to job search
+            log.info("🔍 Navigating to job search...")
+            await page.goto(
+                "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
+                wait_until="networkidle",
+                timeout=45000
+            )
+            await page.wait_for_timeout(4000)
+
+            # Step 3: Collect cookies
+            cookies = await context.cookies()
+            session_cookies = cookies
+            log.info(f"✅ Session built! {len(session_cookies)} cookies collected")
+            await browser.close()
+            return True
+
+    except Exception as e:
+        log.error(f"Session build error: {e}")
+        return False
+
+# ─── KING SCRAPER ─────────────────────────────────────────────────────────────
 async def fetch_jobs():
+    global session_cookies
     all_jobs = {}
 
     if not DECODO_USER or not DECODO_PASS:
         log.error("❌ Decodo credentials not configured!")
         return []
 
+    # Build session if not exists
+    if not session_cookies:
+        await build_session()
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox"]
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled"
+                ]
             )
             context = await browser.new_context(
-                proxy={
-                    "server": PROXY_SERVER,
-                    "username": DECODO_USER,
-                    "password": DECODO_PASS,
-                },
+                proxy={"server": PROXY_SERVER, "username": DECODO_USER, "password": DECODO_PASS},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-GB",
                 timezone_id="Europe/London",
+                viewport={"width": 1280, "height": 800},
             )
+
+            # Hide automation
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+            """)
+
+            # Inject saved session cookies
+            if session_cookies:
+                await context.add_cookies(session_cookies)
+                log.info(f"🍪 Injected {len(session_cookies)} cookies")
+
             page     = await context.new_page()
             captured = []
 
@@ -179,39 +263,73 @@ async def fetch_jobs():
             await page.goto(
                 "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
                 wait_until="networkidle",
-                timeout=60000
+                timeout=45000
             )
             await page.wait_for_timeout(5000)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(2000)
 
-            # If no intercept, try GraphQL injection
-            if not captured:
-                log.info("💉 Injecting GraphQL call...")
+            if captured:
+                log.info(f"✅ Intercept got {len(captured)} jobs!")
+            else:
+                # Smart injection using real session
+                log.info("💉 Smart injection with real session cookies...")
                 for variables in [
-                    {"locale": "en-GB", "country": "United Kingdom", "keyWords": "warehouse operative", "equalFilters": [], "containFilters": [], "pageSize": 100},
-                    {"locale": "en-GB", "country": "United Kingdom", "keyWords": "", "equalFilters": [], "containFilters": [], "pageSize": 100}
+                    {"locale": "en-GB", "country": "United Kingdom", "keyWords": "warehouse", "equalFilters": [], "containFilters": [], "pageSize": 100},
+                    {"locale": "en-GB", "country": "United Kingdom", "keyWords": "", "equalFilters": [], "containFilters": [], "pageSize": 100},
                 ]:
                     try:
-                        result = await page.evaluate(f"""
-                            async () => {{
-                                const r = await fetch('/graphql', {{
-                                    method: 'POST',
-                                    headers: {{'Content-Type': 'application/json', 'country': 'United Kingdom', 'accept': '*/*'}},
-                                    body: JSON.stringify({{
-                                        operationName: 'searchJobCardsByLocation',
-                                        query: `{GRAPHQL_QUERY.replace('`', '')}`,
-                                        variables: {{searchJobRequest: {json.dumps(variables)}}}
-                                    }})
-                                }});
-                                return await r.json();
-                            }}
-                        """)
-                        cards = result.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
-                        if cards:
-                            log.info(f"💉 Got {len(cards)} jobs via injection!")
-                            captured.extend(cards)
-                            break
+                        result = await page.evaluate("""
+                            async (vars) => {
+                                const query = `query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+                                  searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+                                    nextToken
+                                    jobCards {
+                                      jobId jobTitle jobType employmentType city state
+                                      postalCode locationName geoClusterDescription
+                                      totalPayRateMin totalPayRateMax firstDayOnSite
+                                      hoursPerWeek shiftCode scheduleCount currencyCode __typename
+                                    }
+                                    __typename
+                                  }
+                                }`;
+                                try {
+                                    const r = await fetch('/graphql', {
+                                        method: 'POST',
+                                        credentials: 'include',
+                                        headers: {
+                                            'Content-Type': 'application/json',
+                                            'country': 'United Kingdom',
+                                            'locale': 'en-GB',
+                                            'accept': 'application/json',
+                                        },
+                                        body: JSON.stringify({
+                                            operationName: 'searchJobCardsByLocation',
+                                            query: query,
+                                            variables: {searchJobRequest: vars}
+                                        })
+                                    });
+                                    if (!r.ok) return {error: r.status};
+                                    return await r.json();
+                                } catch(e) {
+                                    return {error: e.toString()};
+                                }
+                            }
+                        """, variables)
+
+                        if result and "error" not in result:
+                            cards = result.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
+                            if cards:
+                                log.info(f"💉 Smart injection got {len(cards)} jobs!")
+                                captured.extend(cards)
+                                session_cookies = await context.cookies()
+                                break
+                            else:
+                                log.info(f"💉 Empty response: {str(result)[:150]}")
+                        else:
+                            log.warning(f"💉 Blocked: {result}")
                     except Exception as e:
                         log.warning(f"Injection error: {e}")
 
@@ -224,10 +342,12 @@ async def fetch_jobs():
 
     except Exception as e:
         log.error(f"Scraper error: {e}")
+        session_cookies = []  # Reset on error
 
-    log.info(f"✅ Total jobs: {len(all_jobs)}")
+    log.info(f"👑 Total: {len(all_jobs)} jobs")
     return list(all_jobs.values())
 
+# ─── PARSE CARD ───────────────────────────────────────────────────────────────
 def parse_card(card):
     try:
         job_id = str(card.get("jobId", ""))
@@ -258,7 +378,6 @@ def parse_card(card):
         if any(s in title.lower() for s in skip):
             return None
 
-        pay_display = f"{pay:.2f}"
         parts = []
         if city: parts.append(city)
         if state and state != city: parts.append(state)
@@ -279,7 +398,7 @@ def parse_card(card):
             "title":       title,
             "location":    location,
             "pay":         round(pay, 2),
-            "pay_display": pay_display,
+            "pay_display": f"{pay:.2f}",
             "contract":    contract,
             "duration":    duration,
             "firstDay":    first_day,
@@ -294,75 +413,50 @@ def parse_card(card):
         log.warning(f"Parse error: {e}")
         return None
 
-# ─── FETCH FULL JOB DETAILS ──────────────────────────────────────────────────
+# ─── FETCH JOB DETAILS ───────────────────────────────────────────────────────
 async def fetch_job_details(job):
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox"]
-            )
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             context = await browser.new_context(
-                proxy={
-                    "server": PROXY_SERVER,
-                    "username": DECODO_USER,
-                    "password": DECODO_PASS,
-                },
+                proxy={"server": PROXY_SERVER, "username": DECODO_USER, "password": DECODO_PASS},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-GB",
-                timezone_id="Europe/London",
             )
+            if session_cookies:
+                await context.add_cookies(session_cookies)
             page = await context.new_page()
-
-            async def handle_response(response):
-                try:
-                    if "graphql" in response.url and response.status == 200:
-                        data = await response.json()
-                        schedules = (data.get("data", {}).get("getSchedules") or
-                                    data.get("data", {}).get("jobSchedules") or
-                                    data.get("data", {}).get("schedules"))
-                        if schedules:
-                            pass
-                        detail = (data.get("data", {}).get("getJobDetails") or
-                                 data.get("data", {}).get("jobDetail"))
-                        if detail:
-                            pass
-                except:
-                    pass
-
-            page.on("response", handle_response)
             await page.goto(job["link"], wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(3000)
+            content = await page.inner_text("body")
 
-            import re
-            content_text = await page.inner_text("body")
+            m = re.search(r'First Day[: ]+([0-9]{4}-[0-9]{2}-[0-9]{2})', content)
+            if m: job["firstDay"] = m.group(1)
 
-            day_match = re.search(r'First Day[: ]+([0-9]{4}-[0-9]{2}-[0-9]{2})', content_text)
-            if day_match:
-                job["firstDay"] = day_match.group(1)
+            m = re.search(r'Schedule[: ]+([A-Za-z, ]+[0-9]{1,2}:[0-9]{2}[^\n]+)', content)
+            if m: job["schedule"] = m.group(1).strip()[:60]
 
-            sched_match = re.search(r'Schedule[: ]+([A-Za-z, ]+[0-9]{1,2}:[0-9]{2}[^\n]+)', content_text)
-            if sched_match:
-                job["schedule"] = sched_match.group(1).strip()[:60]
-
-            hours_match = re.search(r'Hours/Week[: ]+([0-9]+)', content_text)
-            if hours_match:
-                job["hours"] = hours_match.group(1)
+            m = re.search(r'Hours/Week[: ]+([0-9]+)', content)
+            if m: job["hours"] = m.group(1)
 
             for ct in ["Full-time", "Part-time", "Reduced", "Flex"]:
-                if ct.lower() in content_text.lower():
+                if ct.lower() in content.lower():
                     job["contract"] = ct
                     break
 
             await browser.close()
-            log.info(f"✅ Details fetched: {job.get('firstDay')} | {job.get('schedule','TBC')[:30]}")
-
     except Exception as e:
         log.warning(f"Detail fetch error: {e}")
-
     return job
 
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+# ─── SESSION REFRESH ─────────────────────────────────────────────────────────
+async def session_refresh_loop():
+    while True:
+        await asyncio.sleep(25 * 60)
+        log.info("🔄 Refreshing session...")
+        await build_session()
+
+# ─── MAIN CHECK ──────────────────────────────────────────────────────────────
 async def check_jobs():
     global known_jobs, job_history, posting_times
     if bot_paused:
@@ -376,21 +470,16 @@ async def check_jobs():
         if jid not in known_jobs:
             known_jobs[jid] = job
             new_count += 1
-
             job_history.append(job)
-            hour = datetime.utcnow().hour
-            posting_times[job["location"][:20]].append(hour)
-
+            posting_times[job["location"][:20]].append(datetime.utcnow().hour)
             log.info(f"🆕 NEW: {job['location']} £{job['pay']}/hr Score:{job['score']}")
-
             job = await fetch_job_details(job)
             known_jobs[jid] = job
-
             await tg_alert(job, "new")
             asyncio.create_task(auto_navigate(job))
 
     if new_count == 0:
-        log.info(f"✅ No new jobs — {len(known_jobs)} tracked")
+        log.info(f"👑 No new jobs — {len(known_jobs)} tracked")
     return new_count
 
 # ─── AUTO NAVIGATION ─────────────────────────────────────────────────────────
@@ -399,22 +488,15 @@ async def auto_navigate(job):
     await tg_alert(job, "navigating")
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox"]
-            )
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             context = await browser.new_context(
-                proxy={
-                    "server": PROXY_SERVER,
-                    "username": DECODO_USER,
-                    "password": DECODO_PASS,
-                },
+                proxy={"server": PROXY_SERVER, "username": DECODO_USER, "password": DECODO_PASS},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-GB",
-                timezone_id="Europe/London",
             )
+            if session_cookies:
+                await context.add_cookies(session_cookies)
             page = await context.new_page()
-
             await page.goto(job["link"], wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(2000)
 
@@ -424,7 +506,6 @@ async def auto_navigate(job):
                     if btn:
                         await btn.click()
                         await page.wait_for_timeout(2000)
-                        log.info("✅ Clicked Apply")
                         break
                 except: pass
 
@@ -434,7 +515,6 @@ async def auto_navigate(job):
                     if btn:
                         await btn.click()
                         await page.wait_for_timeout(2000)
-                        log.info("✅ Clicked Next")
                         break
                 except: pass
 
@@ -444,14 +524,12 @@ async def auto_navigate(job):
                     if btn:
                         await btn.click()
                         await page.wait_for_timeout(2000)
-                        log.info("✅ Clicked Start Application")
                         break
                 except: pass
 
             job["link"] = page.url if page.url != "about:blank" else job["link"]
             await browser.close()
             await tg_alert(job, "ready")
-
     except Exception as e:
         log.error(f"Navigation error: {e}")
         await tg_alert(job, "failed")
@@ -461,17 +539,16 @@ async def send_daily_summary():
     while True:
         now = datetime.utcnow()
         if now.hour == 7 and now.minute == 0:
-            today_jobs = [j for j in job_history
-                         if j.get("found_at", "")[:10] == now.strftime("%Y-%m-%d")]
-            if today_jobs:
-                best    = max(today_jobs, key=lambda x: x.get("score", 0))
-                avg_pay = sum(j.get("pay", 0) for j in today_jobs) / len(today_jobs)
+            today = [j for j in job_history if j.get("found_at","")[:10] == now.strftime("%Y-%m-%d")]
+            if today:
+                best    = max(today, key=lambda x: x.get("score", 0))
+                avg_pay = sum(j.get("pay", 0) for j in today) / len(today)
                 await tg_send(f"""📊 <b>Daily Summary</b>
 ━━━━━━━━━━━━━━━━━
 📅 {now.strftime('%Y-%m-%d')}
-🆕 Jobs found: {len(today_jobs)}
+🆕 Jobs: {len(today)}
 💰 Avg pay: £{avg_pay:.2f}/hr
-⭐ Best job: {best.get('location', 'Unknown')} £{best.get('pay', '?')}/hr
+⭐ Best: {best.get('location','?')} £{best.get('pay','?')}/hr
 ━━━━━━━━━━━━━━━━━
 Keep going Yonas! 💪""")
             await asyncio.sleep(60)
@@ -495,97 +572,86 @@ async def handle_updates():
 async def process_update(update):
     global bot_paused
     if "callback_query" in update:
-        cb   = update["callback_query"]
-        data = cb.get("data", "")
-        if data.startswith("applied_"):
-            await tg_send("✅ Applied! Good luck Yonas! 💪🔥")
-        elif data.startswith("skip_"):
-            await tg_send("⏭️ Skipped! 👀")
+        cb = update["callback_query"]
+        d  = cb.get("data", "")
+        if d.startswith("applied_"): await tg_send("✅ Applied! Good luck Yonas! 💪🔥")
+        elif d.startswith("skip_"):  await tg_send("⏭️ Skipped! 👀")
         return
 
     msg  = update.get("message", {})
     text = msg.get("text", "").strip().lower()
 
     if text == "/start":
-        await tg_send("""🚀 <b>Amazon SUPERBOT v3 — Decodo Edition!</b>
-⚡ Decodo Residential Proxies
+        await tg_send("""👑 <b>Amazon KING BOT v4!</b>
+⚡ Decodo Residential Proxies 🇬🇧
+🍪 Real session + cookie auth
 🌍 ALL UK warehouse jobs
-⭐ Smart job scoring
-📊 Daily summaries
+⭐ Smart scoring
 🤖 Auto-navigates application
 👆 You just tap SUBMIT!
 Send /scrape to check now!""")
 
     elif text == "/status":
-        status       = "⏸️ PAUSED" if bot_paused else "✅ RUNNING"
-        proxy_status = "✅ Decodo Connected" if DECODO_USER else "❌ Not configured"
+        status  = "⏸️ PAUSED" if bot_paused else "✅ RUNNING"
+        session = f"🍪 {len(session_cookies)} cookies" if session_cookies else "⚠️ No session"
         await tg_send(f"""📊 <b>Bot Status</b>
 ━━━━━━━━━━━━━━━━━
 Status: {status}
-Proxy: {proxy_status}
-Provider: 🔵 Decodo Residential
-Location: Great Britain 🇬🇧
+Proxy: ✅ Decodo GB 🇬🇧
+Session: {session}
 Jobs tracked: {len(known_jobs)}
-Total history: {len(job_history)}
-Check speed: every 3 seconds ⚡
+History: {len(job_history)}
+Speed: 10s ⚡
 ━━━━━━━━━━━━━━━━━""")
 
     elif text == "/scrape":
         await tg_send("🔍 <b>Scanning ALL UK Amazon jobs...</b>")
         count = await check_jobs()
-        await tg_send(f"""✅ <b>Scan complete!</b>
-New jobs: {count}
-Total tracked: {len(known_jobs)}
-{"🎉 Alerts sent!" if count > 0 else "⏳ No new jobs right now!"}""")
+        await tg_send(f"✅ New: {count} | Tracked: {len(known_jobs)}\n{'🎉 Alerts sent!' if count > 0 else '⏳ No new jobs!'}")
+
+    elif text == "/session":
+        await tg_send("🔄 Rebuilding session...")
+        ok = await build_session()
+        await tg_send(f"{'✅ ' + str(len(session_cookies)) + ' cookies loaded!' if ok else '❌ Failed'}")
 
     elif text == "/jobs":
         if not known_jobs:
-            await tg_send("📭 No jobs yet. Send /scrape!")
+            await tg_send("📭 No jobs yet!")
         else:
             txt = f"📋 <b>Last {min(5,len(known_jobs))} Jobs:</b>\n━━━━━━━━━━━\n"
             for job in list(known_jobs.values())[-5:]:
-                stars = get_star_rating(job.get("score", 0))
-                txt += f"{stars}\n📍 {job.get('location')}\n💰 £{job.get('pay')}/hr | 📅{job.get('firstDay')}\n\n"
+                txt += f"{get_star_rating(job.get('score',0))}\n📍 {job.get('location')}\n💰 £{job.get('pay')}/hr\n\n"
             await tg_send(txt)
 
     elif text == "/history":
         if not job_history:
-            await tg_send("📭 No history yet!")
+            await tg_send("📭 No history!")
         else:
             total = len(job_history)
-            avg   = sum(j.get("pay", 0) for j in job_history) / total
-            best  = max(job_history, key=lambda x: x.get("score", 0))
-            await tg_send(f"""📊 <b>Job History</b>
-━━━━━━━━━━━━━━━━━
-Total found: {total}
-Avg pay: £{avg:.2f}/hr
-Best: {best.get('location', '?')} £{best.get('pay', '?')}/hr
-━━━━━━━━━━━━━━━━━""")
+            avg   = sum(j.get("pay",0) for j in job_history) / total
+            best  = max(job_history, key=lambda x: x.get("score",0))
+            await tg_send(f"📊 Total: {total} | Avg: £{avg:.2f}/hr | Best: {best.get('location','?')}")
 
     elif text == "/predict":
         if not posting_times:
-            await tg_send("📭 Not enough data yet!\nKeep bot running to learn patterns!")
+            await tg_send("📭 Not enough data yet!")
         else:
             txt = "🧠 <b>Posting Patterns</b>\n━━━━━━━━━━━━━━━\n"
             for loc, times in list(posting_times.items())[:5]:
                 if times:
                     common = max(set(times), key=times.count)
-                    txt += f"📍 {loc}\n⏰ Usually posts at {common}:00 UTC\n\n"
+                    txt += f"📍 {loc}\n⏰ Usually {common}:00 UTC\n\n"
             await tg_send(txt)
 
     elif text == "/test":
         await tg_alert({
-            "id": "JOB-UK-0000000214",
+            "id": "JOB-UK-TEST-001",
             "title": "Warehouse Operative",
-            "location": "Rugby, England (Coventry, Rugby, Daventry Area) CV23 0XF",
-            "pay": 14.30,
-            "contract": "Full-time",
-            "duration": "Seasonal",
-            "firstDay": "2026-05-10",
-            "schedule": "Sun, Mon, Tue, Wed, Thu 18:30-2:30",
-            "hours": "40",
-            "score": 85,
-            "link": "https://www.jobsatamazon.co.uk/app#/jobDetail?jobId=JOB-UK-0000000214&locale=en-GB",
+            "location": "Enfield, England (North-East London) EN3 7PZ",
+            "pay": 15.30, "contract": "Reduced", "duration": "Seasonal",
+            "firstDay": "2026-05-14", "schedule": "Thu, Fri, Sat 23:45-10:15",
+            "hours": "30", "score": 90,
+            "link": "https://www.jobsatamazon.co.uk",
         }, "new")
 
     elif text == "/pause":
@@ -597,38 +663,41 @@ Best: {best.get('location', '?')} £{best.get('pay', '?')}/hr
         await tg_send("▶️ Resumed! 🔥")
 
     elif text == "/help":
-        await tg_send("""🤖 <b>Commands</b>
+        await tg_send("""👑 <b>King Bot Commands</b>
 /scrape   — Scan now
 /status   — Bot status
+/session  — Rebuild session
 /jobs     — Recent jobs
 /history  — All time stats
 /predict  — Posting patterns
 /test     — Test alert
 /pause    — Pause
-/resume   — Resume
-/help     — This message""")
+/resume   — Resume""")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("🚀 Amazon SUPERBOT v3 — Decodo Edition Starting!")
+    log.info("👑 Amazon KING BOT v4 Starting!")
+
+    # Build real session first — king move
+    await build_session()
+
     asyncio.create_task(handle_updates())
     asyncio.create_task(send_daily_summary())
+    asyncio.create_task(session_refresh_loop())
 
     await asyncio.sleep(2)
-    await tg_send("""🚀 <b>Amazon SUPERBOT v3 ONLINE!</b>
-⚡ Decodo Residential Proxies 🔵
+    await tg_send(f"""👑 <b>Amazon KING BOT v4 ONLINE!</b>
+⚡ Decodo Residential Proxies 🇬🇧
+🍪 Session: {len(session_cookies)} cookies loaded
 🌍 ALL UK warehouse jobs
-⭐ Smart scoring system
-📊 Daily summaries at 8am
 🤖 Auto-navigates application
 👆 You just tap SUBMIT!
 Send /scrape to check now!""")
 
     await check_jobs()
 
-    # Check every 3 seconds — beast mode! 🔥
     while True:
-        await asyncio.sleep(3)
+        await asyncio.sleep(10)
         await check_jobs()
 
 if __name__ == "__main__":
