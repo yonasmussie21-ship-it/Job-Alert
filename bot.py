@@ -8,9 +8,15 @@ from playwright.async_api import async_playwright
 from collections import defaultdict
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("CHAT_ID", "1027065157")
-SBR_WS    = os.environ.get("SBR_WS", "")
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
+CHAT_ID      = os.environ.get("CHAT_ID", "1027065157")
+DECODO_USER  = os.environ.get("DECODO_USER", "")
+DECODO_PASS  = os.environ.get("DECODO_PASS", "")
+DECODO_HOST  = os.environ.get("DECODO_HOST", "gb.decodo.com")
+DECODO_PORT  = os.environ.get("DECODO_PORT", "30000")
+
+PROXY_SERVER = f"http://{DECODO_HOST}:{DECODO_PORT}"
+PROXY_AUTH   = {"username": DECODO_USER, "password": DECODO_PASS}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -18,8 +24,8 @@ log = logging.getLogger(__name__)
 # ─── STATE ───────────────────────────────────────────────────────────────────
 known_jobs    = {}
 bot_paused    = False
-job_history   = []  # All jobs ever found
-posting_times = defaultdict(list)  # Track when jobs post by location
+job_history   = []
+posting_times = defaultdict(list)
 
 TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -70,17 +76,14 @@ def score_job(job):
     contract = job.get("contract", "").lower()
     hours    = int(job.get("hours", 0)) if str(job.get("hours", "0")).isdigit() else 0
 
-    # Pay score
     if pay >= 15.30:   score += 40
     elif pay >= 14.30: score += 30
     else:              score += 15
 
-    # Contract score
-    if "full" in contract:    score += 35
+    if "full" in contract:      score += 35
     elif "reduced" in contract: score += 25
-    elif "part" in contract:  score += 15
+    elif "part" in contract:    score += 15
 
-    # Hours score
     if hours >= 40:   score += 25
     elif hours >= 30: score += 18
     elif hours >= 20: score += 10
@@ -88,14 +91,14 @@ def score_job(job):
     return min(score, 100)
 
 def get_star_rating(score):
-    if score >= 85: return "⭐⭐⭐ EXCELLENT"
+    if score >= 85:   return "⭐⭐⭐ EXCELLENT"
     elif score >= 65: return "⭐⭐ GOOD"
-    else: return "⭐ OK"
+    else:             return "⭐ OK"
 
 # ─── ALERT ───────────────────────────────────────────────────────────────────
 async def tg_alert(job, status="new"):
-    score  = job.get("score", 0)
-    stars  = get_star_rating(score)
+    score = job.get("score", 0)
+    stars = get_star_rating(score)
 
     if status == "new":
         header = f"🚨 <b>NEW AMAZON JOB — ACT NOW!</b>\n{stars} | Score: {score}/100"
@@ -133,17 +136,30 @@ async def tg_alert(job, status="new"):
     }
     await tg_send(text, markup)
 
-# ─── SCRAPER ─────────────────────────────────────────────────────────────────
+# ─── SCRAPER (Decodo Residential Proxy) ──────────────────────────────────────
 async def fetch_jobs():
     all_jobs = {}
-    if not SBR_WS:
-        log.error("❌ SBR_WS not configured!")
+
+    if not DECODO_USER or not DECODO_PASS:
+        log.error("❌ Decodo credentials not configured!")
         return []
 
     try:
         async with async_playwright() as p:
-            browser  = await p.chromium.connect_over_cdp(SBR_WS)
-            context  = browser.contexts[0] if browser.contexts else await browser.new_context()
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
+            context = await browser.new_context(
+                proxy={
+                    "server": PROXY_SERVER,
+                    "username": DECODO_USER,
+                    "password": DECODO_PASS,
+                },
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+                timezone_id="Europe/London",
+            )
             page     = await context.new_page()
             captured = []
 
@@ -169,7 +185,7 @@ async def fetch_jobs():
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(3000)
 
-            # If no intercept try injection
+            # If no intercept, try GraphQL injection
             if not captured:
                 log.info("💉 Injecting GraphQL call...")
                 for variables in [
@@ -218,19 +234,17 @@ def parse_card(card):
         if not job_id:
             return None
 
-        title    = card.get("jobTitle", "Warehouse Operative") or "Warehouse Operative"
-        city     = card.get("city") or card.get("locationName") or ""
-        state    = card.get("state") or "England"
-        postcode = card.get("postalCode") or ""
-        geo      = card.get("geoClusterDescription") or ""
-        pay      = float(card.get("totalPayRateMax") or card.get("totalPayRateMin") or 0)
-        
-        # Fix contract - get both duration and type
+        title      = card.get("jobTitle", "Warehouse Operative") or "Warehouse Operative"
+        city       = card.get("city") or card.get("locationName") or ""
+        state      = card.get("state") or "England"
+        postcode   = card.get("postalCode") or ""
+        geo        = card.get("geoClusterDescription") or ""
+        pay        = float(card.get("totalPayRateMax") or card.get("totalPayRateMin") or 0)
         employment = card.get("employmentType") or ""
         job_type   = card.get("jobType") or ""
-        # employmentType has full-time/part-time, jobType has Seasonal
+
         if employment and employment.lower() not in ["seasonal", "temporary"]:
-            contract = employment  # Full-time, Part-time, Reduced
+            contract = employment
             duration = job_type or "Seasonal"
         else:
             contract = employment or job_type or "Full-time"
@@ -240,19 +254,15 @@ def parse_card(card):
         first_day = card.get("firstDayOnSite") or "TBC"
         schedule  = card.get("shiftCode") or "TBC"
 
-        # Skip non-warehouse jobs
         skip = ["customer service", "vcc", "virtual", "remote", "manager", "software", "engineer"]
         if any(s in title.lower() for s in skip):
             return None
 
-        # Fix pay display
         pay_display = f"{pay:.2f}"
-
-        # Full location - handle None values
         parts = []
         if city: parts.append(city)
         if state and state != city: parts.append(state)
-        
+
         if geo and postcode:
             location = f"{', '.join(parts)} ({geo}) {postcode}".strip()
         elif geo:
@@ -265,18 +275,18 @@ def parse_card(card):
         link = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}&locale=en-GB&recommended=1&intcmpid=searchalljobsleft"
 
         job = {
-            "id":       job_id,
-            "title":    title,
-            "location": location,
-            "pay":      round(pay, 2),
+            "id":          job_id,
+            "title":       title,
+            "location":    location,
+            "pay":         round(pay, 2),
             "pay_display": pay_display,
-            "contract": contract,
-            "duration": duration,
-            "firstDay": first_day,
-            "schedule": schedule,
-            "hours":    hours,
-            "link":     link,
-            "found_at": datetime.utcnow().isoformat(),
+            "contract":    contract,
+            "duration":    duration,
+            "firstDay":    first_day,
+            "schedule":    schedule,
+            "hours":       hours,
+            "link":        link,
+            "found_at":    datetime.utcnow().isoformat(),
         }
         job["score"] = score_job(job)
         return job
@@ -286,59 +296,59 @@ def parse_card(card):
 
 # ─── FETCH FULL JOB DETAILS ──────────────────────────────────────────────────
 async def fetch_job_details(job):
-    """Fetch schedule, first day, hours from job detail page"""
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(SBR_WS)
-            context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            page    = await context.new_page()
-
-            captured = {}
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
+            context = await browser.new_context(
+                proxy={
+                    "server": PROXY_SERVER,
+                    "username": DECODO_USER,
+                    "password": DECODO_PASS,
+                },
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+                timezone_id="Europe/London",
+            )
+            page = await context.new_page()
 
             async def handle_response(response):
                 try:
                     if "graphql" in response.url and response.status == 200:
                         data = await response.json()
-                        # Check for schedule data
                         schedules = (data.get("data", {}).get("getSchedules") or
                                     data.get("data", {}).get("jobSchedules") or
                                     data.get("data", {}).get("schedules"))
                         if schedules:
-                            captured["schedules"] = schedules
-
-                        # Check for job detail
+                            pass
                         detail = (data.get("data", {}).get("getJobDetails") or
                                  data.get("data", {}).get("jobDetail"))
                         if detail:
-                            captured["detail"] = detail
+                            pass
                 except:
                     pass
 
             page.on("response", handle_response)
-
             await page.goto(job["link"], wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(4000)
 
-            # Extract from page text
             import re
             content_text = await page.inner_text("body")
 
-            # First Day
             day_match = re.search(r'First Day[: ]+([0-9]{4}-[0-9]{2}-[0-9]{2})', content_text)
             if day_match:
                 job["firstDay"] = day_match.group(1)
 
-            # Schedule
             sched_match = re.search(r'Schedule[: ]+([A-Za-z, ]+[0-9]{1,2}:[0-9]{2}[^\n]+)', content_text)
             if sched_match:
                 job["schedule"] = sched_match.group(1).strip()[:60]
 
-            # Hours
             hours_match = re.search(r'Hours/Week[: ]+([0-9]+)', content_text)
             if hours_match:
                 job["hours"] = hours_match.group(1)
 
-            # Contract type
             for ct in ["Full-time", "Part-time", "Reduced", "Flex"]:
                 if ct.lower() in content_text.lower():
                     job["contract"] = ct
@@ -367,17 +377,15 @@ async def check_jobs():
             known_jobs[jid] = job
             new_count += 1
 
-            # Track history & posting times
             job_history.append(job)
             hour = datetime.utcnow().hour
             posting_times[job["location"][:20]].append(hour)
 
             log.info(f"🆕 NEW: {job['location']} £{job['pay']}/hr Score:{job['score']}")
-            
-            # Fetch full details first then alert
+
             job = await fetch_job_details(job)
-            known_jobs[jid] = job  # Update with full details
-            
+            known_jobs[jid] = job
+
             await tg_alert(job, "new")
             asyncio.create_task(auto_navigate(job))
 
@@ -391,9 +399,21 @@ async def auto_navigate(job):
     await tg_alert(job, "navigating")
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(SBR_WS)
-            context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            page    = await context.new_page()
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
+            context = await browser.new_context(
+                proxy={
+                    "server": PROXY_SERVER,
+                    "username": DECODO_USER,
+                    "password": DECODO_PASS,
+                },
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+                timezone_id="Europe/London",
+            )
+            page = await context.new_page()
 
             await page.goto(job["link"], wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(2000)
@@ -440,13 +460,11 @@ async def auto_navigate(job):
 async def send_daily_summary():
     while True:
         now = datetime.utcnow()
-        # Send at 8am UK time
         if now.hour == 7 and now.minute == 0:
             today_jobs = [j for j in job_history
                          if j.get("found_at", "")[:10] == now.strftime("%Y-%m-%d")]
-
             if today_jobs:
-                best = max(today_jobs, key=lambda x: x.get("score", 0))
+                best    = max(today_jobs, key=lambda x: x.get("score", 0))
                 avg_pay = sum(j.get("pay", 0) for j in today_jobs) / len(today_jobs)
                 await tg_send(f"""📊 <b>Daily Summary</b>
 ━━━━━━━━━━━━━━━━━
@@ -489,8 +507,8 @@ async def process_update(update):
     text = msg.get("text", "").strip().lower()
 
     if text == "/start":
-        await tg_send("""🚀 <b>Amazon SUPERBOT v2!</b>
-⚡ Bright Data Scraping Browser
+        await tg_send("""🚀 <b>Amazon SUPERBOT v3 — Decodo Edition!</b>
+⚡ Decodo Residential Proxies
 🌍 ALL UK warehouse jobs
 ⭐ Smart job scoring
 📊 Daily summaries
@@ -499,15 +517,17 @@ async def process_update(update):
 Send /scrape to check now!""")
 
     elif text == "/status":
-        status     = "⏸️ PAUSED" if bot_paused else "✅ RUNNING"
-        sbr_status = "✅ Connected" if SBR_WS else "❌ Not configured"
+        status       = "⏸️ PAUSED" if bot_paused else "✅ RUNNING"
+        proxy_status = "✅ Decodo Connected" if DECODO_USER else "❌ Not configured"
         await tg_send(f"""📊 <b>Bot Status</b>
 ━━━━━━━━━━━━━━━━━
 Status: {status}
-Scraping Browser: {sbr_status}
+Proxy: {proxy_status}
+Provider: 🔵 Decodo Residential
+Location: Great Britain 🇬🇧
 Jobs tracked: {len(known_jobs)}
 Total history: {len(job_history)}
-Check speed: every 5 seconds ⚡
+Check speed: every 3 seconds ⚡
 ━━━━━━━━━━━━━━━━━""")
 
     elif text == "/scrape":
@@ -590,13 +610,13 @@ Best: {best.get('location', '?')} £{best.get('pay', '?')}/hr
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("🚀 Amazon SUPERBOT v2 Starting!")
+    log.info("🚀 Amazon SUPERBOT v3 — Decodo Edition Starting!")
     asyncio.create_task(handle_updates())
     asyncio.create_task(send_daily_summary())
 
     await asyncio.sleep(2)
-    await tg_send("""🚀 <b>Amazon SUPERBOT v2 ONLINE!</b>
-⚡ Bright Data Scraping Browser
+    await tg_send("""🚀 <b>Amazon SUPERBOT v3 ONLINE!</b>
+⚡ Decodo Residential Proxies 🔵
 🌍 ALL UK warehouse jobs
 ⭐ Smart scoring system
 📊 Daily summaries at 8am
@@ -606,9 +626,9 @@ Send /scrape to check now!""")
 
     await check_jobs()
 
-    # Check every 5 seconds!
+    # Check every 3 seconds — beast mode! 🔥
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
         await check_jobs()
 
 if __name__ == "__main__":
