@@ -593,9 +593,15 @@ Send /scrape to check now!""")
 
     elif text == "/status":
         status  = "⏸️ PAUSED" if bot_paused else "✅ RUNNING"
-        session = f"🍪 {len(session_cookies)} cookies" if session_cookies else "⚠️ No session"
-        now_hour = datetime.utcnow().hour
-        speed = "3s 🔥 BEAST MODE" if (now_hour >= 18 or now_hour < 1) else "10s 💤 Off peak"
+        session  = f"🍪 {len(session_cookies)} cookies" if session_cookies else "⚠️ No session"
+        now      = datetime.utcnow()
+        h, m     = now.hour, now.minute
+        am_peak  = (h == 10 and m >= 55) or (h == 11 and m <= 25)
+        pm_peak  = (h == 22 and m >= 55) or (h == 23 and m <= 25)
+        if am_peak or pm_peak:
+            speed = "1s ⚡ ULTRA BEAST — Peak window!"
+        else:
+            speed = "3s 🔥 BEAST MODE"
         await tg_send(f"""📊 <b>Bot Status</b>
 ━━━━━━━━━━━━━━━━━
 Status: {status}
@@ -699,14 +705,24 @@ Send /scrape to check now!""")
     await check_jobs()
 
     while True:
-        # ⚡ KING MODE — smart speed based on time
-        now_hour = datetime.utcnow().hour
-        # Peak hours 18:00-01:00 UTC (7pm-2am UK) = BEAST MODE 3s
-        # Off peak = 10s to save resources
-        if now_hour >= 18 or now_hour < 1:
-            await asyncio.sleep(3)   # 🔥 BEAST MODE
+        # 👑 KING BOT — precision timing
+        now        = datetime.utcnow()
+        now_hour   = now.hour
+        now_minute = now.minute
+
+        # ⚡ ULTRA BEAST: 11am UK (10:55-11:25 UTC) = 1 second
+        am_peak = (now_hour == 10 and now_minute >= 55) or \
+                  (now_hour == 11 and now_minute <= 25)
+
+        # ⚡ ULTRA BEAST: 11pm UK (22:55-23:25 UTC) = 1 second
+        pm_peak = (now_hour == 22 and now_minute >= 55) or \
+                  (now_hour == 23 and now_minute <= 25)
+
+        if am_peak or pm_peak:
+            await asyncio.sleep(1)   # ⚡ 1 SECOND — peak windows!
         else:
-            await asyncio.sleep(10)  # 💤 Off peak
+            await asyncio.sleep(3)   # 🔥 3 SECONDS — all other times
+
         await check_jobs()
 
 if __name__ == "__main__":
