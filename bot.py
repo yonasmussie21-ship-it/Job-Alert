@@ -207,72 +207,75 @@ async def build_session():
         log.error(f"Session build error: {e}")
         return False
 
-# ─── ULTRA LEAN SCRAPER — API ONLY, TINY DATA USAGE ──────────────────────────
+# ─── KING SCRAPER — Browser interception, no proxy needed ───────────────────
 async def fetch_jobs():
     """
-    Sends a tiny GraphQL API call (~5KB) through proxy.
-    No full page loads. No browser through proxy.
-    Data usage: ~1-2GB/month instead of 10GB/day!
+    Loads Amazon job search page directly.
+    Intercepts GraphQL response automatically.
+    No proxy needed — Amazon allows direct access!
     """
-    global session_headers, session_cookies_str
     all_jobs = {}
 
-    if not session_headers:
-        log.warning("No session — rebuilding...")
-        await build_session()
-        if not session_headers:
-            return []
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-gpu",
+                    "--disable-images",  # Skip images — saves bandwidth
+                    "--blink-settings=imagesEnabled=false",
+                ]
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+                timezone_id="Europe/London",
+            )
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            """)
 
-    variables_list = [
-        {"locale": "en-GB", "country": "United Kingdom", "keyWords": "warehouse", "equalFilters": [], "containFilters": [], "pageSize": 100},
-        {"locale": "en-GB", "country": "United Kingdom", "keyWords": "", "equalFilters": [], "containFilters": [], "pageSize": 100},
-        {"locale": "en-GB", "country": "United Kingdom", "keyWords": "warehouse operative", "equalFilters": [], "containFilters": [], "pageSize": 100},
-    ]
+            # Block images, fonts, media to save bandwidth
+            await context.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}", lambda route: route.abort())
 
-    # Run all 3 searches in parallel — 3x faster!
-    async def search(variables):
-        try:
-            payload = {
-                "operationName": "searchJobCardsByLocation",
-                "query": GRAPHQL_QUERY,
-                "variables": {"searchJobRequest": variables}
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://www.jobsatamazon.co.uk/graphql",
-                    json=payload,
-                    headers=session_headers,
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as resp:
-                    if resp.status == 200:
-                        try:
-                            data  = await resp.json(content_type=None)
-                            if not data:
-                                log.warning(f"Empty response for '{variables['keyWords']}'")
-                                return []
-                            cards = (data.get("data") or {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
-                            log.info(f"✅ Search '{variables['keyWords']}': {len(cards)} jobs")
-                            return cards or []
-                        except Exception as je:
-                            raw = await resp.text()
-                            log.warning(f"JSON error: {je} | Raw: {raw[:200]}")
-                            return []
-                    else:
-                        body = await resp.text()
-                        log.warning(f"API status {resp.status} for '{variables['keyWords']}' | Body: {body[:200]}")
-                        return []
-        except Exception as e:
-            log.warning(f"Search error: {e}")
-            return []
+            page     = await context.new_page()
+            captured = []
 
-    # Run all 3 searches simultaneously — parallel scraping!
-    results = await asyncio.gather(*[search(v) for v in variables_list])
+            async def handle_response(response):
+                try:
+                    if "graphql" in response.url and response.status == 200:
+                        data  = await response.json()
+                        cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
+                        if cards:
+                            log.info(f"🎯 Intercepted {len(cards)} jobs!")
+                            captured.extend(cards)
+                except: pass
 
-    for cards in results:
-        for card in cards:
-            job = parse_card(card)
-            if job and job["id"] not in all_jobs:
-                all_jobs[job["id"]] = job
+            page.on("response", handle_response)
+
+            await page.goto(
+                "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
+                wait_until="networkidle",
+                timeout=45000
+            )
+            await page.wait_for_timeout(3000)
+
+            # Scroll to trigger any lazy loading
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(2000)
+
+            await browser.close()
+
+            for card in captured:
+                job = parse_card(card)
+                if job and job["id"] not in all_jobs:
+                    all_jobs[job["id"]] = job
+
+    except Exception as e:
+        log.error(f"Scraper error: {e}")
 
     log.info(f"👑 Total unique jobs: {len(all_jobs)}")
     return list(all_jobs.values())
