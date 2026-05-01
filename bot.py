@@ -211,23 +211,29 @@ async def fetch_jobs():
                 "query": GRAPHQL_QUERY,
                 "variables": {"searchJobRequest": variables}
             }
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
+            async with aiohttp.ClientSession() as session:
                 async with session.post(
                     "https://www.jobsatamazon.co.uk/graphql",
                     json=payload,
                     headers=session_headers,
-                    proxy=PROXY_URL,
                     timeout=aiohttp.ClientTimeout(total=20),
-                    ssl=False
                 ) as resp:
                     if resp.status == 200:
-                        data  = await resp.json()
-                        cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
-                        log.info(f"✅ Search '{variables['keyWords']}': {len(cards)} jobs")
-                        return cards
+                        try:
+                            data  = await resp.json(content_type=None)
+                            if not data:
+                                log.warning(f"Empty response for '{variables['keyWords']}'")
+                                return []
+                            cards = (data.get("data") or {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
+                            log.info(f"✅ Search '{variables['keyWords']}': {len(cards)} jobs")
+                            return cards or []
+                        except Exception as je:
+                            raw = await resp.text()
+                            log.warning(f"JSON error: {je} | Raw: {raw[:200]}")
+                            return []
                     else:
-                        log.warning(f"API status {resp.status} for '{variables['keyWords']}'")
+                        body = await resp.text()
+                        log.warning(f"API status {resp.status} for '{variables['keyWords']}' | Body: {body[:200]}")
                         return []
         except Exception as e:
             log.warning(f"Search error: {e}")
@@ -434,7 +440,7 @@ async def process_update(update):
 
     if text == "/start":
         await tg_send("""👑 <b>Amazon KING BOT v6!</b>
-⚡ Ultra lean — ~1GB/month only
+✅ Direct mode — Zero proxy cost!
 🔥 Parallel x3 scraping
 🌍 ALL UK warehouse jobs
 🤖 Auto-navigates application
@@ -448,13 +454,12 @@ Send /scrape to check now!""")
         h, m    = now.hour, now.minute
         am_peak = (h == 10 and m >= 55) or (h == 11 and m <= 25)
         pm_peak = (h == 22 and m >= 55) or (h == 23 and m <= 25)
-        speed   = "1s ⚡ ULTRA BEAST" if (am_peak or pm_peak) else "30s 💤 Data saver"
+        speed   = "1s ⚡ ULTRA BEAST" if (am_peak or pm_peak) else "30s 💤 Normal"
         await tg_send(f"""📊 <b>Bot Status</b>
 ━━━━━━━━━━━━━━━━━
 Status: {status}
 Session: {session}
-Proxy: ✅ Decodo GB 🇬🇧
-Mode: Lean API — ~1GB/month
+Mode: ✅ Direct — No proxy!
 Jobs tracked: {len(known_jobs)}
 History: {len(job_history)}
 Speed: {speed}
@@ -551,7 +556,7 @@ async def main():
 
     await asyncio.sleep(2)
     await tg_send(f"""👑 <b>Amazon KING BOT v6 ONLINE!</b>
-⚡ Ultra Lean Mode — ~1GB/month
+✅ Direct mode — No proxy needed!
 🔥 Parallel x3 scraping
 ✅ Session: {'Ready' if session_headers else 'Building...'}
 🌍 ALL UK warehouse jobs
