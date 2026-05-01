@@ -247,7 +247,7 @@ async def fetch_jobs():
                         data  = await response.json()
                         cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
                         if cards:
-                            log.info(f"🎯 Intercepted {len(cards)} jobs! Raw first card: {json.dumps(cards[0])[:500]}")
+                            log.info(f"🎯 Intercepted {len(cards)} jobs!")
                             captured.extend(cards)
                 except: pass
 
@@ -308,10 +308,7 @@ def parse_card(card):
         # Skip non-warehouse jobs
         skip = ["customer service", "vcc", "virtual", "remote", "manager", "software", "engineer"]
         if any(s in title.lower() for s in skip):
-            log.info(f"⏭️ Skipped: {title}")
             return None
-        
-        log.info(f"✅ Parsed job: {title} | {location} | £{pay}/hr")
 
         parts = []
         if city: parts.append(city)
