@@ -448,7 +448,7 @@ Send /scrape to check now!""")
         h, m    = now.hour, now.minute
         am_peak = (h == 10 and m >= 55) or (h == 11 and m <= 25)
         pm_peak = (h == 22 and m >= 55) or (h == 23 and m <= 25)
-        speed   = "1s ⚡ ULTRA BEAST" if (am_peak or pm_peak) else "3s 🔥 BEAST MODE"
+        speed   = "1s ⚡ ULTRA BEAST" if (am_peak or pm_peak) else "30s 💤 Data saver"
         await tg_send(f"""📊 <b>Bot Status</b>
 ━━━━━━━━━━━━━━━━━
 Status: {status}
@@ -567,9 +567,9 @@ Send /scrape to check now!""")
         pm_peak = (h == 22 and m >= 55) or (h == 23 and m <= 25)
 
         if am_peak or pm_peak:
-            await asyncio.sleep(1)   # ⚡ ULTRA BEAST — peak windows
+            await asyncio.sleep(1)   # ⚡ ULTRA BEAST — peak windows (1s)
         else:
-            await asyncio.sleep(3)   # 🔥 BEAST MODE — all other times
+            await asyncio.sleep(30)  # 💤 OFF PEAK — saves data (30s)
 
         await check_jobs()
 
