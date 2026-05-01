@@ -134,31 +134,46 @@ async def build_session():
 
             page = await context.new_page()
             captured_headers = {}
+            captured_jobs = []
 
-            async def sniff_headers(response):
+            async def sniff_graphql(response):
                 try:
                     if "graphql" in response.url and response.status == 200:
-                        captured_headers.update(dict(response.request.headers))
-                except: pass
+                        # Capture ALL request headers from real GraphQL call
+                        req_headers = dict(response.request.headers)
+                        captured_headers.update(req_headers)
+                        log.info(f"🎯 Captured GraphQL headers: {list(req_headers.keys())}")
+                        # Also try to capture jobs directly
+                        data = await response.json()
+                        cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
+                        if cards:
+                            log.info(f"🎯 Intercepted {len(cards)} jobs during session build!")
+                            captured_jobs.extend(cards)
+                except Exception as e:
+                    log.warning(f"Sniff error: {e}")
 
-            page.on("response", sniff_headers)
+            page.on("response", sniff_graphql)
 
-            # Visit Amazon job search — NO proxy, just to get session
+            # Visit Amazon job search to trigger real GraphQL calls
             await page.goto(
                 "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
                 wait_until="networkidle",
                 timeout=45000
             )
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(5000)
+
+            # Scroll to trigger more loading
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(2000)
 
             # Grab cookies
             cookies = await context.cookies()
             session_cookies_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-            # Build headers from captured + defaults
+            # Build headers — prioritise captured real headers
             session_headers = {
                 "Content-Type": "application/json",
-                "Accept": "application/json",
+                "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "en-GB,en;q=0.9",
                 "country": "United Kingdom",
                 "locale": "en-GB",
@@ -168,10 +183,21 @@ async def build_session():
                 "Cookie": session_cookies_str,
             }
 
-            # Add any extra headers captured from real GraphQL calls
-            for key in ["x-amz-user-agent", "authorization", "x-csrf-token"]:
+            # Add captured auth headers — these are the key!
+            important_headers = ["authorization", "x-amz-user-agent", "x-csrf-token",
+                                 "x-amzn-requestid", "x-api-key", "x-auth-token"]
+            for key in important_headers:
                 if key in captured_headers:
                     session_headers[key] = captured_headers[key]
+                    log.info(f"✅ Got auth header: {key}")
+
+            # Store intercepted jobs for immediate use
+            if captured_jobs:
+                log.info(f"✅ Pre-loaded {len(captured_jobs)} jobs from session build!")
+                for card in captured_jobs:
+                    job = parse_card(card)
+                    if job and job["id"] not in known_jobs:
+                        known_jobs[job["id"]] = job
 
             await browser.close()
             log.info(f"✅ Session built! {len(cookies)} cookies, {len(session_headers)} headers")
