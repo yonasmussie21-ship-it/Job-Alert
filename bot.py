@@ -13,7 +13,7 @@ BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 CHAT_ID     = os.environ.get("CHAT_ID", "1027065157")
 DECODO_USER = os.environ.get("DECODO_USER", "")
 DECODO_PASS = os.environ.get("DECODO_PASS", "")
-DECODO_HOST = os.environ.get("DECODO_HOST", "gb.decodo.com")
+DECODO_HOST = os.environ.get("DECODO_HOST", "gb.decodo.caom")
 DECODO_PORT = os.environ.get("DECODO_PORT", "30000")
 
 PROXY_URL    = f"http://{DECODO_USER}:{DECODO_PASS}@{DECODO_HOST}:{DECODO_PORT}"
@@ -394,6 +394,87 @@ async def session_refresh_loop():
         await build_session()
 
 # ─── MAIN CHECK ──────────────────────────────────────────────────────────────
+# ─── FETCH FULL JOB DETAILS ──────────────────────────────────────────────────
+async def fetch_job_details(job):
+    """
+    Visit individual job page to get real schedule, hours, first day.
+    This is how we match the other bot's data quality.
+    """
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"]
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+            )
+            # Block images to save bandwidth
+            await context.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}", lambda route: route.abort())
+
+            page = await context.new_page()
+            captured_detail = {}
+
+            async def handle_detail(response):
+                try:
+                    if "graphql" in response.url and response.status == 200:
+                        data = await response.json()
+                        # Look for schedule/detail data
+                        schedules = data.get("data", {}).get("getSchedules") or \
+                                   data.get("data", {}).get("schedules") or \
+                                   data.get("data", {}).get("jobSchedules")
+                        if schedules:
+                            captured_detail["schedules"] = schedules
+                except: pass
+
+            page.on("response", handle_detail)
+
+            await page.goto(job["link"], wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(3000)
+
+            # Extract from page text directly
+            content = await page.inner_text("body")
+
+            # First Day
+            m = re.search(r'(?:First Day|Start [Dd]ate|Tentative start date)[:\s]+([A-Za-z]+,?\s+\d+\s+[A-Za-z]+\s+\d{4}|\d{4}-\d{2}-\d{2}|[A-Za-z]+ \d+, \d{4})', content)
+            if m:
+                job["firstDay"] = m.group(1).strip()
+
+            # Schedule/Shift timing
+            m = re.search(r'Shift timing[:\s]+([A-Za-z,\s]+ \d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})', content)
+            if m:
+                job["schedule"] = m.group(1).strip()
+            else:
+                m = re.search(r'(?:Schedule|Shift)[:\s]+([A-Za-z,\s]+ \d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})', content)
+                if m:
+                    job["schedule"] = m.group(1).strip()
+
+            # Hours
+            m = re.search(r'(\d+)\s+hours?/week', content, re.IGNORECASE)
+            if m:
+                job["hours"] = m.group(1)
+
+            # Contract type
+            for ct in ["Full-time", "Part-time", "Reduced", "Flex", "Fixed Term", "Fixed-term"]:
+                if ct.lower() in content.lower():
+                    job["contract"] = ct
+                    break
+
+            # Pay rate
+            m = re.search(r'£(\d+\.\d{2})/hour', content)
+            if m:
+                job["pay"] = float(m.group(1))
+                job["pay_display"] = m.group(1)
+
+            await browser.close()
+            log.info(f"✅ Details: {job.get('firstDay','?')} | {job.get('schedule','?')[:40]} | {job.get('hours','?')}hrs")
+
+    except Exception as e:
+        log.warning(f"Detail fetch error: {e}")
+
+    return job
+
 async def check_jobs():
     global known_jobs, job_history, posting_times
     if bot_paused:
@@ -405,11 +486,15 @@ async def check_jobs():
     for job in jobs:
         jid = job["id"]
         if jid not in known_jobs:
-            known_jobs[jid] = job
             new_count += 1
             job_history.append(job)
             posting_times[job["location"][:20]].append(datetime.utcnow().hour)
             log.info(f"🆕 NEW: {job['location']} £{job['pay']}/hr")
+
+            # Fetch full details before alerting
+            job = await fetch_job_details(job)
+            known_jobs[jid] = job
+
             await tg_alert(job, "new")
             asyncio.create_task(auto_navigate(job))
 
