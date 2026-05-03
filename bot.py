@@ -4,31 +4,42 @@ import json
 import logging
 import aiohttp
 import re
+import math
 from datetime import datetime
 from playwright.async_api import async_playwright
 from collections import defaultdict
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-CHAT_ID     = os.environ.get("CHAT_ID", "1027065157")
-DECODO_USER = os.environ.get("DECODO_USER", "")
-DECODO_PASS = os.environ.get("DECODO_PASS", "")
-DECODO_HOST = os.environ.get("DECODO_HOST", "gb.decodo.caom")
-DECODO_PORT = os.environ.get("DECODO_PORT", "30000")
-
-PROXY_URL    = f"http://{DECODO_USER}:{DECODO_PASS}@{DECODO_HOST}:{DECODO_PORT}"
-PROXY_SERVER = f"http://{DECODO_HOST}:{DECODO_PORT}"
+BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
+CHAT_ID          = os.environ.get("CHAT_ID", "1027065157")
+AMAZON_EMAIL     = os.environ.get("AMAZON_EMAIL", "")
+AMAZON_PIN       = os.environ.get("AMAZON_PIN", "")
+AMAZON_COOKIES   = os.environ.get("AMAZON_COOKIES", "")  # JSON string of cookies
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
-known_jobs    = {}
-bot_paused    = False
-job_history   = []
-posting_times = defaultdict(list)
-session_headers = {}   # Real headers from Amazon session
-session_cookies_str = ""  # Cookie string for API calls
+known_jobs      = {}
+bot_paused      = False
+job_history     = []
+posting_times   = defaultdict(list)
+session_headers = {}
+
+# ─── SUBSCRIBER PREFERENCES ──────────────────────────────────────────────────
+# Each subscriber has: chat_id, postcode, radius_miles, shift_prefs, auto_apply
+subscribers = {
+    CHAT_ID: {
+        "postcode": os.environ.get("MY_POSTCODE", "B1 1BB"),
+        "radius":   int(os.environ.get("MY_RADIUS", "30")),
+        "shifts":   ["night", "any"],  # night first, then any
+        "auto_apply": True,
+    }
+}
+
+# Postcodes waiting for input
+awaiting_postcode = {}
+awaiting_radius   = {}
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -49,8 +60,9 @@ query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
 """
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
-async def tg_send(text, reply_markup=None):
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+async def tg_send(text, reply_markup=None, chat_id=None):
+    cid = chat_id or CHAT_ID
+    payload = {"chat_id": cid, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
@@ -59,35 +71,92 @@ async def tg_send(text, reply_markup=None):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
+# ─── POSTCODE DISTANCE ────────────────────────────────────────────────────────
+async def get_postcode_coords(postcode):
+    """Get lat/lng for a UK postcode using free postcodes.io API"""
+    try:
+        clean = postcode.replace(" ", "").upper()
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://api.postcodes.io/postcodes/{clean}") as r:
+                data = await r.json()
+                if data.get("status") == 200:
+                    result = data["result"]
+                    return result["latitude"], result["longitude"]
+    except Exception as e:
+        log.warning(f"Postcode lookup error: {e}")
+    return None, None
+
+def haversine_miles(lat1, lon1, lat2, lon2):
+    """Calculate distance in miles between two coordinates"""
+    R = 3958.8  # Earth radius in miles
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+async def job_distance_miles(job_postcode, subscriber_postcode):
+    """Calculate distance between job and subscriber in miles"""
+    try:
+        lat1, lon1 = await get_postcode_coords(subscriber_postcode)
+        lat2, lon2 = await get_postcode_coords(job_postcode)
+        if all([lat1, lon1, lat2, lon2]):
+            return round(haversine_miles(lat1, lon1, lat2, lon2), 1)
+    except Exception as e:
+        log.warning(f"Distance calc error: {e}")
+    return None
+
+# ─── SHIFT PRIORITY ──────────────────────────────────────────────────────────
+def is_night_shift(schedule):
+    """Check if schedule is a night shift"""
+    if not schedule or schedule == "TBC":
+        return False
+    night_indicators = ["18:30", "19:00", "20:00", "21:00", "22:00", "23:00", "23:45", "0:00", "1:00", "2:00", "3:00"]
+    return any(t in schedule for t in night_indicators)
+
+def shift_priority(schedule):
+    """Return priority score — lower is better"""
+    if is_night_shift(schedule):
+        return 1  # Night shift — highest priority
+    if any(t in str(schedule) for t in ["14:00", "15:00", "16:00"]):
+        return 2  # Evening
+    return 3  # Day shift
+
 # ─── ALERT ───────────────────────────────────────────────────────────────────
-async def tg_alert(job, status="new"):
+async def tg_alert(job, status="new", chat_id=None, distance=None):
+    cid = chat_id or CHAT_ID
+
     if status == "new":
         header = "🚨 <b>NEW AMAZON JOB — ACT NOW!</b>"
     elif status == "navigating":
         header = "⚡ <b>BOT OPENING APPLICATION...</b>"
+    elif status == "applying":
+        header = "🤖 <b>BOT AUTO-SUBMITTING...</b>"
+    elif status == "applied":
+        header = "✅ <b>APPLIED FOR YOU AUTOMATICALLY!</b>"
     elif status == "ready":
         header = "✅ <b>APPLICATION READY — LOG IN & SUBMIT!</b>"
     else:
         header = "⚠️ <b>OPEN MANUALLY!</b>"
 
     pay_str  = job.get("pay_display") or f"{job.get('pay', '?'):.2f}"
-    contract = job.get("contract", "Seasonal")
-    hours    = job.get("hours", "TBC")
-    schedule = job.get("schedule", "TBC")
-    first_day = job.get("firstDay", "TBC")
+    dist_str = f"\n📏 Distance: <b>{distance} miles</b>" if distance else ""
+    night    = "🌙 NIGHT SHIFT" if is_night_shift(job.get("schedule","")) else ""
 
     text = f"""{header}
 ━━━━━━━━━━━━━━━━━━━━━
 📍 <b>{job.get('location', 'Unknown')}</b>
-📦 {job.get('title', 'Warehouse Operative')}
+📦 {job.get('title', 'Warehouse Operative')} {night}
 💰 <b>£{pay_str}/hr</b>
-📋 {contract}
-📅 First Day: <b>{first_day}</b>
-🕘 Schedule: <b>{schedule}</b>
-🕐 Hours/Week: <b>{hours}</b>
+📋 {job.get('contract', 'Seasonal')}
+📅 First Day: <b>{job.get('firstDay', 'TBC')}</b>
+🕘 Schedule: <b>{job.get('schedule', 'TBC')}</b>
+🕐 Hours/Week: <b>{job.get('hours', 'TBC')}</b>{dist_str}
 ━━━━━━━━━━━━━━━━━━━━━"""
 
-    if status == "ready":
+    if status == "applied":
+        text += "\n🎉 <b>Check your Amazon Jobs dashboard!</b>\n━━━━━━━━━━━━━━━━━━━━━"
+    elif status == "ready":
         text += "\n👆 <b>TAP OPEN APPLICATION → Log in → Submit!</b>\n━━━━━━━━━━━━━━━━━━━━━"
 
     markup = {
@@ -99,132 +168,87 @@ async def tg_alert(job, status="new"):
             ]
         ]
     }
-    await tg_send(text, markup)
+    await tg_send(text, markup, chat_id=cid)
 
-# ─── SESSION BUILDER (runs ONCE — no proxy needed) ────────────────────────────
+# ─── SESSION BUILDER ─────────────────────────────────────────────────────────
 async def build_session():
-    """
-    Visit Amazon ONCE without proxy to get real headers/cookies.
-    Then use those headers for all future API calls through proxy.
-    This saves massive amounts of proxy data!
-    """
-    global session_headers, session_cookies_str
-    log.info("🔑 Building session (one-time)...")
-
+    global session_headers
+    log.info("🔑 Building session...")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-gpu",
-                ]
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"]
             )
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-GB",
                 timezone_id="Europe/London",
-                viewport={"width": 1280, "height": 800},
             )
             await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             """)
+            await context.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}", lambda route: route.abort())
+
+            # Inject saved Amazon cookies if available
+            if AMAZON_COOKIES:
+                try:
+                    cookies = json.loads(AMAZON_COOKIES)
+                    await context.add_cookies(cookies)
+                    log.info(f"🍪 Injected {len(cookies)} Amazon cookies")
+                except Exception as e:
+                    log.warning(f"Cookie inject error: {e}")
 
             page = await context.new_page()
             captured_headers = {}
-            captured_jobs = []
 
-            async def sniff_graphql(response):
+            async def sniff(response):
                 try:
                     if "graphql" in response.url and response.status == 200:
-                        # Capture ALL request headers from real GraphQL call
-                        req_headers = dict(response.request.headers)
-                        captured_headers.update(req_headers)
-                        log.info(f"🎯 Captured GraphQL headers: {list(req_headers.keys())}")
-                        # Also try to capture jobs directly
-                        data = await response.json()
-                        cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
-                        if cards:
-                            log.info(f"🎯 Intercepted {len(cards)} jobs during session build!")
-                            captured_jobs.extend(cards)
-                except Exception as e:
-                    log.warning(f"Sniff error: {e}")
+                        captured_headers.update(dict(response.request.headers))
+                except: pass
 
-            page.on("response", sniff_graphql)
+            page.on("response", sniff)
 
-            # Visit Amazon job search to trigger real GraphQL calls
             await page.goto(
                 "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
-                wait_until="networkidle",
-                timeout=45000
+                wait_until="networkidle", timeout=45000
             )
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(4000)
 
-            # Scroll to trigger more loading
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(2000)
-
-            # Grab cookies
             cookies = await context.cookies()
-            session_cookies_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-            # Build headers — prioritise captured real headers
             session_headers = {
                 "Content-Type": "application/json",
-                "Accept": "application/json, text/plain, */*",
+                "Accept": "application/json",
                 "Accept-Language": "en-GB,en;q=0.9",
                 "country": "United Kingdom",
                 "locale": "en-GB",
                 "Origin": "https://www.jobsatamazon.co.uk",
                 "Referer": "https://www.jobsatamazon.co.uk/app",
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Cookie": session_cookies_str,
+                "Cookie": cookie_str,
             }
-
-            # Add captured auth headers — these are the key!
-            important_headers = ["authorization", "x-amz-user-agent", "x-csrf-token",
-                                 "x-amzn-requestid", "x-api-key", "x-auth-token"]
-            for key in important_headers:
+            for key in ["authorization", "x-amz-user-agent", "x-csrf-token"]:
                 if key in captured_headers:
                     session_headers[key] = captured_headers[key]
-                    log.info(f"✅ Got auth header: {key}")
-
-            # Log intercepted jobs but DON'T add to known_jobs
-            # Let the main check loop handle them so alerts fire properly
-            if captured_jobs:
-                log.info(f"✅ Session intercepted {len(captured_jobs)} jobs — will alert via main loop")
 
             await browser.close()
-            log.info(f"✅ Session built! {len(cookies)} cookies, {len(session_headers)} headers")
+            log.info(f"✅ Session built! {len(cookies)} cookies")
             return True
-
     except Exception as e:
-        log.error(f"Session build error: {e}")
+        log.error(f"Session error: {e}")
         return False
 
-# ─── KING SCRAPER — Browser interception, no proxy needed ───────────────────
+# ─── SCRAPER ─────────────────────────────────────────────────────────────────
 async def fetch_jobs():
-    """
-    Loads Amazon job search page directly.
-    Intercepts GraphQL response automatically.
-    No proxy needed — Amazon allows direct access!
-    """
     all_jobs = {}
-
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-gpu",
-                    "--disable-images",  # Skip images — saves bandwidth
-                    "--blink-settings=imagesEnabled=false",
-                ]
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled", "--disable-gpu"]
             )
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -234,8 +258,6 @@ async def fetch_jobs():
             await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             """)
-
-            # Block images, fonts, media to save bandwidth
             await context.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}", lambda route: route.abort())
 
             page     = await context.new_page()
@@ -252,18 +274,13 @@ async def fetch_jobs():
                 except: pass
 
             page.on("response", handle_response)
-
             await page.goto(
                 "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
-                wait_until="networkidle",
-                timeout=45000
+                wait_until="networkidle", timeout=45000
             )
             await page.wait_for_timeout(3000)
-
-            # Scroll to trigger any lazy loading
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
-
             await browser.close()
 
             for card in captured:
@@ -274,7 +291,7 @@ async def fetch_jobs():
     except Exception as e:
         log.error(f"Scraper error: {e}")
 
-    log.info(f"👑 Total unique jobs: {len(all_jobs)}")
+    log.info(f"👑 Total: {len(all_jobs)} jobs")
     return list(all_jobs.values())
 
 # ─── PARSE CARD ───────────────────────────────────────────────────────────────
@@ -293,19 +310,17 @@ def parse_card(card):
         employment = card.get("employmentType") or ""
         job_type   = card.get("jobType") or ""
 
-        # Contract type
         if employment and employment.lower() not in ["seasonal", "temporary"]:
             contract = employment
         else:
             contract = job_type or employment or "Seasonal"
 
-        hours      = str(int(card.get("hoursPerWeek"))) if card.get("hoursPerWeek") else "TBC"
-        first_day  = card.get("firstDayOnSite") or "TBC"
+        hours       = str(int(card.get("hoursPerWeek"))) if card.get("hoursPerWeek") else "TBC"
+        first_day   = card.get("firstDayOnSite") or "TBC"
         sched_count = card.get("scheduleCount", 0)
         shift_code  = card.get("shiftCode") or ""
         schedule    = shift_code if shift_code else (f"{sched_count} schedule(s)" if sched_count else "TBC")
 
-        # Skip non-warehouse jobs
         skip = ["customer service", "vcc", "virtual", "remote", "manager", "software", "engineer"]
         if any(s in title.lower() for s in skip):
             return None
@@ -329,6 +344,7 @@ def parse_card(card):
             "id":          job_id,
             "title":       title,
             "location":    location,
+            "postcode":    postcode,
             "pay":         round(pay, 2),
             "pay_display": f"{pay:.2f}",
             "contract":    contract,
@@ -342,17 +358,186 @@ def parse_card(card):
         log.warning(f"Parse error: {e}")
         return None
 
-# ─── AUTO NAVIGATION (separate browser, not through proxy) ───────────────────
-async def auto_navigate(job):
-    """Opens application page — no proxy needed, saves data"""
-    log.info(f"🤖 Navigating: {job['location']}")
-    await tg_alert(job, "navigating")
+# ─── FETCH FULL JOB DETAILS ──────────────────────────────────────────────────
+async def fetch_job_details(job):
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+            )
+            await context.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}", lambda route: route.abort())
+            page = await context.new_page()
+            await page.goto(job["link"], wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(3000)
+            content = await page.inner_text("body")
+
+            # First Day
+            m = re.search(r'(?:Start [Dd]ate|Tentative start date)[:\s]+([A-Za-z]+,?\s+\d+\s+[A-Za-z]+\s+\d{4}|[A-Za-z]+ \d+, \d{4})', content)
+            if m: job["firstDay"] = m.group(1).strip()
+
+            # Schedule
+            m = re.search(r'Shift timing[:\s]+([A-Za-z,\s]+\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})', content)
+            if m:
+                job["schedule"] = m.group(1).strip()
+            else:
+                m = re.search(r'Shift[:\s]+([A-Za-z,\s]+\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})', content)
+                if m: job["schedule"] = m.group(1).strip()
+
+            # Hours
+            m = re.search(r'(\d+)\s*hrs?\s*per\s*week', content, re.IGNORECASE)
+            if m: job["hours"] = m.group(1)
+
+            # Contract
+            for ct in ["Full-time", "Part-time", "Reduced", "Fixed-term", "Fixed Term"]:
+                if ct.lower() in content.lower():
+                    job["contract"] = ct
+                    break
+
+            await browser.close()
+            log.info(f"✅ Details: {job.get('firstDay','?')} | {job.get('schedule','?')[:40]}")
+    except Exception as e:
+        log.warning(f"Detail fetch error: {e}")
+    return job
+
+# ─── AUTO SUBMIT ─────────────────────────────────────────────────────────────
+async def auto_submit(job, chat_id=None):
+    """Full auto-submit using stored Amazon session cookies"""
+    cid = chat_id or CHAT_ID
+    log.info(f"🤖 Auto-submitting: {job['location']}")
+    await tg_alert(job, "applying", chat_id=cid)
+
+    if not AMAZON_COOKIES:
+        log.warning("No Amazon cookies — falling back to navigate only")
+        await auto_navigate(job, chat_id=cid)
+        return
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox"]
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"]
             )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+                timezone_id="Europe/London",
+            )
+
+            # Inject Amazon session cookies
+            cookies = json.loads(AMAZON_COOKIES)
+            await context.add_cookies(cookies)
+            log.info(f"🍪 Injected {len(cookies)} Amazon session cookies")
+
+            page = await context.new_page()
+
+            # Step 1 — Go to job page
+            await page.goto(job["link"], wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(2000)
+
+            # Step 2 — Click Apply button
+            applied = False
+            for sel in ["button:has-text('Apply')", "a:has-text('Apply')", "[data-test='apply-button']", "button:has-text('Apply now')"]:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await page.wait_for_timeout(2000)
+                        log.info("✅ Clicked Apply")
+                        applied = True
+                        break
+                except: pass
+
+            if not applied:
+                log.warning("⚠️ Apply button not found — may need login")
+                await tg_alert(job, "ready", chat_id=cid)
+                await browser.close()
+                return
+
+            # Step 3 — Handle active application popup
+            try:
+                continue_btn = await page.wait_for_selector("button:has-text('Continue')", timeout=3000)
+                if continue_btn:
+                    await continue_btn.click()
+                    await page.wait_for_timeout(2000)
+                    log.info("✅ Dismissed active app popup")
+            except: pass
+
+            # Step 4 — Click Start Application on T&Cs page
+            for sel in ["button:has-text('Start Application')", "[data-test='start-application']"]:
+                try:
+                    btn = await page.wait_for_selector(sel, timeout=5000)
+                    if btn:
+                        await btn.click()
+                        await page.wait_for_timeout(3000)
+                        log.info("✅ Clicked Start Application")
+                        break
+                except: pass
+
+            # Step 5 — Select best shift (prioritise night shifts)
+            try:
+                # Wait for shift selection page
+                await page.wait_for_selector("button:has-text('Select this job')", timeout=8000)
+                shift_buttons = await page.query_selector_all("button:has-text('Select this job')")
+
+                if shift_buttons:
+                    # Get all shift cards and find night shift
+                    best_btn = shift_buttons[0]  # Default to first
+                    best_priority = 999
+
+                    shift_cards = await page.query_selector_all(".shift-card, [class*='shift'], [class*='job-card']")
+                    for i, card in enumerate(shift_cards[:len(shift_buttons)]):
+                        try:
+                            card_text = await card.inner_text()
+                            priority  = shift_priority(card_text)
+                            if priority < best_priority:
+                                best_priority = priority
+                                if i < len(shift_buttons):
+                                    best_btn = shift_buttons[i]
+                        except: pass
+
+                    await best_btn.click()
+                    await page.wait_for_timeout(3000)
+                    log.info(f"✅ Selected shift (priority: {best_priority})")
+
+            except Exception as e:
+                log.warning(f"Shift selection: {e}")
+
+            # Step 6 — Accept Offer if shown
+            try:
+                accept_btn = await page.wait_for_selector("button:has-text('Accept Offer')", timeout=5000)
+                if accept_btn:
+                    await accept_btn.click()
+                    await page.wait_for_timeout(3000)
+                    log.info("✅ Clicked Accept Offer")
+            except: pass
+
+            # Step 7 — Check success
+            current_url = page.url
+            content     = await page.inner_text("body")
+
+            if "thank you" in content.lower() or "applied" in content.lower() or "checklist" in current_url:
+                log.info(f"🎉 Successfully applied for {job['location']}!")
+                await tg_alert(job, "applied", chat_id=cid)
+            else:
+                log.warning("⚠️ Not sure if applied — sending ready alert")
+                job["link"] = current_url if current_url != "about:blank" else job["link"]
+                await tg_alert(job, "ready", chat_id=cid)
+
+            await browser.close()
+
+    except Exception as e:
+        log.error(f"Auto-submit error: {e}")
+        await tg_alert(job, "ready", chat_id=cid)
+
+# ─── AUTO NAVIGATE (fallback for subscribers) ────────────────────────────────
+async def auto_navigate(job, chat_id=None):
+    cid = chat_id or CHAT_ID
+    await tg_alert(job, "navigating", chat_id=cid)
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-GB",
@@ -361,7 +546,7 @@ async def auto_navigate(job):
             await page.goto(job["link"], wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(2000)
 
-            for sel in ["button:has-text('Apply')", "a:has-text('Apply')", "[data-test='apply-button']"]:
+            for sel in ["button:has-text('Apply')", "a:has-text('Apply')"]:
                 try:
                     btn = await page.query_selector(sel)
                     if btn:
@@ -370,7 +555,7 @@ async def auto_navigate(job):
                         break
                 except: pass
 
-            for sel in ["button:has-text('Start Application')", "[data-test='start-application']"]:
+            for sel in ["button:has-text('Start Application')"]:
                 try:
                     btn = await page.query_selector(sel)
                     if btn:
@@ -381,100 +566,12 @@ async def auto_navigate(job):
 
             job["link"] = page.url if page.url != "about:blank" else job["link"]
             await browser.close()
-            await tg_alert(job, "ready")
+            await tg_alert(job, "ready", chat_id=cid)
     except Exception as e:
         log.error(f"Navigation error: {e}")
-        await tg_alert(job, "failed")
-
-# ─── SESSION REFRESH (every 6 hours) ─────────────────────────────────────────
-async def session_refresh_loop():
-    while True:
-        await asyncio.sleep(6 * 60 * 60)  # Every 6 hours
-        log.info("🔄 Refreshing session...")
-        await build_session()
+        await tg_alert(job, "failed", chat_id=cid)
 
 # ─── MAIN CHECK ──────────────────────────────────────────────────────────────
-# ─── FETCH FULL JOB DETAILS ──────────────────────────────────────────────────
-async def fetch_job_details(job):
-    """
-    Visit individual job page to get real schedule, hours, first day.
-    This is how we match the other bot's data quality.
-    """
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"]
-            )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                locale="en-GB",
-            )
-            # Block images to save bandwidth
-            await context.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}", lambda route: route.abort())
-
-            page = await context.new_page()
-            captured_detail = {}
-
-            async def handle_detail(response):
-                try:
-                    if "graphql" in response.url and response.status == 200:
-                        data = await response.json()
-                        # Look for schedule/detail data
-                        schedules = data.get("data", {}).get("getSchedules") or \
-                                   data.get("data", {}).get("schedules") or \
-                                   data.get("data", {}).get("jobSchedules")
-                        if schedules:
-                            captured_detail["schedules"] = schedules
-                except: pass
-
-            page.on("response", handle_detail)
-
-            await page.goto(job["link"], wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(3000)
-
-            # Extract from page text directly
-            content = await page.inner_text("body")
-
-            # First Day
-            m = re.search(r'(?:First Day|Start [Dd]ate|Tentative start date)[:\s]+([A-Za-z]+,?\s+\d+\s+[A-Za-z]+\s+\d{4}|\d{4}-\d{2}-\d{2}|[A-Za-z]+ \d+, \d{4})', content)
-            if m:
-                job["firstDay"] = m.group(1).strip()
-
-            # Schedule/Shift timing
-            m = re.search(r'Shift timing[:\s]+([A-Za-z,\s]+ \d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})', content)
-            if m:
-                job["schedule"] = m.group(1).strip()
-            else:
-                m = re.search(r'(?:Schedule|Shift)[:\s]+([A-Za-z,\s]+ \d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})', content)
-                if m:
-                    job["schedule"] = m.group(1).strip()
-
-            # Hours
-            m = re.search(r'(\d+)\s+hours?/week', content, re.IGNORECASE)
-            if m:
-                job["hours"] = m.group(1)
-
-            # Contract type
-            for ct in ["Full-time", "Part-time", "Reduced", "Flex", "Fixed Term", "Fixed-term"]:
-                if ct.lower() in content.lower():
-                    job["contract"] = ct
-                    break
-
-            # Pay rate
-            m = re.search(r'£(\d+\.\d{2})/hour', content)
-            if m:
-                job["pay"] = float(m.group(1))
-                job["pay_display"] = m.group(1)
-
-            await browser.close()
-            log.info(f"✅ Details: {job.get('firstDay','?')} | {job.get('schedule','?')[:40]} | {job.get('hours','?')}hrs")
-
-    except Exception as e:
-        log.warning(f"Detail fetch error: {e}")
-
-    return job
-
 async def check_jobs():
     global known_jobs, job_history, posting_times
     if bot_paused:
@@ -491,16 +588,57 @@ async def check_jobs():
             posting_times[job["location"][:20]].append(datetime.utcnow().hour)
             log.info(f"🆕 NEW: {job['location']} £{job['pay']}/hr")
 
-            # Fetch full details before alerting
+            # Fetch full details
             job = await fetch_job_details(job)
             known_jobs[jid] = job
 
-            await tg_alert(job, "new")
-            asyncio.create_task(auto_navigate(job))
+            # Alert each subscriber based on their location preference
+            for sub_chat_id, prefs in subscribers.items():
+                sub_postcodes = prefs.get("postcode", "").split(",")
+                sub_radius    = prefs.get("radius", 30)
+                sub_auto      = prefs.get("auto_apply", False)
+                job_postcode  = job.get("postcode", "")
+                distance      = None
+                too_far       = True
+
+                # Check distance from ALL subscriber postcodes
+                for sub_postcode in sub_postcodes:
+                    sub_postcode = sub_postcode.strip()
+                    if sub_postcode and job_postcode:
+                        d = await job_distance_miles(job_postcode, sub_postcode)
+                        if d is not None:
+                            if distance is None or d < distance:
+                                distance = d  # Keep closest distance
+                            if d <= sub_radius:
+                                too_far = False
+                                break
+                    else:
+                        too_far = False  # No postcode set = alert everything
+                        break
+
+                if too_far and distance:
+                    log.info(f"📍 Job too far ({distance}mi > {sub_radius}mi) for {sub_chat_id}")
+                    continue  # Skip — too far from all locations
+
+                # Send alert
+                await tg_alert(job, "new", chat_id=sub_chat_id, distance=distance)
+
+                # Auto-submit or navigate
+                if sub_auto and AMAZON_COOKIES:
+                    asyncio.create_task(auto_submit(job, chat_id=sub_chat_id))
+                else:
+                    asyncio.create_task(auto_navigate(job, chat_id=sub_chat_id))
 
     if new_count == 0:
         log.info(f"👑 No new jobs — {len(known_jobs)} tracked")
     return new_count
+
+# ─── SESSION REFRESH ─────────────────────────────────────────────────────────
+async def session_refresh_loop():
+    while True:
+        await asyncio.sleep(6 * 60 * 60)
+        log.info("🔄 Refreshing session...")
+        await build_session()
 
 # ─── DAILY SUMMARY ───────────────────────────────────────────────────────────
 async def send_daily_summary():
@@ -511,10 +649,12 @@ async def send_daily_summary():
             if today:
                 best    = max(today, key=lambda x: x.get("pay", 0))
                 avg_pay = sum(j.get("pay", 0) for j in today) / len(today)
+                nights  = sum(1 for j in today if is_night_shift(j.get("schedule","")))
                 await tg_send(f"""📊 <b>Daily Summary</b>
 ━━━━━━━━━━━━━━━━━
 📅 {now.strftime('%Y-%m-%d')}
 🆕 Jobs found: {len(today)}
+🌙 Night shifts: {nights}
 💰 Avg pay: £{avg_pay:.2f}/hr
 ⭐ Best: {best.get('location','?')} £{best.get('pay','?')}/hr
 ━━━━━━━━━━━━━━━━━
@@ -538,127 +678,171 @@ async def handle_updates():
         await asyncio.sleep(2)
 
 async def process_update(update):
-    global bot_paused
+    global bot_paused, awaiting_postcode, awaiting_radius
+
     if "callback_query" in update:
         cb = update["callback_query"]
         d  = cb.get("data", "")
-        if d.startswith("applied_"): await tg_send("✅ Applied! Good luck Yonas! 💪🔥")
+        if d.startswith("applied_"): await tg_send("✅ Applied! Good luck! 💪🔥")
         elif d.startswith("skip_"):  await tg_send("⏭️ Skipped! 👀")
         return
 
-    msg  = update.get("message", {})
-    text = msg.get("text", "").strip().lower()
+    msg     = update.get("message", {})
+    text    = msg.get("text", "").strip()
+    cid     = str(msg.get("chat", {}).get("id", CHAT_ID))
+    text_lw = text.lower()
 
-    if text == "/start":
-        await tg_send("""👑 <b>Amazon KING BOT v6!</b>
-✅ Direct mode — Zero proxy cost!
-🔥 Parallel x3 scraping
+    # Handle postcode input
+    if cid in awaiting_postcode:
+        postcode = text.upper().strip()
+        if cid not in subscribers:
+            subscribers[cid] = {}
+        subscribers[cid]["postcode"] = postcode
+        awaiting_postcode.pop(cid)
+        awaiting_radius[cid] = True
+        await tg_send(f"📍 Postcode set to <b>{postcode}</b>\n\nNow enter your max travel radius in miles (e.g. 10, 20, 30, 50):", chat_id=cid)
+        return
+
+    # Handle radius input
+    if cid in awaiting_radius:
+        try:
+            radius = int(re.search(r'\d+', text).group())
+            subscribers[cid]["radius"] = radius
+            awaiting_radius.pop(cid)
+            postcode = subscribers[cid].get("postcode", "?")
+            await tg_send(f"✅ <b>Location preference saved!</b>\n📍 Postcode: {postcode}\n🚗 Radius: {radius} miles\n\nYou'll only get alerts for jobs within {radius} miles of {postcode}! 👑", chat_id=cid)
+        except:
+            await tg_send("❌ Please enter a number e.g. 20", chat_id=cid)
+        return
+
+    if text_lw == "/start":
+        await tg_send("""👑 <b>Amazon KING BOT v7!</b>
+✅ Direct — No proxy cost
+🌙 Night shift priority
+📍 Location filter by postcode
+🤖 Auto-submit (your account)
 🌍 ALL UK warehouse jobs
-🤖 Auto-navigates application
-👆 Log in & Submit!
-Send /scrape to check now!""")
+Send /help for all commands!""", chat_id=cid)
 
-    elif text == "/status":
-        status  = "⏸️ PAUSED" if bot_paused else "✅ RUNNING"
-        session = "✅ Active" if session_headers else "⚠️ No session"
-        now     = datetime.utcnow()
-        h, m    = now.hour, now.minute
-        am_peak = (h == 10 and m >= 55) or (h == 11 and m <= 25)
-        pm_peak = (h == 22 and m >= 55) or (h == 23 and m <= 25)
-        speed   = "1s ⚡ ULTRA BEAST" if (am_peak or pm_peak) else "30s 💤 Normal"
+    elif text_lw == "/status":
+        sub      = subscribers.get(cid, {})
+        postcode = sub.get("postcode", "Not set")
+        radius   = sub.get("radius", "Not set")
+        auto     = "✅ ON" if sub.get("auto_apply") and AMAZON_COOKIES else "❌ OFF"
+        now      = datetime.utcnow()
+        h, m     = now.hour, now.minute
+        am_peak  = (h == 10 and m >= 55) or (h == 11 and m <= 25)
+        pm_peak  = (h == 22 and m >= 55) or (h == 23 and m <= 25)
+        speed    = "1s ⚡ ULTRA BEAST" if (am_peak or pm_peak) else "30s 💤 Normal"
         await tg_send(f"""📊 <b>Bot Status</b>
 ━━━━━━━━━━━━━━━━━
-Status: {status}
-Session: {session}
-Mode: ✅ Direct — No proxy!
+Status: {"⏸️ PAUSED" if bot_paused else "✅ RUNNING"}
+Auto-submit: {auto}
+📍 Your postcode: {postcode}
+🚗 Radius: {radius} miles
 Jobs tracked: {len(known_jobs)}
 History: {len(job_history)}
 Speed: {speed}
-━━━━━━━━━━━━━━━━━""")
+━━━━━━━━━━━━━━━━━""", chat_id=cid)
 
-    elif text == "/scrape":
-        await tg_send("🔍 <b>Scanning ALL UK Amazon jobs...</b>")
+    elif text_lw.startswith("/prefer location") or text_lw == "/prefer":
+        awaiting_postcode[cid] = True
+        await tg_send("📍 <b>Set your location</b>\n\nEnter your postcode (e.g. B1 1BB, LS9 0DZ):", chat_id=cid)
+
+    elif text_lw == "/mylocation":
+        sub = subscribers.get(cid, {})
+        await tg_send(f"""📍 <b>Your Location Settings</b>
+━━━━━━━━━━━━━━━━━
+Postcode: {sub.get('postcode', 'Not set')}
+Radius: {sub.get('radius', 'Not set')} miles
+━━━━━━━━━━━━━━━━━
+Use /prefer to update""", chat_id=cid)
+
+    elif text_lw == "/autoon":
+        if cid not in subscribers:
+            subscribers[cid] = {}
+        subscribers[cid]["auto_apply"] = True
+        await tg_send("🤖 Auto-submit <b>ON</b> — Bot will apply automatically!", chat_id=cid)
+
+    elif text_lw == "/autooff":
+        if cid not in subscribers:
+            subscribers[cid] = {}
+        subscribers[cid]["auto_apply"] = False
+        await tg_send("⏸️ Auto-submit <b>OFF</b> — Alerts only mode", chat_id=cid)
+
+    elif text_lw == "/scrape":
+        await tg_send("🔍 <b>Scanning ALL UK Amazon jobs...</b>", chat_id=cid)
         count = await check_jobs()
-        await tg_send(f"✅ New: {count} | Tracked: {len(known_jobs)}\n{'🎉 Alerts sent!' if count > 0 else '⏳ No new jobs!'}")
+        await tg_send(f"✅ New: {count} | Tracked: {len(known_jobs)}\n{'🎉 Alerts sent!' if count > 0 else '⏳ No new jobs!'}", chat_id=cid)
 
-    elif text == "/session":
-        await tg_send("🔄 Rebuilding session...")
-        ok = await build_session()
-        await tg_send(f"{'✅ Session ready!' if ok else '❌ Session failed'}")
-
-    elif text == "/jobs":
+    elif text_lw == "/jobs":
         if not known_jobs:
-            await tg_send("📭 No jobs yet!")
+            await tg_send("📭 No jobs yet!", chat_id=cid)
         else:
             txt = f"📋 <b>Last {min(5,len(known_jobs))} Jobs:</b>\n━━━━━━━━━━━\n"
             for job in list(known_jobs.values())[-5:]:
-                txt += f"📍 {job.get('location')}\n💰 £{job.get('pay')}/hr | {job.get('contract')}\n\n"
-            await tg_send(txt)
+                night = "🌙" if is_night_shift(job.get("schedule","")) else "☀️"
+                txt += f"{night} {job.get('location')}\n💰 £{job.get('pay')}/hr | {job.get('contract')}\n📅 {job.get('firstDay','TBC')}\n\n"
+            await tg_send(txt, chat_id=cid)
 
-    elif text == "/history":
+    elif text_lw == "/history":
         if not job_history:
-            await tg_send("📭 No history!")
+            await tg_send("📭 No history!", chat_id=cid)
         else:
-            total = len(job_history)
-            avg   = sum(j.get("pay",0) for j in job_history) / total
-            best  = max(job_history, key=lambda x: x.get("pay",0))
+            total  = len(job_history)
+            avg    = sum(j.get("pay",0) for j in job_history) / total
+            best   = max(job_history, key=lambda x: x.get("pay",0))
+            nights = sum(1 for j in job_history if is_night_shift(j.get("schedule","")))
             await tg_send(f"""📊 <b>Job History</b>
 ━━━━━━━━━━━━━━━━━
 Total found: {total}
+🌙 Night shifts: {nights}
 Avg pay: £{avg:.2f}/hr
 Best: {best.get('location','?')} £{best.get('pay','?')}/hr
-━━━━━━━━━━━━━━━━━""")
+━━━━━━━━━━━━━━━━━""", chat_id=cid)
 
-    elif text == "/predict":
-        if not posting_times:
-            await tg_send("📭 Not enough data yet!")
-        else:
-            txt = "🧠 <b>Posting Patterns</b>\n━━━━━━━━━━━━━━━\n"
-            for loc, times in list(posting_times.items())[:5]:
-                if times:
-                    common = max(set(times), key=times.count)
-                    txt += f"📍 {loc}\n⏰ Usually {common}:00 UTC\n\n"
-            await tg_send(txt)
-
-    elif text == "/test":
+    elif text_lw == "/test":
         await tg_alert({
             "id": "JOB-UK-TEST-001",
             "title": "Warehouse Operative",
             "location": "Enfield, England (North-East London) EN3 7PZ",
-            "pay": 15.30,
-            "pay_display": "15.30",
+            "postcode": "EN3 7PZ",
+            "pay": 15.30, "pay_display": "15.30",
             "contract": "Reduced",
             "firstDay": "2026-05-14",
             "schedule": "Thu, Fri, Sat 23:45-10:15",
             "hours": "30",
             "link": "https://www.jobsatamazon.co.uk",
-        }, "new")
+        }, "new", chat_id=cid, distance=12.5)
 
-    elif text == "/pause":
+    elif text_lw == "/pause":
         bot_paused = True
-        await tg_send("⏸️ Paused.")
+        await tg_send("⏸️ Paused.", chat_id=cid)
 
-    elif text == "/resume":
+    elif text_lw == "/resume":
         bot_paused = False
-        await tg_send("▶️ Resumed! 🔥")
+        await tg_send("▶️ Resumed! 🔥", chat_id=cid)
 
-    elif text == "/help":
+    elif text_lw == "/help":
         await tg_send("""👑 <b>King Bot Commands</b>
-/scrape   — Scan now
-/status   — Bot status
-/session  — Rebuild session
-/jobs     — Recent jobs
-/history  — All time stats
-/predict  — Posting patterns
-/test     — Test alert
-/pause    — Pause
-/resume   — Resume""")
+━━━━━━━━━━━━━━━━━
+/scrape        — Scan now
+/status        — Bot status
+/prefer        — Set your location
+/mylocation    — View your settings
+/autoon        — Enable auto-submit
+/autooff       — Disable auto-submit
+/jobs          — Recent jobs
+/history       — All time stats
+/test          — Test alert
+/pause         — Pause bot
+/resume        — Resume bot
+━━━━━━━━━━━━━━━━━""", chat_id=cid)
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("👑 Amazon KING BOT v6 — Ultra Lean Edition!")
+    log.info("👑 Amazon KING BOT v7 Starting!")
 
-    # Build session ONCE without proxy
     await build_session()
 
     asyncio.create_task(handle_updates())
@@ -666,12 +850,15 @@ async def main():
     asyncio.create_task(session_refresh_loop())
 
     await asyncio.sleep(2)
-    await tg_send(f"""👑 <b>Amazon KING BOT v6 ONLINE!</b>
-✅ Direct mode — No proxy needed!
-🔥 Parallel x3 scraping
-✅ Session: {'Ready' if session_headers else 'Building...'}
+
+    sub     = subscribers.get(CHAT_ID, {})
+    cookies = "✅ Ready" if AMAZON_COOKIES else "❌ Not set — add AMAZON_COOKIES to Render"
+    await tg_send(f"""👑 <b>Amazon KING BOT v7 ONLINE!</b>
+✅ Direct — No proxy cost
+🌙 Night shift priority
+📍 Location: {sub.get('postcode','Not set')} ({sub.get('radius',30)}mi radius)
+🤖 Auto-submit: {cookies}
 🌍 ALL UK warehouse jobs
-👆 Log in & Submit!
 Send /scrape to check now!""")
 
     await check_jobs()
@@ -683,9 +870,9 @@ Send /scrape to check now!""")
         pm_peak = (h == 22 and m >= 55) or (h == 23 and m <= 25)
 
         if am_peak or pm_peak:
-            await asyncio.sleep(1)   # ⚡ ULTRA BEAST — peak windows (1s)
+            await asyncio.sleep(1)
         else:
-            await asyncio.sleep(30)  # 💤 OFF PEAK — saves data (30s)
+            await asyncio.sleep(30)
 
         await check_jobs()
 
