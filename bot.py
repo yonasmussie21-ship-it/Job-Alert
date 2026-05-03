@@ -39,14 +39,13 @@ job_history   = []
 posting_times = defaultdict(list)
 session_headers = {}
 
-# Verification waiting
 verification_waiting = {}
 verification_codes   = {}
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_API     = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SUBSCRIBERS_FILE = "/tmp/subscribers.json"
 
-# ─── UK CITY POSTCODE MAP ─────────────────────────────────────────────────────
+# ─── UK CITY → POSTCODE MAP ──────────────────────────────────────────────────
 CITY_POSTCODES = {
     "birmingham": "B1 1BB", "london": "EC1A 1BB", "manchester": "M1 1AE",
     "leeds": "LS1 1BA", "glasgow": "G1 1AA", "liverpool": "L1 1JF",
@@ -62,19 +61,105 @@ CITY_POSTCODES = {
     "bolton": "BL1 1AA", "wigan": "WN1 1AA", "stockport": "SK1 1AA",
     "stoke": "ST1 1AA", "swansea": "SA1 1AA", "exeter": "EX1 1AA",
     "enfield": "EN1 1AA", "slough": "SL1 1AA", "watford": "WD17 1AA",
-    "rugby": "CV21 1AA", "north ferriby": "HU14 3AA", "dunstable": "LU5 4AA",
-    "coalville": "LE67 1AA", "knowsley": "L33 1AA", "west thurrock": "RM20 1AA",
-    "motherwell": "ML1 1AA", "barking": "IG11 1AA", "tilbury": "RM18 1AA",
+    "rugby": "CV21 1AA", "dunstable": "LU5 4AA", "coalville": "LE67 1AA",
+    "knowsley": "L33 1AA", "west thurrock": "RM20 1AA", "motherwell": "ML1 1AA",
+    "barking": "IG11 1AA", "tilbury": "RM18 1AA", "bathgate": "EH48 2FB",
+    "gloucester": "GL4 3HR", "poole": "BH15 2AA", "bournemouth": "BH1 1AA",
+    "swindon": "SN1 1AA", "peterborough": "PE1 1AA", "ipswich": "IP1 1AA",
+    "norwich": "NR1 1AA", "milton": "MK9 1AA", "basildon": "SS14 1AA",
+    "chelmsford": "CM1 1AA", "colchester": "CO1 1AA", "stevenage": "SG1 1AA",
+}
+
+# ─── POSTCODE COORDS CACHE ───────────────────────────────────────────────────
+# Hardcoded coords for major cities to avoid API calls
+CITY_COORDS = {
+    "B1 1BB":   (52.4862, -1.8904),   # Birmingham
+    "EC1A 1BB": (51.5200, -0.0990),   # London
+    "M1 1AE":   (53.4808, -2.2426),   # Manchester
+    "LS1 1BA":  (53.7997, -1.5492),   # Leeds
+    "G1 1AA":   (55.8642, -4.2518),   # Glasgow
+    "L1 1JF":   (53.4084, -2.9916),   # Liverpool
+    "S1 1AA":   (53.3811, -1.4701),   # Sheffield
+    "BS1 1AA":  (51.4545, -2.5879),   # Bristol
+    "NE1 1AA":  (54.9783, -1.6178),   # Newcastle
+    "NG1 1AA":  (52.9540, -1.1549),   # Nottingham
+    "LE1 1AA":  (52.6369, -1.1398),   # Leicester
+    "CV1 1AA":  (52.4068, -1.5197),   # Coventry
+    "WV1 1AA":  (52.5852, -2.1297),   # Wolverhampton
+    "DE1 1AA":  (52.9225, -1.4746),   # Derby
+    "CF10 1AA": (51.4816, -3.1791),   # Cardiff
+    "EH1 1AA":  (55.9533, -3.1883),   # Edinburgh
+    "BT1 1AA":  (54.5973, -5.9301),   # Belfast
+    "SO14 1AA": (50.9097, -1.4044),   # Southampton
+    "PO1 1AA":  (50.7989, -1.0919),   # Portsmouth
+    "OX1 1AA":  (51.7520, -1.2577),   # Oxford
+    "CB1 1AA":  (52.2053, 0.1218),    # Cambridge
+    "RG1 1AA":  (51.4543, -0.9781),   # Reading
+    "LU1 1AA":  (51.8787, -0.4200),   # Luton
+    "NN1 1AA":  (52.2405, -0.9027),   # Northampton
+    "MK9 1AA":  (52.0406, -0.7594),   # Milton Keynes
+    "WA1 1AA":  (53.3900, -2.5970),   # Warrington
+    "HU1 1AA":  (53.7457, -0.3367),   # Hull
+    "DN1 1AA":  (53.5228, -1.1286),   # Doncaster
+    "WF1 1AA":  (53.6830, -1.4977),   # Wakefield
+    "DH1 1AA":  (54.7761, -1.5733),   # Durham
+    "SR1 1AA":  (54.9069, -1.3838),   # Sunderland
+    "TS1 1AA":  (54.5740, -1.2343),   # Middlesbrough
+    "BL1 1AA":  (53.5780, -2.4286),   # Bolton
+    "WN1 1AA":  (53.5450, -2.6333),   # Wigan
+    "SK1 1AA":  (53.4083, -2.1578),   # Stockport
+    "ST1 1AA":  (53.0271, -2.1772),   # Stoke
+    "SA1 1AA":  (51.6214, -3.9436),   # Swansea
+    "EX1 1AA":  (50.7236, -3.5275),   # Exeter
+    "EN1 1AA":  (51.6522, -0.0808),   # Enfield
+    "SL1 1AA":  (51.5105, -0.5950),   # Slough
+    "WD17 1AA": (51.6565, -0.3903),   # Watford
+    "CV21 1AA": (52.3711, -1.2660),   # Rugby
+    "LU5 4AA":  (51.8868, -0.5216),   # Dunstable
+    "LE67 1AA": (52.7236, -1.3698),   # Coalville
+    "L33 1AA":  (53.4597, -2.8480),   # Knowsley
+    "RM20 1AA": (51.4833, 0.2667),    # West Thurrock
+    "ML1 1AA":  (55.7900, -3.9833),   # Motherwell
+    "IG11 1AA": (51.5390, 0.0799),    # Barking
+    "RM18 1AA": (51.4617, 0.3590),    # Tilbury
+    "EH48 2FB": (55.9069, -3.6427),   # Bathgate
+    "GL4 3HR":  (51.8585, -2.2180),   # Gloucester
+    "BH15 2AA": (50.7192, -1.9874),   # Poole
+    "BH1 1AA":  (50.7209, -1.8795),   # Bournemouth
+    "SN1 1AA":  (51.5558, -1.7797),   # Swindon
+    "PE1 1AA":  (52.5695, -0.2405),   # Peterborough
+    "IP1 1AA":  (52.0567, 1.1482),    # Ipswich
+    "NR1 1AA":  (52.6309, 1.2974),    # Norwich
+    "SS14 1AA": (51.5790, 0.4553),    # Basildon
+    "CM1 1AA":  (51.7356, 0.4685),    # Chelmsford
+    "CO1 1AA":  (51.8960, 0.8919),    # Colchester
+    "SG1 1AA":  (51.9024, -0.2082),   # Stevenage
+    "S40 1AA":  (53.2354, -1.4210),   # Chesterfield
 }
 
 def resolve_location(location):
+    """Convert city name to postcode."""
     loc = location.lower().strip()
     if loc in CITY_POSTCODES:
         return CITY_POSTCODES[loc]
     for city, postcode in CITY_POSTCODES.items():
         if loc in city or city in loc:
             return postcode
+    # If it looks like a postcode already, return it
     return location.upper()
+
+def get_coords_for_postcode(postcode):
+    """Get coords from cache first, avoids API calls."""
+    clean = postcode.strip().upper()
+    # Try exact match
+    if clean in CITY_COORDS:
+        return CITY_COORDS[clean]
+    # Try prefix match (e.g. "B21" matches "B1 1BB" Birmingham area)
+    prefix = clean.split()[0] if " " in clean else clean[:3]
+    for pc, coords in CITY_COORDS.items():
+        if pc.startswith(prefix[0]):  # Same letter prefix = same region
+            pass  # Don't guess, fall through to None
+    return None
 
 # ─── SUBSCRIBER MANAGEMENT ───────────────────────────────────────────────────
 def load_subscribers():
@@ -82,7 +167,8 @@ def load_subscribers():
         if os.path.exists(SUBSCRIBERS_FILE):
             with open(SUBSCRIBERS_FILE, "r") as f:
                 return json.load(f)
-    except: pass
+    except:
+        pass
     return {}
 
 def save_subscribers(subs):
@@ -107,24 +193,7 @@ if CHAT_ID not in subscribers:
     }
     save_subscribers(subscribers)
 
-# Onboarding state machine
-onboarding = {}  # chat_id -> step + temp data
-
-# ─── GRAPHQL QUERY ────────────────────────────────────────────────────────────
-GRAPHQL_QUERY = """
-query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
-  searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
-    nextToken
-    jobCards {
-      jobId jobTitle jobType employmentType city state
-      postalCode locationName geoClusterDescription
-      totalPayRateMin totalPayRateMax firstDayOnSite
-      hoursPerWeek shiftCode scheduleCount currencyCode __typename
-    }
-    __typename
-  }
-}
-"""
+onboarding = {}
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
 async def tg_send(text, reply_markup=None, chat_id=None):
@@ -138,7 +207,7 @@ async def tg_send(text, reply_markup=None, chat_id=None):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-# ─── ONBOARDING FLOW ─────────────────────────────────────────────────────────
+# ─── ONBOARDING ──────────────────────────────────────────────────────────────
 async def start_onboarding(cid, name="there"):
     onboarding[cid] = {"step": "job_type", "locations": [], "name": name}
     await tg_send(f"""👑 <b>Welcome {name}!</b>
@@ -161,7 +230,6 @@ async def handle_onboarding(cid, text):
     state = onboarding.get(cid, {})
     step  = state.get("step", "")
 
-    # Step 1 — Job type
     if step == "job_type":
         if text in ["1", "1️⃣"]:
             state["job_type"] = "fulltime"
@@ -175,7 +243,6 @@ async def handle_onboarding(cid, text):
         else:
             await tg_send("Please reply with 1, 2 or 3 ☝️", chat_id=cid)
             return
-
         state["step"] = "location_1"
         onboarding[cid] = state
         await tg_send(f"""✅ Job type: <b>{job_label}</b>
@@ -187,7 +254,6 @@ This will be your priority location.
 Examples: Birmingham, London, Leeds, Manchester
 Or postcode: B1 1BB, LS9 0DZ""", chat_id=cid)
 
-    # Step 2 — Location 1 (required)
     elif step == "location_1":
         location = text.strip()
         state["locations"] = [location]
@@ -200,26 +266,22 @@ Enter your 2nd preferred location.
 
 Or type <b>DONE</b> to skip.""", chat_id=cid)
 
-    # Step 3 — Location 2 (optional)
     elif step == "location_2":
         if text.upper() == "DONE":
             state["step"] = "radius"
+            onboarding[cid] = state
+            await ask_radius(cid)
         else:
             state["locations"].append(text.strip())
             state["step"] = "location_3"
+            onboarding[cid] = state
             await tg_send(f"""✅ Location 2: <b>{text.strip()}</b>
 
 <b>Step 4 of 5 — Third Location (Optional)</b>
 Enter your 3rd preferred location.
 
 Or type <b>DONE</b> to skip.""", chat_id=cid)
-            onboarding[cid] = state
-            return
 
-        onboarding[cid] = state
-        await ask_radius(cid)
-
-    # Step 4 — Location 3 (optional)
     elif step == "location_3":
         if text.upper() != "DONE":
             state["locations"].append(text.strip())
@@ -227,24 +289,19 @@ Or type <b>DONE</b> to skip.""", chat_id=cid)
         onboarding[cid] = state
         await ask_radius(cid)
 
-    # Step 5 — Radius
     elif step == "radius":
         try:
             radius = int(re.search(r'\d+', text).group())
             state["radius"] = radius
             state["step"]   = "confirm"
             onboarding[cid] = state
-
-            # Build confirmation message
-            locs     = state.get("locations", [])
-            job_type = state.get("job_type", "both")
+            locs      = state.get("locations", [])
+            job_type  = state.get("job_type", "both")
             job_label = {"fulltime": "Full-time only", "parttime": "Part-time only", "both": "Full-time & Part-time"}.get(job_type, "Both")
-
-            loc_text = ""
+            loc_text  = ""
             for i, loc in enumerate(locs):
                 priority = " ⭐ (Priority)" if i == 0 else ""
                 loc_text += f"\n📍 Location {i+1}: <b>{loc}</b>{priority}"
-
             await tg_send(f"""<b>Step 5 of 5 — Confirm Your Preferences</b>
 ━━━━━━━━━━━━━━━━━
 📋 Job type: <b>{job_label}</b>{loc_text}
@@ -256,10 +313,8 @@ Reply with:
         except:
             await tg_send("Please enter a number e.g. <b>20</b> or <b>30</b>", chat_id=cid)
 
-    # Step 6 — Confirm
     elif step == "confirm":
         if text.upper() == "CONFIRM":
-            # Save subscriber
             name = state.get("name", "Friend")
             subscribers[cid] = {
                 "name":           name,
@@ -272,10 +327,8 @@ Reply with:
             }
             save_subscribers(subscribers)
             onboarding.pop(cid, None)
-
             locs      = subscribers[cid]["locations"]
             loc_lines = "\n".join([f"📍 {'⭐ ' if i==0 else ''}{loc}" for i, loc in enumerate(locs)])
-
             await tg_send(f"""🎉 <b>You're all set!</b>
 
 Your preferences have been saved:
@@ -287,7 +340,6 @@ Your preferences have been saved:
 
 Use /mypreferences to view or update anytime.
 Use /help for all commands.""", chat_id=cid)
-
         elif text.upper() == "RESTART":
             name = state.get("name", "there")
             await start_onboarding(cid, name)
@@ -306,34 +358,50 @@ Reply with miles:
 🚗 <b>30</b> — Reasonable
 🚗 <b>50</b> — Wide search""", chat_id=cid)
 
-# ─── POSTCODE DISTANCE ────────────────────────────────────────────────────────
-async def get_postcode_coords(postcode):
-    try:
-        clean = postcode.replace(" ", "").upper()
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"https://api.postcodes.io/postcodes/{clean}") as r:
-                data = await r.json()
-                if data.get("status") == 200:
-                    return data["result"]["latitude"], data["result"]["longitude"]
-    except: pass
-    return None, None
-
+# ─── DISTANCE CALCULATION ─────────────────────────────────────────────────────
 def haversine_miles(lat1, lon1, lat2, lon2):
     R = 3958.8
     lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    a    = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
 
+async def get_postcode_coords_api(postcode):
+    """Fetch coords from postcodes.io API as fallback."""
+    try:
+        clean = postcode.replace(" ", "").upper()
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://api.postcodes.io/postcodes/{clean}", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                data = await r.json()
+                if data.get("status") == 200:
+                    return data["result"]["latitude"], data["result"]["longitude"]
+    except:
+        pass
+    return None, None
+
+async def get_coords(postcode):
+    """Get coords: cache first, then API."""
+    clean = postcode.strip().upper()
+    # Check hardcoded cache
+    if clean in CITY_COORDS:
+        return CITY_COORDS[clean]
+    # Try API
+    return await get_postcode_coords_api(clean)
+
 async def job_distance_miles(job_postcode, location):
+    """
+    FIX: Returns distance or None. 
+    If coords unavailable, returns None (not treated as too_far).
+    """
     try:
         postcode = resolve_location(location)
-        lat1, lon1 = await get_postcode_coords(postcode)
-        lat2, lon2 = await get_postcode_coords(job_postcode)
-        if all([lat1, lon1, lat2, lon2]):
+        lat1, lon1 = await get_coords(postcode)
+        lat2, lon2 = await get_coords(job_postcode)
+        if all(x is not None for x in [lat1, lon1, lat2, lon2]):
             return round(haversine_miles(lat1, lon1, lat2, lon2), 1)
-    except: pass
+    except:
+        pass
     return None
 
 # ─── JOB TYPE FILTER ─────────────────────────────────────────────────────────
@@ -349,7 +417,8 @@ def job_matches_type(job, job_type):
 
 # ─── SHIFT UTILS ─────────────────────────────────────────────────────────────
 def is_night_shift(schedule):
-    if not schedule or schedule == "TBC": return False
+    if not schedule or schedule == "TBC":
+        return False
     return any(t in str(schedule) for t in ["18:30","19:00","20:00","21:00","22:00","23:00","23:45","0:00","1:00","2:00","3:00"])
 
 def shift_priority(text):
@@ -361,30 +430,38 @@ def shift_priority(text):
 async def tg_alert(job, status="new", chat_id=None, distance=None, account_id=None):
     cid = chat_id or CHAT_ID
 
-    if status == "new":        header = "🚨 <b>NEW AMAZON JOB — ACT NOW!</b>"
+    if status == "new":
+        header = "🚨 <b>NEW AMAZON JOB — ACT NOW!</b>"
     elif status == "applying":
-        acc = f" (Account {account_id})" if account_id else ""
+        acc    = f" (Account {account_id})" if account_id else ""
         header = f"🤖 <b>BOT AUTO-SUBMITTING{acc}...</b>"
     elif status == "applied":
-        acc = f" (Account {account_id})" if account_id else ""
+        acc    = f" (Account {account_id})" if account_id else ""
         header = f"✅ <b>APPLIED FOR YOU{acc}!</b>"
-    elif status == "navigating": header = "⚡ <b>BOT OPENING APPLICATION...</b>"
-    elif status == "ready":      header = "✅ <b>APPLICATION READY — LOG IN & SUBMIT!</b>"
-    else:                        header = "⚠️ <b>OPEN MANUALLY!</b>"
+    elif status == "navigating":
+        header = "⚡ <b>BOT OPENING APPLICATION...</b>"
+    elif status == "ready":
+        header = "✅ <b>APPLICATION READY — LOG IN & SUBMIT!</b>"
+    else:
+        header = "⚠️ <b>OPEN MANUALLY!</b>"
 
-    pay_str  = job.get("pay_display") or f"{job.get('pay','?'):.2f}"
+    pay_str  = job.get("pay_display") or f"{job.get('pay', '?'):.2f}"
     dist_str = f"\n📏 Distance: <b>{distance} miles</b>" if distance else ""
-    night    = " 🌙 NIGHT SHIFT" if is_night_shift(job.get("schedule","")) else ""
+    night    = " 🌙 NIGHT SHIFT" if is_night_shift(job.get("schedule", "")) else ""
+
+    # ✅ FIX: Clean job link — no extra params that break it
+    job_id   = job.get("id", "")
+    job_link = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}" if job_id != "TEST-001" else job.get("link", "https://www.jobsatamazon.co.uk")
 
     text = f"""{header}
 ━━━━━━━━━━━━━━━━━━━━━
-📍 <b>{job.get('location','Unknown')}</b>
-📦 {job.get('title','Warehouse Operative')}{night}
+📍 <b>{job.get('location', 'Unknown')}</b>
+📦 {job.get('title', 'Warehouse Operative')}{night}
 💰 <b>£{pay_str}/hr</b>
-📋 {job.get('contract','Seasonal')}
-📅 First Day: <b>{job.get('firstDay','TBC')}</b>
-🕘 Schedule: <b>{job.get('schedule','TBC')}</b>
-🕐 Hours/Week: <b>{job.get('hours','TBC')}</b>{dist_str}
+📋 {job.get('contract', 'Seasonal')}
+📅 First Day: <b>{job.get('firstDay', 'TBC')}</b>
+🕘 Schedule: <b>{job.get('schedule', 'TBC')}</b>
+🕐 Hours/Week: <b>{job.get('hours', 'TBC')}</b>{dist_str}
 ━━━━━━━━━━━━━━━━━━━━━"""
 
     if status == "applied":
@@ -394,9 +471,9 @@ async def tg_alert(job, status="new", chat_id=None, distance=None, account_id=No
 
     markup = {
         "inline_keyboard": [
-            [{"text": "🚀 OPEN APPLICATION", "url": job.get("link","https://www.jobsatamazon.co.uk")}],
-            [{"text": "✅ APPLIED", "callback_data": f"applied_{job['id']}"},
-             {"text": "⏭️ SKIP",   "callback_data": f"skip_{job['id']}"}]
+            [{"text": "🚀 OPEN APPLICATION", "url": job_link}],
+            [{"text": "✅ APPLIED",  "callback_data": f"applied_{job['id']}"},
+             {"text": "⏭️ SKIP",    "callback_data": f"skip_{job['id']}"}]
         ]
     }
     await tg_send(text, markup, chat_id=cid)
@@ -419,16 +496,20 @@ async def build_session():
                 try:
                     if "graphql" in response.url and response.status == 200:
                         captured_headers.update(dict(response.request.headers))
-                except: pass
+                except:
+                    pass
             page.on("response", sniff)
             await page.goto("https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR", wait_until="networkidle", timeout=45000)
             await page.wait_for_timeout(4000)
             cookies    = await context.cookies()
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             session_headers = {
-                "Content-Type": "application/json", "Accept": "application/json",
-                "Accept-Language": "en-GB,en;q=0.9", "country": "United Kingdom",
-                "locale": "en-GB", "Origin": "https://www.jobsatamazon.co.uk",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Accept-Language": "en-GB,en;q=0.9",
+                "country": "United Kingdom",
+                "locale": "en-GB",
+                "Origin": "https://www.jobsatamazon.co.uk",
                 "Referer": "https://www.jobsatamazon.co.uk/app",
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Cookie": cookie_str,
@@ -445,48 +526,139 @@ async def build_session():
 
 # ─── SCRAPER ─────────────────────────────────────────────────────────────────
 async def fetch_jobs():
+    """
+    FIX: Two-stage scraping.
+    Stage 1: Intercept GraphQL response (fast).
+    Stage 2: If Stage 1 returns 0, scroll and trigger manually.
+    Stage 3: If still 0, inject JS to extract from page state.
+    """
     all_jobs = {}
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox","--disable-setuid-sandbox","--disable-blink-features=AutomationControlled","--disable-gpu"])
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox","--disable-setuid-sandbox","--disable-blink-features=AutomationControlled","--disable-gpu"]
+            )
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-GB",
             )
             await context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
             await context.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}", lambda route: route.abort())
+
             page     = await context.new_page()
             captured = []
+
             async def handle_response(response):
                 try:
                     if "graphql" in response.url and response.status == 200:
                         data  = await response.json()
-                        cards = data.get("data",{}).get("searchJobCardsByLocation",{}).get("jobCards",[])
+                        cards = data.get("data", {}).get("searchJobCardsByLocation", {}).get("jobCards", [])
                         if cards:
                             log.info(f"🎯 Intercepted {len(cards)} jobs!")
                             captured.extend(cards)
-                except: pass
+                except:
+                    pass
+
             page.on("response", handle_response)
-            await page.goto("https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR", wait_until="networkidle", timeout=45000)
-            await page.wait_for_timeout(3000)
-            await page.evaluate("window.scrollTo(0,document.body.scrollHeight)")
-            await page.wait_for_timeout(2000)
+
+            # Stage 1 — Load page
+            await page.goto(
+                "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
+                wait_until="networkidle", timeout=45000
+            )
+            await page.wait_for_timeout(4000)
+
+            # Stage 2 — Scroll to trigger lazy loading if nothing captured
+            if not captured:
+                log.info("⚡ Stage 2: Scrolling to trigger GraphQL...")
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(3000)
+                await page.evaluate("window.scrollTo(0, 0)")
+                await page.wait_for_timeout(2000)
+
+            # Stage 3 — If still nothing, try clicking/filtering to force a new request
+            if not captured:
+                log.info("⚡ Stage 3: Trying to trigger search manually...")
+                try:
+                    # Try clicking any filter or search button
+                    for sel in ["button[type='submit']", "[data-test='search-button']", "button:has-text('Search')"]:
+                        btn = await page.query_selector(sel)
+                        if btn:
+                            await btn.click()
+                            await page.wait_for_timeout(3000)
+                            break
+                except:
+                    pass
+
+            # Stage 4 — Extract from page JS state as last resort
+            if not captured:
+                log.info("⚡ Stage 4: Extracting from page JS state...")
+                try:
+                    js_data = await page.evaluate("""() => {
+                        // Try Redux store or window state
+                        const keys = Object.keys(window);
+                        for (const key of keys) {
+                            try {
+                                const val = window[key];
+                                if (val && typeof val === 'object') {
+                                    const str = JSON.stringify(val);
+                                    if (str.includes('jobId') && str.includes('postalCode')) {
+                                        return str;
+                                    }
+                                }
+                            } catch(e) {}
+                        }
+                        return null;
+                    }""")
+                    if js_data:
+                        parsed = json.loads(js_data)
+                        # Try to extract job cards from nested structure
+                        def find_jobs(obj, depth=0):
+                            if depth > 10: return []
+                            if isinstance(obj, list):
+                                if obj and isinstance(obj[0], dict) and "jobId" in obj[0]:
+                                    return obj
+                                results = []
+                                for item in obj:
+                                    results.extend(find_jobs(item, depth+1))
+                                return results
+                            if isinstance(obj, dict):
+                                if "jobId" in obj:
+                                    return [obj]
+                                results = []
+                                for v in obj.values():
+                                    results.extend(find_jobs(v, depth+1))
+                                return results
+                            return []
+                        found = find_jobs(parsed)
+                        if found:
+                            log.info(f"✅ Stage 4 found {len(found)} jobs from JS state")
+                            captured.extend(found)
+                except Exception as e:
+                    log.warning(f"Stage 4 error: {e}")
+
             await browser.close()
+
             for card in captured:
                 job = parse_card(card)
                 if job and job["id"] not in all_jobs:
                     all_jobs[job["id"]] = job
+
     except Exception as e:
         log.error(f"Scraper error: {e}")
-    log.info(f"👑 Total: {len(all_jobs)} jobs")
+
+    log.info(f"👑 Total: {len(all_jobs)} jobs found")
     return list(all_jobs.values())
 
 # ─── PARSE CARD ───────────────────────────────────────────────────────────────
 def parse_card(card):
     try:
-        job_id = str(card.get("jobId",""))
-        if not job_id: return None
-        title      = card.get("jobTitle","Warehouse Operative") or "Warehouse Operative"
+        job_id = str(card.get("jobId", ""))
+        if not job_id:
+            return None
+
+        title      = card.get("jobTitle", "Warehouse Operative") or "Warehouse Operative"
         city       = card.get("city") or card.get("locationName") or ""
         state      = card.get("state") or "England"
         postcode   = card.get("postalCode") or ""
@@ -497,22 +669,28 @@ def parse_card(card):
         contract   = employment if employment and employment.lower() not in ["seasonal","temporary"] else (job_type or employment or "Seasonal")
         hours      = str(int(card.get("hoursPerWeek"))) if card.get("hoursPerWeek") else "TBC"
         first_day  = card.get("firstDayOnSite") or "TBC"
-        sched_count= card.get("scheduleCount",0)
+        sched_count= card.get("scheduleCount", 0)
         shift_code = card.get("shiftCode") or ""
         schedule   = shift_code if shift_code else (f"{sched_count} schedule(s)" if sched_count else "TBC")
+
         skip = ["customer service","vcc","virtual","remote","manager","software","engineer"]
-        if any(s in title.lower() for s in skip): return None
+        if any(s in title.lower() for s in skip):
+            return None
+
         parts = []
         if city: parts.append(city)
         if state and state != city: parts.append(state)
-        if geo and postcode:   location = f"{', '.join(parts)} ({geo}) {postcode}".strip()
-        elif geo:              location = f"{', '.join(parts)} ({geo})".strip()
-        elif postcode:         location = f"{', '.join(parts)} {postcode}".strip()
-        else:                  location = ", ".join(parts) or "Unknown UK Location"
-        link = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}&locale=en-GB&recommended=1&intcmpid=searchalljobsleft"
+        if geo and postcode:    location = f"{', '.join(parts)} ({geo}) {postcode}".strip()
+        elif geo:               location = f"{', '.join(parts)} ({geo})".strip()
+        elif postcode:          location = f"{', '.join(parts)} {postcode}".strip()
+        else:                   location = ", ".join(parts) or "Unknown UK Location"
+
+        # ✅ FIX: Clean link — just jobId, no extra params
+        link = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}"
+
         return {
             "id": job_id, "title": title, "location": location,
-            "postcode": postcode, "pay": round(pay,2), "pay_display": f"{pay:.2f}",
+            "postcode": postcode, "pay": round(pay, 2), "pay_display": f"{pay:.2f}",
             "contract": contract, "firstDay": first_day, "schedule": schedule,
             "hours": hours, "link": link, "found_at": datetime.utcnow().isoformat(),
         }
@@ -566,19 +744,18 @@ async def auto_submit_account(job, account, chat_id=None):
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-GB", timezone_id="Europe/London",
             )
-            # Load cookies
             if account["session"]:
                 await context.add_cookies(account["session"])
             elif account["cookies"]:
                 try:
                     await context.add_cookies(json.loads(account["cookies"]))
-                except: pass
+                except:
+                    pass
 
             page = await context.new_page()
             await page.goto(job["link"], wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(2000)
 
-            # Step 1 — Click Apply
             applied = False
             for sel in ["button:has-text('Apply')","a:has-text('Apply')","[data-test='apply-button']"]:
                 try:
@@ -588,22 +765,22 @@ async def auto_submit_account(job, account, chat_id=None):
                         await page.wait_for_timeout(2000)
                         applied = True
                         break
-                except: pass
+                except:
+                    pass
 
             if not applied:
                 await tg_alert(job, "ready", chat_id=cid)
                 await browser.close()
                 return
 
-            # Step 2 — Handle active app popup
             try:
                 btn = await page.wait_for_selector("button:has-text('Continue')", timeout=3000)
                 if btn:
                     await btn.click()
                     await page.wait_for_timeout(2000)
-            except: pass
+            except:
+                pass
 
-            # Step 3 — Start Application
             for sel in ["button:has-text('Start Application')","[data-test='start-application']"]:
                 try:
                     btn = await page.wait_for_selector(sel, timeout=5000)
@@ -611,9 +788,9 @@ async def auto_submit_account(job, account, chat_id=None):
                         await btn.click()
                         await page.wait_for_timeout(3000)
                         break
-                except: pass
+                except:
+                    pass
 
-            # Step 4 — Select best shift (night priority)
             try:
                 await page.wait_for_selector("button:has-text('Select this job')", timeout=8000)
                 shift_buttons = await page.query_selector_all("button:has-text('Select this job')")
@@ -628,20 +805,21 @@ async def auto_submit_account(job, account, chat_id=None):
                                 best_pri = pri
                                 if i < len(shift_buttons):
                                     best_btn = shift_buttons[i]
-                        except: pass
+                        except:
+                            pass
                     await best_btn.click()
                     await page.wait_for_timeout(3000)
-            except: pass
+            except:
+                pass
 
-            # Step 5 — Accept Offer
             try:
                 btn = await page.wait_for_selector("button:has-text('Accept Offer')", timeout=5000)
                 if btn:
                     await btn.click()
                     await page.wait_for_timeout(3000)
-            except: pass
+            except:
+                pass
 
-            # Check success
             content = await page.inner_text("body")
             if "thank you" in content.lower() or "applied" in content.lower() or "checklist" in page.url:
                 log.info(f"🎉 Account {acc_id} applied for {job['location']}!")
@@ -659,7 +837,8 @@ async def auto_submit_account(job, account, chat_id=None):
 # ─── MAIN CHECK ──────────────────────────────────────────────────────────────
 async def check_jobs():
     global known_jobs, job_history, posting_times
-    if bot_paused: return 0
+    if bot_paused:
+        return 0
 
     jobs      = await fetch_jobs()
     new_count = 0
@@ -677,42 +856,42 @@ async def check_jobs():
 
             # Alert each subscriber
             for sub_cid, prefs in subscribers.items():
-                if not prefs.get("setup_complete"): continue
+                if not prefs.get("setup_complete"):
+                    continue
+                if not job_matches_type(job, prefs.get("job_type", "both")):
+                    continue
 
-                # Check job type preference
-                if not job_matches_type(job, prefs.get("job_type","both")): continue
-
-                # Check distance from preferred locations
-                job_postcode  = job.get("postcode","")
-                locations     = prefs.get("locations",[])
-                radius        = prefs.get("radius",50)
-                too_far       = True
+                job_postcode  = job.get("postcode", "")
+                locations     = prefs.get("locations", [])
+                radius        = prefs.get("radius", 50)
+                too_far       = False  # ✅ FIX: Default to FALSE (send alert unless proven too far)
                 best_distance = None
 
                 if locations and job_postcode:
+                    distances = []
                     for location in locations:
                         d = await job_distance_miles(job_postcode, location)
                         if d is not None:
+                            distances.append(d)
                             if best_distance is None or d < best_distance:
                                 best_distance = d
-                            if d <= radius:
-                                too_far = False
-                                break
-                else:
-                    too_far = False
+
+                    # ✅ FIX: Only block if we got actual distance data AND it's too far
+                    if distances:
+                        too_far = min(distances) > radius
+
+                    # If no distances could be calculated (API failed), send anyway
+                    # too_far stays False
 
                 if too_far:
-                    log.info(f"📍 Subscriber {sub_cid}: job too far ({best_distance}mi)")
+                    log.info(f"📍 Subscriber {sub_cid}: job too far ({best_distance}mi from {locations})")
                     continue
 
-                # Send alert
                 await tg_alert(job, "new", chat_id=sub_cid, distance=best_distance)
 
-                # Auto-submit if enabled
                 if prefs.get("auto_apply") and ACCOUNTS:
                     asyncio.create_task(auto_submit_account(job, ACCOUNTS[0], chat_id=sub_cid))
                 else:
-                    # Navigate only
                     asyncio.create_task(navigate_job(job, sub_cid))
 
     if new_count == 0:
@@ -740,7 +919,8 @@ async def navigate_job(job, chat_id=None):
                         await btn.click()
                         await page.wait_for_timeout(2000)
                         break
-                except: pass
+                except:
+                    pass
             for sel in ["button:has-text('Start Application')"]:
                 try:
                     btn = await page.query_selector(sel)
@@ -748,7 +928,8 @@ async def navigate_job(job, chat_id=None):
                         await btn.click()
                         await page.wait_for_timeout(2000)
                         break
-                except: pass
+                except:
+                    pass
             job["link"] = page.url if page.url != "about:blank" else job["link"]
             await browser.close()
             await tg_alert(job, "ready", chat_id=cid)
@@ -760,11 +941,11 @@ async def send_daily_summary():
     while True:
         now = datetime.utcnow()
         if now.hour == 7 and now.minute == 0:
-            today = [j for j in job_history if j.get("found_at","")[:10] == now.strftime("%Y-%m-%d")]
+            today = [j for j in job_history if j.get("found_at", "")[:10] == now.strftime("%Y-%m-%d")]
             if today:
-                best    = max(today, key=lambda x: x.get("pay",0))
-                avg_pay = sum(j.get("pay",0) for j in today) / len(today)
-                nights  = sum(1 for j in today if is_night_shift(j.get("schedule","")))
+                best    = max(today, key=lambda x: x.get("pay", 0))
+                avg_pay = sum(j.get("pay", 0) for j in today) / len(today)
+                nights  = sum(1 for j in today if is_night_shift(j.get("schedule", "")))
                 await tg_send(f"""📊 <b>Daily Summary</b>
 ━━━━━━━━━━━━━━━━━
 📅 {now.strftime('%Y-%m-%d')}
@@ -790,7 +971,7 @@ async def handle_updates():
             async with aiohttp.ClientSession() as s:
                 async with s.get(f"{TELEGRAM_API}/getUpdates?offset={offset}&timeout=10") as r:
                     data = await r.json()
-                    for update in data.get("result",[]):
+                    for update in data.get("result", []):
                         offset = update["update_id"] + 1
                         await process_update(update)
         except Exception as e:
@@ -802,46 +983,44 @@ async def process_update(update):
 
     if "callback_query" in update:
         cb = update["callback_query"]
-        d  = cb.get("data","")
+        d  = cb.get("data", "")
         if d.startswith("applied_"): await tg_send("✅ Applied! Good luck! 💪🔥")
         elif d.startswith("skip_"):  await tg_send("⏭️ Skipped!")
         return
 
-    msg     = update.get("message",{})
-    text    = msg.get("text","").strip()
-    cid     = str(msg.get("chat",{}).get("id", CHAT_ID))
-    name    = msg.get("chat",{}).get("first_name","Friend")
+    msg     = update.get("message", {})
+    text    = msg.get("text", "").strip()
+    cid     = str(msg.get("chat", {}).get("id", CHAT_ID))
+    name    = msg.get("chat", {}).get("first_name", "Friend")
     text_lw = text.lower()
 
-    # Handle verification codes
     if text_lw.startswith("/verify_"):
         try:
             parts  = text.split(" ")
-            acc_id = int(parts[0].replace("/verify_",""))
+            acc_id = int(parts[0].replace("/verify_", ""))
             code   = parts[1] if len(parts) > 1 else ""
             if code and acc_id in verification_waiting:
                 verification_codes[acc_id] = code
                 verification_waiting[acc_id].set()
                 await tg_send(f"✅ Code received for Account {acc_id}!", chat_id=cid)
-        except: pass
+        except:
+            pass
         return
 
-    # Handle onboarding flow
     if cid in onboarding:
         await handle_onboarding(cid, text)
         return
 
-    # Commands
     if text_lw == "/start":
         if cid in subscribers and subscribers[cid].get("setup_complete"):
-            sub = subscribers[cid]
-            locs = ", ".join(sub.get("locations",[]))
+            sub  = subscribers[cid]
+            locs = ", ".join(sub.get("locations", []))
             await tg_send(f"""👋 <b>Welcome back {name}!</b>
 
 Your preferences:
 📍 {locs}
-🚗 {sub.get('radius',30)} miles
-📋 {sub.get('job_type','both')}
+🚗 {sub.get('radius', 30)} miles
+📋 {sub.get('job_type', 'both')}
 
 Use /help for all commands!""", chat_id=cid)
         else:
@@ -851,18 +1030,18 @@ Use /help for all commands!""", chat_id=cid)
         await start_onboarding(cid, name)
 
     elif text_lw == "/mypreferences":
-        sub = subscribers.get(cid,{})
+        sub = subscribers.get(cid, {})
         if not sub:
             await tg_send("You haven't set up yet! Send /start", chat_id=cid)
             return
-        locs     = sub.get("locations",[])
-        job_type = sub.get("job_type","both")
-        job_label = {"fulltime":"Full-time only","parttime":"Part-time only","both":"Full-time & Part-time"}.get(job_type,"Both")
-        loc_text = "\n".join([f"📍 {'⭐ ' if i==0 else ''}{loc}" for i,loc in enumerate(locs)])
+        locs      = sub.get("locations", [])
+        job_type  = sub.get("job_type", "both")
+        job_label = {"fulltime": "Full-time only", "parttime": "Part-time only", "both": "Full-time & Part-time"}.get(job_type, "Both")
+        loc_text  = "\n".join([f"📍 {'⭐ ' if i==0 else ''}{loc}" for i, loc in enumerate(locs)])
         await tg_send(f"""📋 <b>Your Preferences</b>
 ━━━━━━━━━━━━━━━━━
 {loc_text}
-🚗 Radius: {sub.get('radius',30)} miles
+🚗 Radius: {sub.get('radius', 30)} miles
 📋 Job type: {job_label}
 🤖 Auto-submit: {'✅ ON' if sub.get('auto_apply') else '❌ OFF'}
 ━━━━━━━━━━━━━━━━━
@@ -885,36 +1064,35 @@ Speed: {speed}
 ━━━━━━━━━━━━━━━━━""", chat_id=cid)
 
     elif text_lw == "/subscribers" and cid == CHAT_ID:
-        # Admin only
         txt = f"👥 <b>{len(subscribers)} Subscribers:</b>\n━━━━━━━━━━━\n"
         for scid, sub in subscribers.items():
-            locs = ", ".join(sub.get("locations",[]))
+            locs = ", ".join(sub.get("locations", []))
             txt += f"• {sub.get('name','?')} | {locs} | {sub.get('radius',30)}mi\n"
         await tg_send(txt, chat_id=cid)
 
     elif text_lw == "/scrape":
         await tg_send("🔍 <b>Scanning ALL UK Amazon jobs...</b>", chat_id=cid)
         count = await check_jobs()
-        await tg_send(f"✅ New: {count} | Tracked: {len(known_jobs)}\n{'🎉 Done!' if count > 0 else '⏳ No new jobs!'}", chat_id=cid)
+        await tg_send(f"✅ New: {count} | Tracked: {len(known_jobs)}\n{'🎉 Jobs found!' if count > 0 else '⏳ No new jobs found this scan!'}", chat_id=cid)
 
     elif text_lw == "/jobs":
         if not known_jobs:
-            await tg_send("📭 No jobs yet!", chat_id=cid)
+            await tg_send("📭 No jobs yet — send /scrape to scan!", chat_id=cid)
         else:
-            txt = f"📋 <b>Last {min(5,len(known_jobs))} Jobs:</b>\n━━━━━━━━━━━\n"
+            txt = f"📋 <b>Last {min(5, len(known_jobs))} Jobs:</b>\n━━━━━━━━━━━\n"
             for job in list(known_jobs.values())[-5:]:
-                night = "🌙" if is_night_shift(job.get("schedule","")) else "☀️"
+                night = "🌙" if is_night_shift(job.get("schedule", "")) else "☀️"
                 txt  += f"{night} {job.get('location')}\n💰 £{job.get('pay')}/hr | {job.get('contract')}\n📅 {job.get('firstDay','TBC')}\n\n"
             await tg_send(txt, chat_id=cid)
 
     elif text_lw == "/history":
         if not job_history:
-            await tg_send("📭 No history!", chat_id=cid)
+            await tg_send("📭 No history yet!", chat_id=cid)
         else:
             total  = len(job_history)
-            avg    = sum(j.get("pay",0) for j in job_history) / total
-            best   = max(job_history, key=lambda x: x.get("pay",0))
-            nights = sum(1 for j in job_history if is_night_shift(j.get("schedule","")))
+            avg    = sum(j.get("pay", 0) for j in job_history) / total
+            best   = max(job_history, key=lambda x: x.get("pay", 0))
+            nights = sum(1 for j in job_history if is_night_shift(j.get("schedule", "")))
             await tg_send(f"""📊 <b>History</b>
 Total: {total} | 🌙 Nights: {nights}
 Avg: £{avg:.2f}/hr
@@ -922,21 +1100,21 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
 
     elif text_lw == "/test":
         await tg_alert({
-            "id":"TEST-001","title":"Warehouse Operative",
-            "location":"Enfield, England (North-East London) EN3 7PZ",
-            "postcode":"EN3 7PZ","pay":15.30,"pay_display":"15.30",
-            "contract":"Reduced","firstDay":"2026-05-14",
-            "schedule":"Thu, Fri, Sat 23:45-10:15","hours":"30",
-            "link":"https://www.jobsatamazon.co.uk",
-        }, "new", chat_id=cid, distance=12.5)
+            "id": "TEST-001", "title": "Warehouse Operative",
+            "location": "Birmingham, England (West Midlands) B21 0UT",
+            "postcode": "B21 0UT", "pay": 14.30, "pay_display": "14.30",
+            "contract": "Full-time", "firstDay": "2026-05-14",
+            "schedule": "Mon, Tue, Wed, Thu 23:45-10:15", "hours": "40",
+            "link": "https://www.jobsatamazon.co.uk",
+        }, "new", chat_id=cid, distance=2.1)
 
     elif text_lw == "/pause" and cid == CHAT_ID:
         bot_paused = True
-        await tg_send("⏸️ Paused.", chat_id=cid)
+        await tg_send("⏸️ Bot paused.", chat_id=cid)
 
     elif text_lw == "/resume" and cid == CHAT_ID:
         bot_paused = False
-        await tg_send("▶️ Resumed! 🔥", chat_id=cid)
+        await tg_send("▶️ Bot resumed! 🔥", chat_id=cid)
 
     elif text_lw == "/help":
         await tg_send("""👑 <b>King Bot v9 Commands</b>
@@ -949,6 +1127,7 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
 /jobs           — Recent jobs
 /history        — All time stats
 /test           — Test alert
+/subscribers    — View all users (admin)
 ━━━━━━━━━━━━━━━━━
 🔗 Share bot: t.me/Jibhub_bot""", chat_id=cid)
 
@@ -980,8 +1159,10 @@ Send /scrape to check now!""")
         h, m    = now.hour, now.minute
         am_peak = (h == 10 and m >= 55) or (h == 11 and m <= 25)
         pm_peak = (h == 22 and m >= 55) or (h == 23 and m <= 25)
-        if am_peak or pm_peak: await asyncio.sleep(1)
-        else:                   await asyncio.sleep(30)
+        if am_peak or pm_peak:
+            await asyncio.sleep(1)
+        else:
+            await asyncio.sleep(30)
         await check_jobs()
 
 if __name__ == "__main__":
