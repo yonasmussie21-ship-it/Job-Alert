@@ -10,12 +10,12 @@ from playwright.async_api import async_playwright
 from collections import defaultdict
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
-CHAT_ID      = os.environ.get("CHAT_ID", "1027065157")
-DECODO_USER  = os.environ.get("DECODO_USER", "")
-DECODO_PASS  = os.environ.get("DECODO_PASS", "")
-DECODO_HOST  = os.environ.get("DECODO_HOST", "gate.decodo.com")
-DECODO_PORT  = os.environ.get("DECODO_PORT", "7777")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+CHAT_ID     = os.environ.get("CHAT_ID", "1027065157")
+DECODO_USER = os.environ.get("DECODO_USER", "")
+DECODO_PASS = os.environ.get("DECODO_PASS", "")
+DECODO_HOST = os.environ.get("DECODO_HOST", "gate.decodo.com")
+DECODO_PORT = os.environ.get("DECODO_PORT", "7777")
 
 # ─── MULTI-ACCOUNT CONFIG ────────────────────────────────────────────────────
 ACCOUNTS = []
@@ -37,16 +37,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
-known_jobs    = {}
-bot_paused    = False
-job_history   = []
-posting_times = defaultdict(list)
+known_jobs        = {}
+bot_paused        = False
+job_history       = []
+posting_times     = defaultdict(list)
+captured_graphql  = {}   # Stores real GraphQL request captured from browser
 
 TELEGRAM_API     = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SUBSCRIBERS_FILE = "/tmp/subscribers.json"
 COOKIES_FILE     = "/tmp/amazon_session.json"
 
-# ─── JOB FILTERING (from feedback) ───────────────────────────────────────────
+# ─── JOB FILTERING ───────────────────────────────────────────────────────────
 WAREHOUSE_KEYWORDS = [
     "warehouse", "fulfillment", "fulfilment", "sortation",
     "sort centre", "sort center", "delivery station",
@@ -59,7 +60,7 @@ WAREHOUSE_KEYWORDS = [
 
 BLOCKED_KEYWORDS = [
     "customer service", "software", "engineer", "manager",
-    "corporate", "marketing", "hr ", "finance", "recruiter",
+    "corporate", "marketing", " hr ", "finance", "recruiter",
     "sales", "vcc", "loss prevention", "learning ambassador",
     "data entry", "legal", "it support", "business analyst",
 ]
@@ -216,7 +217,6 @@ def is_peak_time():
     pm   = (h == 22 and m >= 55) or (h == 23 and m <= 25)
     return am or pm
 
-# ─── DECODO PROXY URL ─────────────────────────────────────────────────────────
 def get_proxy_url():
     if DECODO_USER and DECODO_PASS:
         return f"http://{DECODO_USER}:{DECODO_PASS}@{DECODO_HOST}:{DECODO_PORT}"
@@ -351,7 +351,8 @@ How far can you travel? (miles)
         onboarding[cid] = state
         locs   = state.get("locations", [])
         jt     = state.get("job_type", "both")
-        jlabel = {"fulltime": "Full-time only", "parttime": "Part-time only", "both": "Full-time & Part-time"}.get(jt)
+        jlabel = {"fulltime": "Full-time only", "parttime": "Part-time only",
+                  "both": "Full-time & Part-time"}.get(jt)
         ltext  = "\n".join([f"📍 {'⭐ ' if i==0 else ''}{l}" for i, l in enumerate(locs)])
         await tg_send(f"""<b>Confirm Your Preferences</b>
 ━━━━━━━━━━━━━━━━━
@@ -373,36 +374,11 @@ Reply <b>CONFIRM</b> or <b>RESTART</b>""", chat_id=cid)
             }
             save_subscribers(subscribers)
             onboarding.pop(cid, None)
-            await tg_send("🎉 <b>You're all set!</b> You'll get instant alerts when jobs drop!\n\nUse /help for all commands.", chat_id=cid)
+            await tg_send("🎉 <b>You're all set!</b> Instant alerts when jobs drop!\n\nUse /help for all commands.", chat_id=cid)
         elif text.upper() == "RESTART":
             await start_onboarding(cid, state.get("name", "there"))
         else:
             await tg_send("Reply <b>CONFIRM</b> or <b>RESTART</b>", chat_id=cid)
-
-# ─── GRAPHQL RESPONSE HANDLER (from feedback) ─────────────────────────────────
-async def handle_graphql_response(response, payload):
-    status = response.status
-    text   = await response.text()
-
-    if status != 200:
-        log.warning(f"⚠️ GraphQL status {status} — falling back to browser")
-        log.warning(f"GraphQL error response: {text[:800]}")
-        log.warning(f"GraphQL payload sent: {json.dumps(payload)[:1000]}")
-        return None
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        log.warning("⚠️ GraphQL returned invalid JSON — falling back to browser")
-        log.warning(f"Bad response: {text[:800]}")
-        return None
-
-    if "errors" in data:
-        log.warning("⚠️ GraphQL returned errors:")
-        log.warning(json.dumps(data["errors"], indent=2)[:1000])
-        return None
-
-    return data
 
 # ─── PARSE CARD ───────────────────────────────────────────────────────────────
 def parse_card(card):
@@ -454,103 +430,209 @@ def parse_card(card):
         log.warning(f"Parse error: {e}")
         return None
 
-# ─── PRIMARY SCRAPER — DIRECT GRAPHQL VIA DECODO UK PROXY ────────────────────
-async def fetch_jobs():
-    all_jobs = {}
-    proxy    = get_proxy_url()
-
-    if not proxy:
-        log.warning("⚠️ No Decodo proxy configured — falling back to browser")
-        return await fetch_jobs_browser()
-
-    graphql_url = "https://www.jobsatamazon.co.uk/api/graphql"
-
-    # GraphQL query
-    query = """
-    query searchJobCardsByLocation($input: SearchJobCardsByLocationInput!) {
-        searchJobCardsByLocation(input: $input) {
-            jobCards {
-                jobId jobTitle city state postalCode geoClusterDescription
-                totalPayRateMin totalPayRateMax employmentType jobType
-                hoursPerWeek firstDayOnSite scheduleCount shiftCode distance
-            }
-        }
-    }
+# ─── STEP 1: CAPTURE REAL GRAPHQL REQUEST FROM BROWSER ───────────────────────
+async def capture_real_graphql_request():
     """
-
-    # Build payload
-    payload = {
-        "query": query,
-        "variables": {
-            "input": {
-                "locale":     "en-GB",
-                "country":    "GBR",
-                "cityName":   "London",
-                "postalCode": "EC1A 1BB",
-                "radius":     500,
-                "jobType":    ["Full-Time", "Part-Time", "Reduced-Time", "Seasonal", "Temporary"],
-                "sortBy":     "DISTANCE",
-                "pageNumber": 0,
-                "pageSize":   100,
-            }
-        }
-    }
-
-    headers = {
-        "Content-Type":   "application/json",
-        "Accept":         "application/json",
-        "Accept-Language":"en-GB,en;q=0.9",
-        "country":        "United Kingdom",
-        "locale":         "en-GB",
-        "Origin":         "https://www.jobsatamazon.co.uk",
-        "Referer":        "https://www.jobsatamazon.co.uk/app",
-        "User-Agent":     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-
-    # Add saved cookies if available
-    saved = load_cookies()
-    if saved:
-        headers["Cookie"] = "; ".join([f"{c['name']}={c['value']}" for c in saved])
-
-    log.info(f"🌐 Fetching via Decodo UK proxy...")
+    Load Amazon jobs page once, capture the real GraphQL request
+    including exact URL, headers and body. Store globally for reuse.
+    """
+    global captured_graphql
+    log.info("🔍 Capturing real GraphQL request from browser...")
 
     try:
-        connector = aiohttp.TCPConnector()
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox","--disable-setuid-sandbox",
+                      "--disable-blink-features=AutomationControlled","--disable-gpu"]
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            )
+            await context.route(
+                "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}",
+                lambda route: route.abort()
+            )
+
+            saved = load_cookies()
+            if saved:
+                await context.add_cookies(saved)
+
+            page = await context.new_page()
+            found = asyncio.Event()
+
+            async def handle_request(request):
+                if "graphql" in request.url.lower() and not found.is_set():
+                    try:
+                        body = request.post_data
+                        if not body:
+                            return
+                        body_json = json.loads(body)
+                        op = body_json.get("operationName", "")
+                        if op == "searchJobCardsByLocation":
+                            # Clean headers — remove problematic ones
+                            headers = dict(request.headers)
+                            for h in ["content-length", "host", ":method",
+                                      ":path", ":scheme", ":authority"]:
+                                headers.pop(h, None)
+
+                            captured_graphql = {
+                                "url":     request.url,
+                                "headers": headers,
+                                "body":    body_json,
+                            }
+                            log.info(f"✅ Captured real GraphQL!")
+                            log.info(f"📡 URL: {request.url}")
+                            log.info(f"📡 Body preview: {body[:300]}")
+                            found.set()
+                    except Exception as e:
+                        log.warning(f"Capture error: {e}")
+
+            page.on("request", handle_request)
+
+            await page.goto(
+                "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
+                wait_until="networkidle", timeout=45000
+            )
+            await page.wait_for_timeout(3000)
+
+            if not found.is_set():
+                log.info("⚡ Scrolling to trigger GraphQL request...")
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(3000)
+
+            # Save cookies for future use
+            cookies = await context.cookies()
+            if cookies:
+                save_cookies(cookies)
+
+            await browser.close()
+
+            if captured_graphql:
+                log.info("✅ GraphQL request captured and ready to replay!")
+                return True
+            else:
+                log.warning("⚠️ Could not capture GraphQL request")
+                return False
+
+    except Exception as e:
+        log.error(f"Capture error: {e}")
+        return False
+
+# ─── STEP 2: REPLAY CAPTURED REQUEST THROUGH DECODO PROXY ────────────────────
+async def replay_graphql_via_proxy():
+    """
+    Replay the captured GraphQL request through Decodo UK proxy.
+    Returns list of job cards or empty list.
+    """
+    global captured_graphql
+
+    if not captured_graphql:
+        log.warning("⚠️ No captured GraphQL request yet")
+        return []
+
+    proxy = get_proxy_url()
+    if not proxy:
+        log.warning("⚠️ No Decodo proxy configured")
+        return []
+
+    url     = captured_graphql["url"]
+    headers = dict(captured_graphql["headers"])
+    body    = dict(captured_graphql["body"])
+
+    log.info(f"🌐 Replaying GraphQL via Decodo UK proxy...")
+    log.info(f"📡 URL: {url}")
+
+    try:
+        async with aiohttp.ClientSession() as session:
             async with session.post(
-                graphql_url,
-                json=payload,
+                url,
+                json=body,
                 headers=headers,
                 proxy=proxy,
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
-                data = await handle_graphql_response(response, payload)
+                status = response.status
+                text   = await response.text()
 
-                if data is None:
-                    log.info("↩️ GraphQL failed — trying browser fallback")
-                    return await fetch_jobs_browser()
+                if status != 200:
+                    log.warning(f"⚠️ Replay failed — status {status}")
+                    log.warning(f"Response: {text[:500]}")
+                    return []
 
-                cards = (data.get("data", {})
-                             .get("searchJobCardsByLocation", {})
-                             .get("jobCards", []))
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    log.warning(f"⚠️ Invalid JSON response: {text[:300]}")
+                    return []
 
-                log.info(f"🎯 GraphQL via Decodo: {len(cards)} jobs returned")
+                if "errors" in data:
+                    log.warning(f"⚠️ GraphQL errors: {json.dumps(data['errors'])[:500]}")
+                    return []
 
+                # Handle both response structures
+                result = data.get("data", {})
+                cards  = (result.get("searchJobCardsByLocation", {})
+                               .get("jobCards", []))
+
+                log.info(f"🎯 Decodo replay: {len(cards)} jobs returned!")
+                return cards
+
+    except Exception as e:
+        log.error(f"Replay error: {e}")
+        return []
+
+# ─── MAIN FETCH — CAPTURE ONCE, REPLAY FOREVER ───────────────────────────────
+async def fetch_jobs():
+    """
+    Strategy:
+    1. If we have a captured GraphQL request → replay via Decodo (fast, cheap)
+    2. If replay fails or no capture → recapture from browser then replay
+    3. If no proxy → use browser intercept directly
+    """
+    global captured_graphql
+    all_jobs = {}
+
+    # Try replay first if we have a captured request
+    if captured_graphql:
+        cards = await replay_graphql_via_proxy()
+        if cards:
+            for card in cards:
+                job = parse_card(card)
+                if job and job["id"] not in all_jobs:
+                    all_jobs[job["id"]] = job
+            log.info(f"👑 Total valid warehouse jobs: {len(all_jobs)}")
+            return list(all_jobs.values())
+        else:
+            log.warning("⚠️ Replay returned 0 — recapturing...")
+            captured_graphql = {}
+
+    # Capture fresh request from browser
+    success = await capture_real_graphql_request()
+
+    if success and captured_graphql:
+        # Now replay with proxy
+        if get_proxy_url():
+            cards = await replay_graphql_via_proxy()
+            if cards:
                 for card in cards:
                     job = parse_card(card)
                     if job and job["id"] not in all_jobs:
                         all_jobs[job["id"]] = job
+                log.info(f"👑 Total valid warehouse jobs: {len(all_jobs)}")
+                return list(all_jobs.values())
 
-    except Exception as e:
-        log.error(f"Decodo proxy error: {e}")
-        log.info("↩️ Falling back to browser")
-        return await fetch_jobs_browser()
+    # Final fallback — use browser intercept results directly
+    log.info("↩️ Using browser intercept results directly")
+    return await fetch_jobs_browser_only()
 
-    log.info(f"👑 Total valid warehouse jobs: {len(all_jobs)}")
-    return list(all_jobs.values())
 
-# ─── FALLBACK SCRAPER — BROWSER (NO PROXY, saves bandwidth) ──────────────────
-async def fetch_jobs_browser():
+async def fetch_jobs_browser_only():
+    """Pure browser intercept — no proxy. Fallback only."""
     all_jobs = {}
     try:
         async with async_playwright() as p:
@@ -563,9 +645,13 @@ async def fetch_jobs_browser():
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-GB",
             )
-            await context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-            await context.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}", lambda route: route.abort())
-
+            await context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            )
+            await context.route(
+                "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}",
+                lambda route: route.abort()
+            )
             saved = load_cookies()
             if saved:
                 await context.add_cookies(saved)
@@ -576,9 +662,6 @@ async def fetch_jobs_browser():
             async def handle_response(response):
                 try:
                     if "graphql" in response.url and response.status == 200:
-                        body = response.request.post_data
-                        if body:
-                            log.info(f"📡 Captured GraphQL request body: {body[:300]}")
                         data  = await response.json()
                         cards = (data.get("data", {})
                                      .get("searchJobCardsByLocation", {})
@@ -597,22 +680,18 @@ async def fetch_jobs_browser():
             await page.wait_for_timeout(4000)
 
             if not captured:
-                log.info("⚡ Scrolling to trigger GraphQL...")
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(3000)
-                await page.evaluate("window.scrollTo(0, 0)")
-                await page.wait_for_timeout(2000)
 
             await browser.close()
 
-            log.info(f"🎯 Browser intercepted {len(captured)} total cards")
             for card in captured:
                 job = parse_card(card)
                 if job and job["id"] not in all_jobs:
                     all_jobs[job["id"]] = job
 
     except Exception as e:
-        log.error(f"Browser error: {e}")
+        log.error(f"Browser fallback error: {e}")
 
     log.info(f"👑 Browser total: {len(all_jobs)} jobs")
     return list(all_jobs.values())
@@ -621,12 +700,17 @@ async def fetch_jobs_browser():
 async def fetch_job_details(job):
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox","--disable-gpu"])
+            browser = await p.chromium.launch(
+                headless=True, args=["--no-sandbox","--disable-gpu"]
+            )
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-GB",
             )
-            await context.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}", lambda route: route.abort())
+            await context.route(
+                "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}",
+                lambda route: route.abort()
+            )
             saved = load_cookies()
             if saved:
                 await context.add_cookies(saved)
@@ -746,7 +830,7 @@ async def auto_submit_account(job, account, chat_id=None):
 
             content = await page.inner_text("body")
             if "sign in" in content.lower() or "log in" in content.lower():
-                log.warning("🔐 Login wall hit — sending manual alert")
+                log.warning("🔐 Login wall — sending manual alert")
                 await tg_alert(job, "ready", chat_id=cid)
                 await browser.close()
                 return
@@ -769,9 +853,9 @@ async def auto_submit_account(job, account, chat_id=None):
             except:
                 pass
 
-            # CSS selector fallback
             if not applied:
-                for sel in ["button:has-text('Apply now')","button:has-text('Apply')","a:has-text('Apply')","[data-test='apply-button']"]:
+                for sel in ["button:has-text('Apply now')","button:has-text('Apply')",
+                            "a:has-text('Apply')","[data-test='apply-button']"]:
                     try:
                         btn = await page.query_selector(sel)
                         if btn and await btn.is_visible():
@@ -789,7 +873,6 @@ async def auto_submit_account(job, account, chat_id=None):
                 await browser.close()
                 return
 
-            # Continue / Next
             for sel in ["button:has-text('Continue')","button:has-text('Next')"]:
                 try:
                     btn = await page.wait_for_selector(sel, timeout=4000)
@@ -800,7 +883,6 @@ async def auto_submit_account(job, account, chat_id=None):
                 except:
                     pass
 
-            # Start Application
             for sel in ["button:has-text('Start Application')","[data-test='start-application']"]:
                 try:
                     btn = await page.wait_for_selector(sel, timeout=5000)
@@ -812,7 +894,6 @@ async def auto_submit_account(job, account, chat_id=None):
                 except:
                     pass
 
-            # Shift selection — pick best shift
             try:
                 await page.wait_for_selector("button:has-text('Select this job')", timeout=8000)
                 shift_buttons = await page.query_selector_all("button:has-text('Select this job')")
@@ -835,7 +916,6 @@ async def auto_submit_account(job, account, chat_id=None):
             except:
                 log.info("ℹ️ No shift selection page")
 
-            # Accept Offer
             try:
                 btn = await page.wait_for_selector("button:has-text('Accept Offer')", timeout=5000)
                 if btn:
@@ -845,7 +925,6 @@ async def auto_submit_account(job, account, chat_id=None):
             except:
                 pass
 
-            # Check success
             final_url     = page.url
             final_content = await page.inner_text("body")
             success = (
@@ -924,7 +1003,6 @@ async def check_jobs():
 
             await tg_alert(job, "new", chat_id=sub_cid, distance=best_distance)
 
-            # Owner always auto-submits regardless of saved preference
             is_owner    = (sub_cid == CHAT_ID)
             should_auto = (is_owner or prefs.get("auto_apply")) and ACCOUNTS and not is_fresh_job(job)
 
@@ -994,12 +1072,14 @@ Keep going Yonas! 💪""")
             await asyncio.sleep(60)
         await asyncio.sleep(30)
 
-async def session_refresh_loop():
+async def recapture_loop():
+    """Recapture GraphQL request every 6 hours to keep headers fresh."""
     while True:
-        await asyncio.sleep(4 * 60 * 60)
-        if os.path.exists(COOKIES_FILE):
-            os.remove(COOKIES_FILE)
-        log.info("🔄 Cookie cache cleared — fresh session next scan")
+        await asyncio.sleep(6 * 60 * 60)
+        log.info("🔄 Refreshing GraphQL capture...")
+        global captured_graphql
+        captured_graphql = {}
+        await capture_real_graphql_request()
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
 async def handle_updates():
@@ -1017,7 +1097,7 @@ async def handle_updates():
         await asyncio.sleep(2)
 
 async def process_update(update):
-    global bot_paused
+    global bot_paused, captured_graphql
 
     if "callback_query" in update:
         cb = update["callback_query"]
@@ -1062,7 +1142,8 @@ Use /help for all commands!""", chat_id=cid)
             return
         locs   = sub.get("locations",[])
         jt     = sub.get("job_type","both")
-        jlabel = {"fulltime":"Full-time only","parttime":"Part-time only","both":"Full-time & Part-time"}.get(jt,"Both")
+        jlabel = {"fulltime":"Full-time only","parttime":"Part-time only",
+                  "both":"Full-time & Part-time"}.get(jt,"Both")
         ltext  = "\n".join([f"📍 {'⭐ ' if i==0 else ''}{l}" for i, l in enumerate(locs)])
         auto   = "✅ ON (always)" if cid == CHAT_ID else ("✅ ON" if sub.get("auto_apply") else "❌ OFF")
         await tg_send(f"""📋 <b>Your Preferences</b>
@@ -1085,13 +1166,15 @@ Use /setup to update""", chat_id=cid)
         await tg_send("🤖 Auto-submit OFF ❌ (still fires as owner)", chat_id=cid)
 
     elif text_lw == "/status":
-        peak  = is_peak_time()
-        speed = "3s ⚡ PEAK" if peak else "10s 🔄 Normal"
-        proxy = "✅ Decodo UK" if get_proxy_url() else "❌ No proxy"
+        peak     = is_peak_time()
+        speed    = "3s ⚡ PEAK" if peak else "10s 🔄 Normal"
+        proxy    = "✅ Decodo UK" if get_proxy_url() else "❌ No proxy"
+        captured = "✅ Ready" if captured_graphql else "⏳ Not yet captured"
         await tg_send(f"""📊 <b>Bot Status</b>
 ━━━━━━━━━━━━━━━━━
 Status: {"⏸️ PAUSED" if bot_paused else "✅ RUNNING"}
 🌐 Proxy: {proxy}
+📡 GraphQL: {captured}
 👥 Subscribers: {len(subscribers)}
 🤖 Accounts: {len(ACCOUNTS)}
 Jobs tracked: {len(known_jobs)}
@@ -1158,17 +1241,24 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
         known_jobs.clear()
         await tg_send("🗑️ Cache cleared — bot will re-alert all jobs next scan.", chat_id=cid)
 
+    elif text_lw == "/recapture" and cid == CHAT_ID:
+        await tg_send("🔄 Recapturing GraphQL request...", chat_id=cid)
+        captured_graphql = {}
+        ok = await capture_real_graphql_request()
+        await tg_send(f"{'✅ Captured!' if ok else '❌ Failed — check logs'}", chat_id=cid)
+
     elif text_lw == "/help":
-        await tg_send("""👑 <b>Amazon KING BOT v12</b>
+        await tg_send("""👑 <b>Amazon KING BOT v13</b>
 ━━━━━━━━━━━━━━━━━
 /start          — Welcome & setup
 /setup          — Update preferences
 /mypreferences  — View settings
-/status         — Bot status + proxy
+/status         — Bot status
 /scrape         — Scan now
 /jobs           — Recent jobs
 /history        — All time stats
 /test           — Test alert
+/recapture      — Force new GraphQL capture
 /autoon         — Enable auto-submit
 /autooff        — Disable auto-submit
 /subscribers    — All users (admin)
@@ -1182,29 +1272,31 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info(f"👑 Amazon KING BOT v12 Starting!")
+    log.info(f"👑 Amazon KING BOT v13 Starting!")
     log.info(f"🌐 Proxy: {'Decodo configured ✅' if get_proxy_url() else 'No proxy ❌'}")
-    log.info(f"👥 Subscribers: {len(subscribers)}")
-    log.info(f"🤖 Accounts: {len(ACCOUNTS)}")
+    log.info(f"👥 Subscribers: {len(subscribers)} | 🤖 Accounts: {len(ACCOUNTS)}")
 
     asyncio.create_task(handle_updates())
     asyncio.create_task(send_daily_summary())
-    asyncio.create_task(session_refresh_loop())
+    asyncio.create_task(recapture_loop())
 
     await asyncio.sleep(2)
-    proxy_status = "✅ Decodo UK Proxy active" if get_proxy_url() else "❌ No proxy — add DECODO credentials"
-    await tg_send(f"""👑 <b>Amazon KING BOT v12 ONLINE!</b>
-🌐 {proxy_status}
-✅ Direct GraphQL via UK IP (~5KB/scan)
-✅ Auto-submit ON for owner (always)
-✅ Amazon Fresh blocked from auto
-✅ Smart warehouse job filtering
-✅ 3s peak / 10s normal scanning
-👥 {len(subscribers)} subscriber(s) | 🤖 {len(ACCOUNTS)} account(s)
-━━━━━━━━━━━━━━━━━
-Send /scrape to check now!
-Share: t.me/Jibhub_bot""")
 
+    # Step 1 — capture real GraphQL request on startup
+    await tg_send(f"""👑 <b>Amazon KING BOT v13 ONLINE!</b>
+🌐 Proxy: {'✅ Decodo UK' if get_proxy_url() else '❌ No proxy'}
+🔍 Capturing real GraphQL request...
+━━━━━━━━━━━━━━━━━
+👥 {len(subscribers)} subscriber(s) | 🤖 {len(ACCOUNTS)} account(s)""")
+
+    ok = await capture_real_graphql_request()
+
+    if ok:
+        await tg_send("✅ <b>GraphQL captured!</b> Now scanning via Decodo UK proxy...\n\nShare: t.me/Jibhub_bot")
+    else:
+        await tg_send("⚠️ <b>GraphQL capture failed</b> — using browser fallback\n\nSend /recapture to retry")
+
+    # Step 2 — start scanning
     await check_jobs()
 
     while True:
