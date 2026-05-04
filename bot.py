@@ -37,11 +37,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
-known_jobs        = {}
-bot_paused        = False
-job_history       = []
-posting_times     = defaultdict(list)
-captured_graphql  = {}   # Stores real GraphQL request captured from browser
+known_jobs    = {}
+bot_paused    = False
+job_history   = []
+posting_times = defaultdict(list)
 
 TELEGRAM_API     = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SUBSCRIBERS_FILE = "/tmp/subscribers.json"
@@ -430,14 +429,19 @@ def parse_card(card):
         log.warning(f"Parse error: {e}")
         return None
 
-# ─── STEP 1: CAPTURE REAL GRAPHQL REQUEST FROM BROWSER ───────────────────────
-async def capture_real_graphql_request():
+# ─── CORE SCRAPER — CAPTURE + REPLAY IN ONE SESSION (v14 key fix) ─────────────
+async def fetch_jobs():
     """
-    Load Amazon jobs page once, capture the real GraphQL request
-    including exact URL, headers and body. Store globally for reuse.
+    v14 approach — all in one browser session:
+    1. Open browser
+    2. Listen for the real GraphQL request (capture URL + headers + body)
+    3. Once captured, immediately replay via Decodo UK proxy
+    4. Parse results
+    5. Close browser
+    No globals, no race conditions, no hardcoded payload.
     """
-    global captured_graphql
-    log.info("🔍 Capturing real GraphQL request from browser...")
+    all_jobs = {}
+    proxy    = get_proxy_url()
 
     try:
         async with async_playwright() as p:
@@ -458,100 +462,135 @@ async def capture_real_graphql_request():
                 lambda route: route.abort()
             )
 
+            # Load saved cookies for better results
             saved = load_cookies()
             if saved:
                 await context.add_cookies(saved)
 
-            page = await context.new_page()
-            found = asyncio.Event()
+            page     = await context.new_page()
+            captured = {}     # stores real GraphQL request
+            direct_cards = [] # stores cards intercepted directly from browser
 
-            async def handle_request(request):
-                if "graphql" in request.url.lower() and not found.is_set():
+            # ── Listen on REQUESTS to capture exact payload ──────────────────
+            async def on_request(request):
+                if "/graphql" in request.url and not captured:
                     try:
                         body = request.post_data
-                        if not body:
-                            return
-                        body_json = json.loads(body)
-                        op = body_json.get("operationName", "")
-                        if op == "searchJobCardsByLocation":
-                            # Clean headers — remove problematic ones
+                        if body and "searchJobCardsByLocation" in body:
                             headers = dict(request.headers)
+                            # Remove browser-only headers that break replay
                             for h in ["content-length", "host", ":method",
                                       ":path", ":scheme", ":authority"]:
                                 headers.pop(h, None)
-
-                            captured_graphql = {
-                                "url":     request.url,
-                                "headers": headers,
-                                "body":    body_json,
-                            }
-                            log.info(f"✅ Captured real GraphQL!")
+                            captured["url"]     = request.url
+                            captured["headers"] = headers
+                            captured["body"]    = body
+                            log.info(f"✅ Captured real GraphQL request!")
                             log.info(f"📡 URL: {request.url}")
-                            log.info(f"📡 Body preview: {body[:300]}")
-                            found.set()
                     except Exception as e:
-                        log.warning(f"Capture error: {e}")
+                        log.warning(f"Request capture error: {e}")
 
-            page.on("request", handle_request)
+            # ── Also listen on RESPONSES to get direct results ───────────────
+            async def on_response(response):
+                if "/graphql" in response.url and response.status == 200:
+                    try:
+                        data  = await response.json()
+                        cards = (data.get("data", {})
+                                     .get("searchJobCardsByLocation", {})
+                                     .get("jobCards", []))
+                        if cards:
+                            log.info(f"🎯 Browser intercepted {len(cards)} jobs directly")
+                            direct_cards.extend(cards)
+                    except:
+                        pass
 
+            page.on("request",  on_request)
+            page.on("response", on_response)
+
+            # Load page
             await page.goto(
                 "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
                 wait_until="networkidle", timeout=45000
             )
             await page.wait_for_timeout(3000)
 
-            if not found.is_set():
-                log.info("⚡ Scrolling to trigger GraphQL request...")
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            # Scroll to trigger GraphQL if not yet captured
+            if not captured:
+                log.info("⚡ Scrolling to trigger GraphQL...")
+                await page.mouse.wheel(0, 3000)
                 await page.wait_for_timeout(3000)
+                await page.mouse.wheel(0, -3000)
+                await page.wait_for_timeout(2000)
 
-            # Save cookies for future use
+            # Save cookies for reuse
             cookies = await context.cookies()
             if cookies:
                 save_cookies(cookies)
 
             await browser.close()
 
-            if captured_graphql:
-                log.info("✅ GraphQL request captured and ready to replay!")
-                return True
+            # ── Now decide: replay via proxy OR use direct results ────────────
+            if captured and proxy:
+                log.info("🌐 Replaying captured request via Decodo UK proxy...")
+                cards = await replay_via_proxy(
+                    url=captured["url"],
+                    headers=captured["headers"],
+                    body=captured["body"],
+                    proxy=proxy
+                )
+                if cards:
+                    log.info(f"🎯 Decodo replay: {len(cards)} jobs!")
+                    for card in cards:
+                        job = parse_card(card)
+                        if job and job["id"] not in all_jobs:
+                            all_jobs[job["id"]] = job
+                else:
+                    log.warning("⚠️ Proxy replay failed — using direct browser results")
+                    for card in direct_cards:
+                        job = parse_card(card)
+                        if job and job["id"] not in all_jobs:
+                            all_jobs[job["id"]] = job
+
+            elif captured and not proxy:
+                log.info("⚠️ No proxy — replaying directly (Frankfurt IP)...")
+                cards = await replay_direct(
+                    url=captured["url"],
+                    headers=captured["headers"],
+                    body=captured["body"]
+                )
+                if cards:
+                    for card in cards:
+                        job = parse_card(card)
+                        if job and job["id"] not in all_jobs:
+                            all_jobs[job["id"]] = job
+                else:
+                    for card in direct_cards:
+                        job = parse_card(card)
+                        if job and job["id"] not in all_jobs:
+                            all_jobs[job["id"]] = job
+
             else:
-                log.warning("⚠️ Could not capture GraphQL request")
-                return False
+                # No capture — use whatever the browser intercepted directly
+                log.warning("⚠️ GraphQL not captured — using browser intercept results")
+                for card in direct_cards:
+                    job = parse_card(card)
+                    if job and job["id"] not in all_jobs:
+                        all_jobs[job["id"]] = job
 
     except Exception as e:
-        log.error(f"Capture error: {e}")
-        return False
+        log.error(f"fetch_jobs error: {e}")
 
-# ─── STEP 2: REPLAY CAPTURED REQUEST THROUGH DECODO PROXY ────────────────────
-async def replay_graphql_via_proxy():
-    """
-    Replay the captured GraphQL request through Decodo UK proxy.
-    Returns list of job cards or empty list.
-    """
-    global captured_graphql
+    log.info(f"👑 Total valid warehouse jobs: {len(all_jobs)}")
+    return list(all_jobs.values())
 
-    if not captured_graphql:
-        log.warning("⚠️ No captured GraphQL request yet")
-        return []
 
-    proxy = get_proxy_url()
-    if not proxy:
-        log.warning("⚠️ No Decodo proxy configured")
-        return []
-
-    url     = captured_graphql["url"]
-    headers = dict(captured_graphql["headers"])
-    body    = dict(captured_graphql["body"])
-
-    log.info(f"🌐 Replaying GraphQL via Decodo UK proxy...")
-    log.info(f"📡 URL: {url}")
-
+async def replay_via_proxy(url, headers, body, proxy):
+    """Replay exact captured GraphQL request through Decodo UK proxy."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url,
-                json=body,
+                data=body,           # send exact raw body — no modification
                 headers=headers,
                 proxy=proxy,
                 timeout=aiohttp.ClientTimeout(total=30)
@@ -560,141 +599,50 @@ async def replay_graphql_via_proxy():
                 text   = await response.text()
 
                 if status != 200:
-                    log.warning(f"⚠️ Replay failed — status {status}")
+                    log.warning(f"⚠️ Proxy replay status {status}")
                     log.warning(f"Response: {text[:500]}")
                     return []
 
                 try:
                     data = json.loads(text)
                 except json.JSONDecodeError:
-                    log.warning(f"⚠️ Invalid JSON response: {text[:300]}")
+                    log.warning(f"⚠️ Invalid JSON: {text[:300]}")
                     return []
 
                 if "errors" in data:
-                    log.warning(f"⚠️ GraphQL errors: {json.dumps(data['errors'])[:500]}")
+                    log.warning(f"⚠️ GraphQL errors: {json.dumps(data['errors'])[:300]}")
                     return []
 
-                # Handle both response structures
-                result = data.get("data", {})
-                cards  = (result.get("searchJobCardsByLocation", {})
-                               .get("jobCards", []))
-
-                log.info(f"🎯 Decodo replay: {len(cards)} jobs returned!")
+                cards = (data.get("data", {})
+                             .get("searchJobCardsByLocation", {})
+                             .get("jobCards", []))
                 return cards
 
     except Exception as e:
-        log.error(f"Replay error: {e}")
+        log.error(f"Proxy replay error: {e}")
         return []
 
-# ─── MAIN FETCH — CAPTURE ONCE, REPLAY FOREVER ───────────────────────────────
-async def fetch_jobs():
-    """
-    Strategy:
-    1. If we have a captured GraphQL request → replay via Decodo (fast, cheap)
-    2. If replay fails or no capture → recapture from browser then replay
-    3. If no proxy → use browser intercept directly
-    """
-    global captured_graphql
-    all_jobs = {}
 
-    # Try replay first if we have a captured request
-    if captured_graphql:
-        cards = await replay_graphql_via_proxy()
-        if cards:
-            for card in cards:
-                job = parse_card(card)
-                if job and job["id"] not in all_jobs:
-                    all_jobs[job["id"]] = job
-            log.info(f"👑 Total valid warehouse jobs: {len(all_jobs)}")
-            return list(all_jobs.values())
-        else:
-            log.warning("⚠️ Replay returned 0 — recapturing...")
-            captured_graphql = {}
-
-    # Capture fresh request from browser
-    success = await capture_real_graphql_request()
-
-    if success and captured_graphql:
-        # Now replay with proxy
-        if get_proxy_url():
-            cards = await replay_graphql_via_proxy()
-            if cards:
-                for card in cards:
-                    job = parse_card(card)
-                    if job and job["id"] not in all_jobs:
-                        all_jobs[job["id"]] = job
-                log.info(f"👑 Total valid warehouse jobs: {len(all_jobs)}")
-                return list(all_jobs.values())
-
-    # Final fallback — use browser intercept results directly
-    log.info("↩️ Using browser intercept results directly")
-    return await fetch_jobs_browser_only()
-
-
-async def fetch_jobs_browser_only():
-    """Pure browser intercept — no proxy. Fallback only."""
-    all_jobs = {}
+async def replay_direct(url, headers, body):
+    """Replay captured GraphQL request directly (no proxy)."""
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox","--disable-setuid-sandbox",
-                      "--disable-blink-features=AutomationControlled","--disable-gpu"]
-            )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                locale="en-GB",
-            )
-            await context.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-            )
-            await context.route(
-                "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}",
-                lambda route: route.abort()
-            )
-            saved = load_cookies()
-            if saved:
-                await context.add_cookies(saved)
-
-            page     = await context.new_page()
-            captured = []
-
-            async def handle_response(response):
-                try:
-                    if "graphql" in response.url and response.status == 200:
-                        data  = await response.json()
-                        cards = (data.get("data", {})
-                                     .get("searchJobCardsByLocation", {})
-                                     .get("jobCards", []))
-                        if cards:
-                            log.info(f"🎯 Browser intercepted {len(cards)} jobs")
-                            captured.extend(cards)
-                except:
-                    pass
-
-            page.on("response", handle_response)
-            await page.goto(
-                "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
-                wait_until="networkidle", timeout=45000
-            )
-            await page.wait_for_timeout(4000)
-
-            if not captured:
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(3000)
-
-            await browser.close()
-
-            for card in captured:
-                job = parse_card(card)
-                if job and job["id"] not in all_jobs:
-                    all_jobs[job["id"]] = job
-
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                data=body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status != 200:
+                    return []
+                data  = await response.json()
+                cards = (data.get("data", {})
+                             .get("searchJobCardsByLocation", {})
+                             .get("jobCards", []))
+                return cards
     except Exception as e:
-        log.error(f"Browser fallback error: {e}")
-
-    log.info(f"👑 Browser total: {len(all_jobs)} jobs")
-    return list(all_jobs.values())
+        log.error(f"Direct replay error: {e}")
+        return []
 
 # ─── FETCH FULL JOB DETAILS ──────────────────────────────────────────────────
 async def fetch_job_details(job):
@@ -1072,15 +1020,6 @@ Keep going Yonas! 💪""")
             await asyncio.sleep(60)
         await asyncio.sleep(30)
 
-async def recapture_loop():
-    """Recapture GraphQL request every 6 hours to keep headers fresh."""
-    while True:
-        await asyncio.sleep(6 * 60 * 60)
-        log.info("🔄 Refreshing GraphQL capture...")
-        global captured_graphql
-        captured_graphql = {}
-        await capture_real_graphql_request()
-
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
 async def handle_updates():
     offset = 0
@@ -1097,7 +1036,7 @@ async def handle_updates():
         await asyncio.sleep(2)
 
 async def process_update(update):
-    global bot_paused, captured_graphql
+    global bot_paused
 
     if "callback_query" in update:
         cb = update["callback_query"]
@@ -1166,15 +1105,13 @@ Use /setup to update""", chat_id=cid)
         await tg_send("🤖 Auto-submit OFF ❌ (still fires as owner)", chat_id=cid)
 
     elif text_lw == "/status":
-        peak     = is_peak_time()
-        speed    = "3s ⚡ PEAK" if peak else "10s 🔄 Normal"
-        proxy    = "✅ Decodo UK" if get_proxy_url() else "❌ No proxy"
-        captured = "✅ Ready" if captured_graphql else "⏳ Not yet captured"
+        peak  = is_peak_time()
+        speed = "3s ⚡ PEAK" if peak else "10s 🔄 Normal"
+        proxy = "✅ Decodo UK" if get_proxy_url() else "❌ No proxy"
         await tg_send(f"""📊 <b>Bot Status</b>
 ━━━━━━━━━━━━━━━━━
 Status: {"⏸️ PAUSED" if bot_paused else "✅ RUNNING"}
 🌐 Proxy: {proxy}
-📡 GraphQL: {captured}
 👥 Subscribers: {len(subscribers)}
 🤖 Accounts: {len(ACCOUNTS)}
 Jobs tracked: {len(known_jobs)}
@@ -1193,7 +1130,11 @@ History: {len(job_history)}
     elif text_lw == "/scrape":
         await tg_send("🔍 <b>Scanning ALL UK Amazon jobs...</b>", chat_id=cid)
         count = await check_jobs()
-        await tg_send(f"✅ New: {count} | Tracked: {len(known_jobs)}\n{'🎉 New jobs found!' if count > 0 else '⏳ No new jobs this scan'}", chat_id=cid)
+        await tg_send(
+            f"✅ New: {count} | Tracked: {len(known_jobs)}\n"
+            f"{'🎉 New jobs found!' if count > 0 else '⏳ No new jobs this scan'}",
+            chat_id=cid
+        )
 
     elif text_lw == "/jobs":
         if not known_jobs:
@@ -1241,14 +1182,8 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
         known_jobs.clear()
         await tg_send("🗑️ Cache cleared — bot will re-alert all jobs next scan.", chat_id=cid)
 
-    elif text_lw == "/recapture" and cid == CHAT_ID:
-        await tg_send("🔄 Recapturing GraphQL request...", chat_id=cid)
-        captured_graphql = {}
-        ok = await capture_real_graphql_request()
-        await tg_send(f"{'✅ Captured!' if ok else '❌ Failed — check logs'}", chat_id=cid)
-
     elif text_lw == "/help":
-        await tg_send("""👑 <b>Amazon KING BOT v13</b>
+        await tg_send("""👑 <b>Amazon KING BOT v14</b>
 ━━━━━━━━━━━━━━━━━
 /start          — Welcome & setup
 /setup          — Update preferences
@@ -1258,7 +1193,6 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
 /jobs           — Recent jobs
 /history        — All time stats
 /test           — Test alert
-/recapture      — Force new GraphQL capture
 /autoon         — Enable auto-submit
 /autooff        — Disable auto-submit
 /subscribers    — All users (admin)
@@ -1267,36 +1201,32 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
 /resume         — Resume bot (admin)
 ━━━━━━━━━━━━━━━━━
 🔗 Share: t.me/Jibhub_bot
-🌿 Amazon Fresh = alert only
+🌿 Fresh = alert only, no auto-submit
 🌐 Powered by Decodo UK proxy""", chat_id=cid)
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info(f"👑 Amazon KING BOT v13 Starting!")
+    log.info(f"👑 Amazon KING BOT v14 Starting!")
     log.info(f"🌐 Proxy: {'Decodo configured ✅' if get_proxy_url() else 'No proxy ❌'}")
     log.info(f"👥 Subscribers: {len(subscribers)} | 🤖 Accounts: {len(ACCOUNTS)}")
 
     asyncio.create_task(handle_updates())
     asyncio.create_task(send_daily_summary())
-    asyncio.create_task(recapture_loop())
 
     await asyncio.sleep(2)
-
-    # Step 1 — capture real GraphQL request on startup
-    await tg_send(f"""👑 <b>Amazon KING BOT v13 ONLINE!</b>
+    await tg_send(f"""👑 <b>Amazon KING BOT v14 ONLINE!</b>
+✅ Capture + replay in one session
+✅ Exact Amazon request format
+✅ Decodo UK proxy routing
+✅ Auto-submit ON for owner
+✅ Fresh jobs blocked from auto
+✅ 3s peak / 10s normal
 🌐 Proxy: {'✅ Decodo UK' if get_proxy_url() else '❌ No proxy'}
-🔍 Capturing real GraphQL request...
+👥 {len(subscribers)} subscriber(s) | 🤖 {len(ACCOUNTS)} account(s)
 ━━━━━━━━━━━━━━━━━
-👥 {len(subscribers)} subscriber(s) | 🤖 {len(ACCOUNTS)} account(s)""")
+Send /scrape to check now!
+Share: t.me/Jibhub_bot""")
 
-    ok = await capture_real_graphql_request()
-
-    if ok:
-        await tg_send("✅ <b>GraphQL captured!</b> Now scanning via Decodo UK proxy...\n\nShare: t.me/Jibhub_bot")
-    else:
-        await tg_send("⚠️ <b>GraphQL capture failed</b> — using browser fallback\n\nSend /recapture to retry")
-
-    # Step 2 — start scanning
     await check_jobs()
 
     while True:
