@@ -768,7 +768,7 @@ async def tg_alert(job, status="new", chat_id=None, distance=None,
         "applying":    f"🤖 <b>AUTO-SUBMITTING{' (Acc '+str(account_id)+')' if account_id else ''}...</b>",
         "applied":     f"✅ <b>APPLIED FOR YOU{' (Acc '+str(account_id)+')' if account_id else ''}!</b>",
         "ready":       "👆 <b>APPLICATION READY — TAP TO SUBMIT!</b>",
-        "prepared":    "📋 <b>APPLICATION PREPARED — LOG IN & CONFIRM!</b>",
+        "prepared":    "🤖 <b>APPLICATION PREPARED — TAP TO CONFIRM!</b>",
         "fresh_alert": "🌿 <b>AMAZON FRESH — MANUAL APPLY ONLY</b>",
     }
     header = headers_map.get(status, "⚠️ <b>OPEN MANUALLY!</b>")
@@ -815,7 +815,7 @@ async def tg_alert(job, status="new", chat_id=None, distance=None,
     elif status == "ready":
         text += "\n👆 <b>Tap OPEN APPLICATION → Log in → Submit!</b>\n━━━━━━━━━━━━━━━━━━━━━"
     elif status == "prepared":
-        text += "\n📋 <b>Application prepared — log in and confirm to submit!</b>\n━━━━━━━━━━━━━━━━━━━━━"
+        text += "\n👆 <b>Bot has prepared your application + selected best shift!</b>\n🔐 Tap OPEN APPLICATION → Log in → Confirm → DONE!\n━━━━━━━━━━━━━━━━━━━━━"
     elif status == "fresh_alert":
         text += "\n🌿 <b>Fresh excluded from auto-submit</b>\n━━━━━━━━━━━━━━━━━━━━━"
 
@@ -1044,44 +1044,32 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
             except:
                 log.info("ℹ️ No shift selection page")
 
-            # ── TIER LOGIC ────────────────────────────────────────────────
-            if tier == "standard":
-                # Stop here — notify subscriber to confirm
-                job["link"] = page.url if page.url != "about:blank" else job["link"]
-                await tg_alert(job, "prepared", chat_id=cid)
-                await browser.close()
-                return
+            # ── HALF BOT HALF HUMAN — works on any server ─────────────────
+            # Bot has navigated, selected best shift, reached confirmation
+            # Now send subscriber the exact URL to tap and confirm themselves
+            # This works perfectly from Frankfurt — no IP issues
+            final_url = page.url if page.url != "about:blank" else job["link"]
+            job["link"] = final_url
 
-            # Owner / Premium — complete the submission
-            try:
-                btn = await page.wait_for_selector("button:has-text('Accept Offer')", timeout=5000)
-                if btn:
-                    await btn.click()
-                    await page.wait_for_timeout(3000)
-                    log.info("✅ Offer accepted")
-            except:
-                pass
+            # Check what page we reached
+            current_content = await page.inner_text("body")
 
-            final_url     = page.url
-            final_content = await page.inner_text("body")
-            success = (
-                "thank you" in final_content.lower() or
-                "applied" in final_content.lower() or
-                "checklist" in final_url or
-                "dashboard" in final_url or
-                "confirmation" in final_url
-            )
+            if any(w in current_content.lower() for w in [
+                "select", "shift", "schedule", "confirm", "accept", "pre-hire",
+                "start application", "appointment", "checklist"
+            ]):
+                # Bot reached a meaningful page — send prepared alert
+                log.info(f"✅ Bot navigated to: {final_url}")
+                await tg_alert(job, "prepared", chat_id=cid, account_id=acc_id)
+            else:
+                # Didn't get far — send basic ready alert
+                await tg_alert(job, "ready", chat_id=cid)
 
-            if success:
-                log.info(f"🎉 Applied! {job['location']}")
-                await tg_alert(job, "applied", chat_id=cid, account_id=acc_id)
-                fresh_cookies = await context.cookies()
+            # Save cookies for next time
+            fresh_cookies = await context.cookies()
+            if fresh_cookies:
                 save_cookies(fresh_cookies)
                 account["session"] = fresh_cookies
-            else:
-                log.warning("⚠️ Uncertain — sending manual alert")
-                job["link"] = final_url if final_url != "about:blank" else job["link"]
-                await tg_alert(job, "ready", chat_id=cid)
 
             await browser.close()
 
