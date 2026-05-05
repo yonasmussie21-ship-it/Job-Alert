@@ -6,6 +6,7 @@ import aiohttp
 import re
 import math
 from datetime import datetime
+from urllib.parse import quote
 from playwright.async_api import async_playwright
 from collections import defaultdict
 
@@ -14,8 +15,10 @@ BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 CHAT_ID     = os.environ.get("CHAT_ID", "1027065157")
 DECODO_USER = os.environ.get("DECODO_USER", "")
 DECODO_PASS = os.environ.get("DECODO_PASS", "")
-DECODO_HOST = os.environ.get("DECODO_HOST", "gate.decodo.com")
-DECODO_PORT = os.environ.get("DECODO_PORT", "7777")
+DECODO_HOST = os.environ.get("DECODO_HOST", "gb.decodo.com")
+DECODO_PORT = os.environ.get("DECODO_PORT", "30004")
+AMAZON_EMAIL = os.environ.get("AMAZON_EMAIL", "")
+AMAZON_PIN   = os.environ.get("AMAZON_PIN", "")
 
 # ─── MULTI-ACCOUNT CONFIG ────────────────────────────────────────────────────
 ACCOUNTS = []
@@ -24,8 +27,8 @@ for i in range(1, 6):
     pin     = os.environ.get(f"AMAZON_PIN_{i}", "")
     cookies = os.environ.get(f"AMAZON_COOKIES_{i}", "")
     if i == 1:
-        email   = email   or os.environ.get("AMAZON_EMAIL", "")
-        pin     = pin     or os.environ.get("AMAZON_PIN", "")
+        email   = email   or AMAZON_EMAIL
+        pin     = pin     or AMAZON_PIN
         cookies = cookies or os.environ.get("AMAZON_COOKIES", "")
     if email or cookies:
         ACCOUNTS.append({
@@ -41,6 +44,8 @@ known_jobs    = {}
 bot_paused    = False
 job_history   = []
 posting_times = defaultdict(list)
+otp_waiting   = {}  # chat_id -> asyncio.Event
+otp_codes     = {}  # chat_id -> code string
 
 TELEGRAM_API     = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SUBSCRIBERS_FILE = "/tmp/subscribers.json"
@@ -218,7 +223,9 @@ def is_peak_time():
 
 def get_proxy_url():
     if DECODO_USER and DECODO_PASS:
-        return f"http://{DECODO_USER}:{DECODO_PASS}@{DECODO_HOST}:{DECODO_PORT}"
+        # URL-encode password to handle special characters like +
+        encoded_pass = quote(DECODO_PASS, safe="")
+        return f"http://{DECODO_USER}:{encoded_pass}@{DECODO_HOST}:{DECODO_PORT}"
     return None
 
 # ─── SUBSCRIBER MANAGEMENT ───────────────────────────────────────────────────
@@ -403,11 +410,11 @@ def parse_card(card):
         employment  = card.get("employmentType") or ""
         job_type    = card.get("jobType") or ""
         contract    = employment or job_type or "Seasonal"
-        hours       = str(int(card.get("hoursPerWeek"))) if card.get("hoursPerWeek") else "TBC"
-        first_day   = card.get("firstDayOnSite") or "TBC"
+        hours       = str(int(card.get("hoursPerWeek"))) if card.get("hoursPerWeek") else None
+        first_day   = card.get("firstDayOnSite") or None
         sched_count = card.get("scheduleCount", 0)
         shift_code  = card.get("shiftCode") or ""
-        schedule    = shift_code if shift_code else (f"{sched_count} schedule(s)" if sched_count else "TBC")
+        schedule    = shift_code if shift_code else None
 
         parts = []
         if city: parts.append(city)
@@ -421,7 +428,7 @@ def parse_card(card):
             "id": job_id, "title": title, "location": location,
             "postcode": postcode, "pay": round(pay, 2), "pay_display": f"{pay:.2f}",
             "contract": contract, "firstDay": first_day, "schedule": schedule,
-            "hours": hours,
+            "hours": hours, "sched_count": sched_count,
             "link": f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}",
             "found_at": datetime.utcnow().isoformat(),
         }
@@ -429,17 +436,115 @@ def parse_card(card):
         log.warning(f"Parse error: {e}")
         return None
 
-# ─── CORE SCRAPER — CAPTURE + REPLAY IN ONE SESSION (v14 key fix) ─────────────
+# ─── FETCH FULL JOB DETAILS (v15 — full shift scraping) ──────────────────────
+async def fetch_job_details(job):
+    """
+    Scrape the full job page to get:
+    - Real shift schedules (not TBC)
+    - First day
+    - Hours per week
+    - Job description
+    - Multiple shifts
+    """
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True, args=["--no-sandbox","--disable-gpu"]
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+            )
+            await context.route(
+                "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}",
+                lambda route: route.abort()
+            )
+            saved = load_cookies()
+            if saved:
+                await context.add_cookies(saved)
+
+            page = await context.new_page()
+
+            # Intercept GraphQL for shift data
+            shifts_data = []
+            async def handle_response(response):
+                try:
+                    if "graphql" in response.url and response.status == 200:
+                        data = await response.json()
+                        # Look for job details with shifts
+                        job_detail = (data.get("data", {})
+                                         .get("getJobDetailByJobId", {}))
+                        if job_detail:
+                            shifts = job_detail.get("jobCardDetail", {}).get("scheduleDetails", [])
+                            if shifts:
+                                shifts_data.extend(shifts)
+                                log.info(f"✅ Got {len(shifts)} shifts from GraphQL")
+                except:
+                    pass
+
+            page.on("response", handle_response)
+            await page.goto(job["link"], wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(4000)
+            content = await page.inner_text("body")
+
+            # ── Extract First Day ──────────────────────────────────────────
+            patterns = [
+                r'(?:Tentative start date|Start date|First day)[:\s]+([A-Za-z]+,?\s+\d+\s+[A-Za-z]+\s+\d{4})',
+                r'(?:Tentative start date|Start date|First day)[:\s]+([A-Za-z]+ \d+, \d{4})',
+                r'(\d{4}-\d{2}-\d{2})',
+            ]
+            for pattern in patterns:
+                m = re.search(pattern, content, re.IGNORECASE)
+                if m:
+                    job["firstDay"] = m.group(1).strip()
+                    break
+
+            # ── Extract Job Description ────────────────────────────────────
+            desc_match = re.search(
+                r'(?:Pick, pack|Sort|Process|Receive|Load|Unload|Pack|Ship)[^.]+\.',
+                content, re.IGNORECASE
+            )
+            if desc_match:
+                job["description"] = desc_match.group(0).strip()
+
+            # ── Extract Shifts from page content ──────────────────────────
+            # Look for shift timing patterns like "Mon, Tue, Wed 08:00 - 18:30"
+            shift_patterns = re.findall(
+                r'([A-Za-z]{3}(?:,\s*[A-Za-z]{3})*\s+\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})',
+                content
+            )
+
+            if shift_patterns:
+                # Get unique shifts
+                unique_shifts = list(dict.fromkeys(shift_patterns))
+                job["shifts"] = unique_shifts
+                job["schedule"] = unique_shifts[0] if unique_shifts else None
+                log.info(f"✅ Found {len(unique_shifts)} shift patterns")
+            elif shifts_data:
+                # Use GraphQL shift data
+                job["shifts"] = [s.get("scheduleDisplay", "") for s in shifts_data]
+                job["schedule"] = job["shifts"][0] if job["shifts"] else None
+
+            # ── Extract Hours ──────────────────────────────────────────────
+            m = re.search(r'(\d+)\s*(?:hrs?|hours?)\s*(?:per\s*week|/week)', content, re.IGNORECASE)
+            if m:
+                job["hours"] = m.group(1)
+
+            # ── Extract Contract Type ──────────────────────────────────────
+            for ct in ["Full-time","Part-time","Reduced","Fixed-term","Seasonal","Permanent","Temporary"]:
+                if ct.lower() in content.lower():
+                    job["contract"] = ct
+                    break
+
+            await browser.close()
+            log.info(f"✅ Details: day={job.get('firstDay','?')} shifts={len(job.get('shifts',[]))} hrs={job.get('hours','?')}")
+
+    except Exception as e:
+        log.warning(f"Detail fetch error: {e}")
+    return job
+
+# ─── CORE SCRAPER — CAPTURE + REPLAY IN ONE SESSION ──────────────────────────
 async def fetch_jobs():
-    """
-    v14 approach — all in one browser session:
-    1. Open browser
-    2. Listen for the real GraphQL request (capture URL + headers + body)
-    3. Once captured, immediately replay via Decodo UK proxy
-    4. Parse results
-    5. Close browser
-    No globals, no race conditions, no hardcoded payload.
-    """
     all_jobs = {}
     proxy    = get_proxy_url()
 
@@ -462,35 +567,54 @@ async def fetch_jobs():
                 lambda route: route.abort()
             )
 
-            # Load saved cookies for better results
             saved = load_cookies()
             if saved:
                 await context.add_cookies(saved)
 
-            page     = await context.new_page()
-            captured = {}     # stores real GraphQL request
-            direct_cards = [] # stores cards intercepted directly from browser
+            page         = await context.new_page()
+            captured     = {}
+            direct_cards = []
 
-            # ── Listen on REQUESTS to capture exact payload ──────────────────
             async def on_request(request):
                 if "/graphql" in request.url and not captured:
                     try:
                         body = request.post_data
                         if body and "searchJobCardsByLocation" in body:
                             headers = dict(request.headers)
-                            # Remove browser-only headers that break replay
-                            for h in ["content-length", "host", ":method",
-                                      ":path", ":scheme", ":authority"]:
+                            for h in ["content-length","host",":method",":path",":scheme",":authority"]:
                                 headers.pop(h, None)
-                            captured["url"]     = request.url
-                            captured["headers"] = headers
-                            captured["body"]    = body
-                            log.info(f"✅ Captured real GraphQL request!")
+
+                            # ── v15 KEY FIX: inject UK location into body ──
+                            try:
+                                body_json = json.loads(body)
+                                search_req = body_json.get("variables", {}).get("searchJobRequest", {})
+                                # Force UK-wide search centred on Birmingham
+                                search_req["country"]  = "United Kingdom"
+                                search_req["keyWords"] = ""
+                                search_req["pageSize"] = 100
+                                # Add location filter if supported
+                                if "geoQueryParam" not in search_req:
+                                    search_req["geoQueryParam"] = {
+                                        "latitude":  52.4862,
+                                        "longitude": -1.8904,
+                                        "radius":    500
+                                    }
+                                modified_body = json.dumps(body_json)
+                                captured["url"]     = request.url
+                                captured["headers"] = headers
+                                captured["body"]    = modified_body
+                                log.info(f"✅ Captured + injected UK location!")
+                            except:
+                                # Fallback — use raw body
+                                captured["url"]     = request.url
+                                captured["headers"] = headers
+                                captured["body"]    = body
+                                log.info(f"✅ Captured real GraphQL request!")
+
                             log.info(f"📡 URL: {request.url}")
                     except Exception as e:
                         log.warning(f"Request capture error: {e}")
 
-            # ── Also listen on RESPONSES to get direct results ───────────────
             async def on_response(response):
                 if "/graphql" in response.url and response.status == 200:
                     try:
@@ -507,14 +631,12 @@ async def fetch_jobs():
             page.on("request",  on_request)
             page.on("response", on_response)
 
-            # Load page
             await page.goto(
                 "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
                 wait_until="networkidle", timeout=45000
             )
             await page.wait_for_timeout(3000)
 
-            # Scroll to trigger GraphQL if not yet captured
             if not captured:
                 log.info("⚡ Scrolling to trigger GraphQL...")
                 await page.mouse.wheel(0, 3000)
@@ -522,16 +644,15 @@ async def fetch_jobs():
                 await page.mouse.wheel(0, -3000)
                 await page.wait_for_timeout(2000)
 
-            # Save cookies for reuse
             cookies = await context.cookies()
             if cookies:
                 save_cookies(cookies)
 
             await browser.close()
 
-            # ── Now decide: replay via proxy OR use direct results ────────────
+            # ── Replay via Decodo UK proxy ────────────────────────────────
             if captured and proxy:
-                log.info("🌐 Replaying captured request via Decodo UK proxy...")
+                log.info("🌐 Replaying via Decodo UK proxy...")
                 cards = await replay_via_proxy(
                     url=captured["url"],
                     headers=captured["headers"],
@@ -545,33 +666,12 @@ async def fetch_jobs():
                         if job and job["id"] not in all_jobs:
                             all_jobs[job["id"]] = job
                 else:
-                    log.warning("⚠️ Proxy replay failed — using direct browser results")
+                    log.warning("⚠️ Proxy replay returned 0 — using browser results")
                     for card in direct_cards:
                         job = parse_card(card)
                         if job and job["id"] not in all_jobs:
                             all_jobs[job["id"]] = job
-
-            elif captured and not proxy:
-                log.info("⚠️ No proxy — replaying directly (Frankfurt IP)...")
-                cards = await replay_direct(
-                    url=captured["url"],
-                    headers=captured["headers"],
-                    body=captured["body"]
-                )
-                if cards:
-                    for card in cards:
-                        job = parse_card(card)
-                        if job and job["id"] not in all_jobs:
-                            all_jobs[job["id"]] = job
-                else:
-                    for card in direct_cards:
-                        job = parse_card(card)
-                        if job and job["id"] not in all_jobs:
-                            all_jobs[job["id"]] = job
-
             else:
-                # No capture — use whatever the browser intercepted directly
-                log.warning("⚠️ GraphQL not captured — using browser intercept results")
                 for card in direct_cards:
                     job = parse_card(card)
                     if job and job["id"] not in all_jobs:
@@ -585,22 +685,17 @@ async def fetch_jobs():
 
 
 async def replay_via_proxy(url, headers, body, proxy):
-    """Replay exact captured GraphQL request through Decodo UK proxy."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                url,
-                data=body,           # send exact raw body — no modification
-                headers=headers,
-                proxy=proxy,
+                url, data=body, headers=headers, proxy=proxy,
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 status = response.status
                 text   = await response.text()
 
                 if status != 200:
-                    log.warning(f"⚠️ Proxy replay status {status}")
-                    log.warning(f"Response: {text[:500]}")
+                    log.warning(f"⚠️ Proxy replay status {status}: {text[:300]}")
                     return []
 
                 try:
@@ -622,76 +717,9 @@ async def replay_via_proxy(url, headers, body, proxy):
         log.error(f"Proxy replay error: {e}")
         return []
 
-
-async def replay_direct(url, headers, body):
-    """Replay captured GraphQL request directly (no proxy)."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url,
-                data=body,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                if response.status != 200:
-                    return []
-                data  = await response.json()
-                cards = (data.get("data", {})
-                             .get("searchJobCardsByLocation", {})
-                             .get("jobCards", []))
-                return cards
-    except Exception as e:
-        log.error(f"Direct replay error: {e}")
-        return []
-
-# ─── FETCH FULL JOB DETAILS ──────────────────────────────────────────────────
-async def fetch_job_details(job):
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True, args=["--no-sandbox","--disable-gpu"]
-            )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                locale="en-GB",
-            )
-            await context.route(
-                "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}",
-                lambda route: route.abort()
-            )
-            saved = load_cookies()
-            if saved:
-                await context.add_cookies(saved)
-            page = await context.new_page()
-            await page.goto(job["link"], wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(3000)
-            content = await page.inner_text("body")
-
-            m = re.search(r'(?:Start [Dd]ate|Tentative start date)[:\s]+([A-Za-z]+,?\s+\d+\s+[A-Za-z]+\s+\d{4}|[A-Za-z]+ \d+, \d{4})', content)
-            if m: job["firstDay"] = m.group(1).strip()
-
-            m = re.search(r'Shift timing[:\s]+([A-Za-z,\s]+\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})', content)
-            if m: job["schedule"] = m.group(1).strip()
-            else:
-                m = re.search(r'Shift[:\s]+([A-Za-z,\s]+\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})', content)
-                if m: job["schedule"] = m.group(1).strip()
-
-            m = re.search(r'(\d+)\s*hrs?\s*per\s*week', content, re.IGNORECASE)
-            if m: job["hours"] = m.group(1)
-
-            for ct in ["Full-time","Part-time","Reduced","Fixed-term","Seasonal","Permanent","Temporary"]:
-                if ct.lower() in content.lower():
-                    job["contract"] = ct
-                    break
-
-            await browser.close()
-            log.info(f"✅ Details: {job.get('firstDay','?')} | {str(job.get('schedule','?'))[:40]}")
-    except Exception as e:
-        log.warning(f"Detail fetch error: {e}")
-    return job
-
-# ─── ALERT ───────────────────────────────────────────────────────────────────
-async def tg_alert(job, status="new", chat_id=None, distance=None, account_id=None):
+# ─── ALERT — v15 with full shift details ─────────────────────────────────────
+async def tg_alert(job, status="new", chat_id=None, distance=None,
+                   account_id=None, shift_index=None, total_shifts=None):
     cid = chat_id or CHAT_ID
 
     headers_map = {
@@ -701,24 +729,41 @@ async def tg_alert(job, status="new", chat_id=None, distance=None, account_id=No
         "navigating":  "⚡ <b>BOT OPENING APPLICATION...</b>",
         "ready":       "✅ <b>APPLICATION READY — LOG IN & SUBMIT!</b>",
         "fresh_alert": "🌿 <b>AMAZON FRESH JOB — MANUAL APPLY ONLY</b>",
+        "otp_needed":  "🔐 <b>AMAZON OTP REQUIRED</b>",
     }
     header   = headers_map.get(status, "⚠️ <b>OPEN MANUALLY!</b>")
     pay_str  = job.get("pay_display") or f"{job.get('pay','?'):.2f}"
     dist_str = f"\n📏 Distance: <b>{distance} miles</b>" if distance else ""
-    night    = " 🌙 NIGHT SHIFT" if is_night_shift(job.get("schedule","")) else ""
+
+    # ── Shift info ────────────────────────────────────────────────────────
+    shifts   = job.get("shifts", [])
+    schedule = job.get("schedule") or (shifts[shift_index] if shifts and shift_index is not None and shift_index < len(shifts) else None)
+    night    = " 🌙 NIGHT SHIFT" if is_night_shift(schedule or "") else ""
     fresh    = " 🌿 FRESH" if is_fresh_job(job) else ""
+
+    # Shift counter e.g. "Shift 1 of 3"
+    shift_str = ""
+    if total_shifts and total_shifts > 1 and shift_index is not None:
+        shift_str = f"\n🔄 <b>Shift {shift_index+1} of {total_shifts}</b>"
+
+    # ── Format fields — no TBC ────────────────────────────────────────────
+    first_day_str = job.get("firstDay") or "Check listing"
+    schedule_str  = schedule or "Check listing"
+    hours_str     = job.get("hours") or "Check listing"
+    desc_str      = f"\n📝 {job.get('description')}" if job.get("description") else ""
+
     job_id   = job.get("id","")
     job_link = f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}" if job_id != "TEST-001" else job.get("link","https://www.jobsatamazon.co.uk")
 
-    text = f"""{header}
+    text = f"""{header}{shift_str}
 ━━━━━━━━━━━━━━━━━━━━━
 📍 <b>{job.get('location','Unknown')}</b>
 📦 {job.get('title','Warehouse Operative')}{night}{fresh}
 💰 <b>£{pay_str}/hr</b>
 📋 {job.get('contract','Seasonal')}
-📅 First Day: <b>{job.get('firstDay','TBC')}</b>
-🕘 Schedule: <b>{job.get('schedule','TBC')}</b>
-🕐 Hours/Week: <b>{job.get('hours','TBC')}</b>{dist_str}
+📅 First Day: <b>{first_day_str}</b>
+🕘 Schedule: <b>{schedule_str}</b>
+🕐 Hours/Week: <b>{hours_str}</b>{dist_str}{desc_str}
 ━━━━━━━━━━━━━━━━━━━━━"""
 
     if status == "applied":
@@ -727,6 +772,8 @@ async def tg_alert(job, status="new", chat_id=None, distance=None, account_id=No
         text += "\n👆 <b>TAP OPEN APPLICATION → Log in → Submit!</b>\n━━━━━━━━━━━━━━━━━━━━━"
     elif status == "fresh_alert":
         text += "\n🌿 <b>Fresh excluded from auto-submit — apply manually!</b>\n━━━━━━━━━━━━━━━━━━━━━"
+    elif status == "otp_needed":
+        text += "\n\n<b>Reply with your OTP code to complete login:</b>"
 
     markup = {
         "inline_keyboard": [
@@ -734,8 +781,85 @@ async def tg_alert(job, status="new", chat_id=None, distance=None, account_id=No
             [{"text": "✅ APPLIED", "callback_data": f"applied_{job['id']}"},
              {"text": "⏭️ SKIP",   "callback_data": f"skip_{job['id']}"}]
         ]
-    }
+    } if status in ["new","ready","fresh_alert"] else None
+
     await tg_send(text, markup, chat_id=cid)
+
+
+async def send_all_shifts(job, status="new", chat_id=None, distance=None):
+    """Send separate alert for each shift found."""
+    shifts = job.get("shifts", [])
+    if not shifts or len(shifts) <= 1:
+        await tg_alert(job, status, chat_id=chat_id, distance=distance)
+        return
+
+    for i, shift in enumerate(shifts):
+        shift_job           = dict(job)
+        shift_job["schedule"] = shift
+        await tg_alert(
+            shift_job, status,
+            chat_id=chat_id, distance=distance,
+            shift_index=i, total_shifts=len(shifts)
+        )
+        await asyncio.sleep(0.5)
+
+# ─── OTP LOGIN FLOW ───────────────────────────────────────────────────────────
+async def amazon_login_with_otp(page, chat_id):
+    """Login to Amazon using email/PIN then wait for OTP from user."""
+    try:
+        log.info("🔐 Starting Amazon login with OTP flow...")
+
+        # Enter email
+        email_field = await page.query_selector("input[type='email'], input[name='email']")
+        if email_field:
+            await email_field.fill(AMAZON_EMAIL)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(2000)
+
+        # Enter password/PIN
+        pass_field = await page.query_selector("input[type='password'], input[name='password']")
+        if pass_field:
+            await pass_field.fill(AMAZON_PIN)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(3000)
+
+        # Check if OTP needed
+        content = await page.inner_text("body")
+        if any(w in content.lower() for w in ["verification", "otp", "one-time", "passcode", "authenticator"]):
+            log.info("📱 OTP required — asking user...")
+
+            # Ask user for OTP
+            await tg_send(
+                "🔐 <b>Amazon needs verification!</b>\n\nCheck your phone/email for the OTP code and reply with it here:",
+                chat_id=chat_id
+            )
+
+            # Wait for OTP from user (60 second timeout)
+            event = asyncio.Event()
+            otp_waiting[chat_id] = event
+            try:
+                await asyncio.wait_for(event.wait(), timeout=120)
+                otp = otp_codes.pop(chat_id, None)
+                otp_waiting.pop(chat_id, None)
+
+                if otp:
+                    otp_field = await page.query_selector("input[type='text'], input[name='otpCode'], input[autocomplete='one-time-code']")
+                    if otp_field:
+                        await otp_field.fill(otp)
+                        await page.keyboard.press("Enter")
+                        await page.wait_for_timeout(3000)
+                        log.info("✅ OTP submitted!")
+                        return True
+            except asyncio.TimeoutError:
+                log.warning("⏱️ OTP timeout — user didn't respond")
+                await tg_send("⏱️ OTP timeout — please apply manually", chat_id=chat_id)
+                return False
+
+        return True
+
+    except Exception as e:
+        log.error(f"Login error: {e}")
+        return False
 
 # ─── AUTO SUBMIT ─────────────────────────────────────────────────────────────
 async def auto_submit_account(job, account, chat_id=None):
@@ -777,15 +901,20 @@ async def auto_submit_account(job, account, chat_id=None):
             await page.wait_for_timeout(3000)
 
             content = await page.inner_text("body")
+
+            # Handle login wall with OTP flow
             if "sign in" in content.lower() or "log in" in content.lower():
-                log.warning("🔐 Login wall — sending manual alert")
-                await tg_alert(job, "ready", chat_id=cid)
-                await browser.close()
-                return
+                log.warning("🔐 Login wall — attempting auto-login with OTP...")
+                login_ok = await amazon_login_with_otp(page, cid)
+                if not login_ok:
+                    await tg_alert(job, "ready", chat_id=cid)
+                    await browser.close()
+                    return
+                content = await page.inner_text("body")
 
             applied = False
 
-            # JS injection — most reliable
+            # JS injection
             try:
                 applied = await page.evaluate("""() => {
                     const btns = Array.from(document.querySelectorAll('button, a'));
@@ -810,7 +939,6 @@ async def auto_submit_account(job, account, chat_id=None):
                             await btn.click()
                             await page.wait_for_timeout(2500)
                             applied = True
-                            log.info(f"✅ Apply clicked: {sel}")
                             break
                     except:
                         pass
@@ -842,6 +970,7 @@ async def auto_submit_account(job, account, chat_id=None):
                 except:
                     pass
 
+            # Shift selection
             try:
                 await page.wait_for_selector("button:has-text('Select this job')", timeout=8000)
                 shift_buttons = await page.query_selector_all("button:has-text('Select this job')")
@@ -949,7 +1078,8 @@ async def check_jobs():
                 log.info(f"📍 Sub {sub_cid}: too far ({best_distance}mi)")
                 continue
 
-            await tg_alert(job, "new", chat_id=sub_cid, distance=best_distance)
+            # Send alert for each shift separately
+            await send_all_shifts(job, "new", chat_id=sub_cid, distance=best_distance)
 
             is_owner    = (sub_cid == CHAT_ID)
             should_auto = (is_owner or prefs.get("auto_apply")) and ACCOUNTS and not is_fresh_job(job)
@@ -1051,6 +1181,13 @@ async def process_update(update):
     name    = msg.get("chat",{}).get("first_name","Friend")
     text_lw = text.lower()
 
+    # ── OTP handler ───────────────────────────────────────────────────────
+    if cid in otp_waiting and text and text.isdigit():
+        otp_codes[cid] = text
+        otp_waiting[cid].set()
+        await tg_send("✅ OTP received! Submitting...", chat_id=cid)
+        return
+
     if cid in onboarding:
         await handle_onboarding(cid, text)
         return
@@ -1144,7 +1281,8 @@ History: {len(job_history)}
             for job in list(known_jobs.values())[-5:]:
                 night = "🌙" if is_night_shift(job.get("schedule","")) else "☀️"
                 fresh = "🌿" if is_fresh_job(job) else ""
-                txt  += f"{night}{fresh} {job.get('location')}\n💰 £{job.get('pay')}/hr | {job.get('contract')}\n📅 {job.get('firstDay','TBC')}\n\n"
+                sched = job.get("schedule") or "Check listing"
+                txt  += f"{night}{fresh} {job.get('location')}\n💰 £{job.get('pay')}/hr | {job.get('contract')}\n📅 {job.get('firstDay') or 'Check listing'} | {sched[:30]}\n\n"
             await tg_send(txt, chat_id=cid)
 
     elif text_lw == "/history":
@@ -1161,14 +1299,23 @@ Avg: £{avg:.2f}/hr
 Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
 
     elif text_lw == "/test":
-        await tg_alert({
+        test_job = {
             "id": "TEST-001", "title": "Warehouse Operative",
-            "location": "Birmingham, England (West Midlands) B21 0UT",
-            "postcode": "B21 0UT", "pay": 14.30, "pay_display": "14.30",
-            "contract": "Full-time", "firstDay": "2026-05-14",
-            "schedule": "Mon, Tue, Wed, Thu 23:45-10:15", "hours": "40",
+            "location": "Weybridge, England (West Surrey) KT13 0YU",
+            "postcode": "KT13 0YU", "pay": 15.30, "pay_display": "15.30",
+            "contract": "Seasonal | Full-time",
+            "firstDay": "2026-05-10",
+            "shifts": [
+                "Sat, Sun, Mon, Tue 23:45 - 10:15",
+                "Fri, Sat, Sun, Mon, Tue 6:30 - 13:00",
+                "Fri, Sat, Sun, Mon 23:45 - 10:15",
+            ],
+            "schedule": "Sat, Sun, Mon, Tue 23:45 - 10:15",
+            "hours": "40",
+            "description": "Pick, pack and ship parcels",
             "link": "https://www.jobsatamazon.co.uk",
-        }, "new", chat_id=cid, distance=2.1)
+        }
+        await send_all_shifts(test_job, "new", chat_id=cid, distance=47.0)
 
     elif text_lw == "/pause" and cid == CHAT_ID:
         bot_paused = True
@@ -1183,7 +1330,7 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
         await tg_send("🗑️ Cache cleared — bot will re-alert all jobs next scan.", chat_id=cid)
 
     elif text_lw == "/help":
-        await tg_send("""👑 <b>Amazon KING BOT v14</b>
+        await tg_send("""👑 <b>Amazon KING BOT v15</b>
 ━━━━━━━━━━━━━━━━━
 /start          — Welcome & setup
 /setup          — Update preferences
@@ -1192,7 +1339,7 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
 /scrape         — Scan now
 /jobs           — Recent jobs
 /history        — All time stats
-/test           — Test alert
+/test           — Test alert (3 shifts)
 /autoon         — Enable auto-submit
 /autooff        — Disable auto-submit
 /subscribers    — All users (admin)
@@ -1201,30 +1348,34 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
 /resume         — Resume bot (admin)
 ━━━━━━━━━━━━━━━━━
 🔗 Share: t.me/Jibhub_bot
-🌿 Fresh = alert only, no auto-submit
-🌐 Powered by Decodo UK proxy""", chat_id=cid)
+🌿 Fresh = alert only
+🌐 Decodo UK proxy
+🔐 Auto OTP login""", chat_id=cid)
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info(f"👑 Amazon KING BOT v14 Starting!")
+    log.info(f"👑 Amazon KING BOT v15 Starting!")
     log.info(f"🌐 Proxy: {'Decodo configured ✅' if get_proxy_url() else 'No proxy ❌'}")
     log.info(f"👥 Subscribers: {len(subscribers)} | 🤖 Accounts: {len(ACCOUNTS)}")
+    log.info(f"📧 Email: {'✅' if AMAZON_EMAIL else '❌'} | PIN: {'✅' if AMAZON_PIN else '❌'}")
 
     asyncio.create_task(handle_updates())
     asyncio.create_task(send_daily_summary())
 
     await asyncio.sleep(2)
-    await tg_send(f"""👑 <b>Amazon KING BOT v14 ONLINE!</b>
-✅ Capture + replay in one session
-✅ Exact Amazon request format
-✅ Decodo UK proxy routing
+    await tg_send(f"""👑 <b>Amazon KING BOT v15 ONLINE!</b>
+✅ UK location injection in GraphQL
+✅ Full shift details (no more TBC)
+✅ Multiple shifts per job
+✅ OTP auto-login flow
+✅ Decodo UK proxy
 ✅ Auto-submit ON for owner
-✅ Fresh jobs blocked from auto
 ✅ 3s peak / 10s normal
 🌐 Proxy: {'✅ Decodo UK' if get_proxy_url() else '❌ No proxy'}
+📧 Login: {'✅ Ready' if AMAZON_EMAIL and AMAZON_PIN else '❌ No credentials'}
 👥 {len(subscribers)} subscriber(s) | 🤖 {len(ACCOUNTS)} account(s)
 ━━━━━━━━━━━━━━━━━
-Send /scrape to check now!
+Send /test to see new alert format!
 Share: t.me/Jibhub_bot""")
 
     await check_jobs()
