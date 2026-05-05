@@ -1090,57 +1090,31 @@ async def check_jobs():
         if skip:
             continue
 
-        for sub_cid, prefs in list(subscribers.items()):
-            if not prefs.get("setup_complete"):
-                continue
-            if not job_matches_type(job, prefs.get("job_type","both")):
-                continue
+        # ── OWNER ONLY MODE — subscribers paused ─────────────────────────
+        # Only process owner (CHAT_ID) for now
+        owner_prefs = subscribers.get(CHAT_ID, {})
 
-            # Distance calculation
-            job_postcode  = job.get("postcode","")
-            locations     = prefs.get("locations",[])
-            radius        = prefs.get("radius", 50)
-            best_distance = None
+        # Distance for info only
+        job_postcode  = job.get("postcode", "")
+        best_distance = None
+        if job_postcode:
+            for loc in owner_prefs.get("locations", ["Birmingham"]):
+                d = await job_distance_miles(job_postcode, loc)
+                if d is not None:
+                    if best_distance is None or d < best_distance:
+                        best_distance = d
 
-            if locations and job_postcode:
-                distances = []
-                for loc in locations:
-                    d = await job_distance_miles(job_postcode, loc)
-                    if d is not None:
-                        distances.append(d)
-                        if best_distance is None or d < best_distance:
-                            best_distance = d
+        # Alert owner
+        await send_all_shifts(job, "new", chat_id=CHAT_ID,
+                              distance=best_distance,
+                              score=job_score if job_score > 0 else None)
 
-            # Always alert — regardless of distance
-            await send_all_shifts(job, "new", chat_id=sub_cid,
-                                  distance=best_distance, score=job_score if job_score > 0 else None)
-
-            # Get subscriber tier
-            tier         = get_tier(sub_cid, prefs)
-            within_radius = (best_distance is None or best_distance <= radius)
-
-            # Auto-submit logic by tier
-            if tier == "free":
-                # Alert only — no application help
-                pass
-
-            elif tier == "standard":
-                # Prepare application within radius only
-                if within_radius and ACCOUNTS:
-                    log.info(f"📋 Preparing application for standard sub {sub_cid}")
-                    asyncio.create_task(
-                        auto_submit_account(job, ACCOUNTS[0], chat_id=sub_cid, tier="standard")
-                    )
-
-            elif tier in ("premium", "owner"):
-                # Full auto-submit within radius
-                if within_radius and ACCOUNTS and not is_fresh_job(job):
-                    log.info(f"🤖 Auto-submitting for {tier} {sub_cid}")
-                    asyncio.create_task(
-                        auto_submit_account(job, ACCOUNTS[0], chat_id=sub_cid, tier=tier)
-                    )
-                elif not within_radius:
-                    log.info(f"📍 {sub_cid}: {best_distance}mi — alert only (beyond {radius}mi)")
+        # Auto-submit ALL jobs — no radius filter, owner decides after
+        if ACCOUNTS and not is_fresh_job(job):
+            log.info(f"🤖 Auto-submitting for owner: {job['location']}")
+            asyncio.create_task(
+                auto_submit_account(job, ACCOUNTS[0], chat_id=CHAT_ID, tier="owner")
+            )
 
     if new_count == 0:
         log.info(f"👑 No new jobs — {len(known_jobs)} tracked")
