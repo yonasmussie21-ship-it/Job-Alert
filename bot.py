@@ -909,42 +909,24 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
                 locale="en-GB", timezone_id="Europe/London",
             )
 
-            # Load cookies — try all sources in order of freshness
-            cookies_loaded = False
-
-            # 1. Try AMAZON_COOKIES env var first (manually set fresh cookies)
+            # Load cookies — AMAZON_COOKIES env var first (freshest)
             amazon_cookies_env = os.environ.get("AMAZON_COOKIES", "")
             if amazon_cookies_env:
                 try:
                     env_cookies = json.loads(amazon_cookies_env)
+                    # Fix sameSite values Playwright doesn't accept
+                    for c in env_cookies:
+                        if c.get("sameSite") not in ["Strict", "Lax", "None"]:
+                            c["sameSite"] = "Lax"
                     await context.add_cookies(env_cookies)
-                    log.info(f"✅ Loaded {len(env_cookies)} cookies from AMAZON_COOKIES env var")
-                    cookies_loaded = True
+                    log.info(f"✅ Loaded {len(env_cookies)} cookies from env var")
                 except Exception as e:
-                    log.warning(f"⚠️ Failed to load AMAZON_COOKIES env: {e}")
-
-            # 2. Also add saved session cookies on top
-            if not cookies_loaded:
-                saved = load_cookies()
-                if saved:
-                    try:
+                    log.warning(f"⚠️ Failed to load env cookies: {e}")
+                    saved = load_cookies()
+                    if saved:
                         await context.add_cookies(saved)
-                        log.info(f"✅ Loaded {len(saved)} cookies from saved file")
-                        cookies_loaded = True
-                    except:
-                        pass
-
-            # 3. Try account session cookies
-            if not cookies_loaded and account["session"]:
-                try:
-                    await context.add_cookies(account["session"])
-                    log.info("✅ Loaded cookies from account session")
-                    cookies_loaded = True
-                except:
-                    pass
-
-            if not cookies_loaded:
-                log.warning("⚠️ No cookies available — will likely hit login wall")
+            elif account["session"]:
+                await context.add_cookies(account["session"])
 
             page = await context.new_page()
             await page.goto(job["link"], wait_until="domcontentloaded", timeout=60000)
