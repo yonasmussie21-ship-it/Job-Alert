@@ -529,7 +529,7 @@ async def fetch_job_details(job):
                     pass
 
             page.on("response", handle_response)
-            await page.goto(job["link"], wait_until="networkidle", timeout=30000)
+            await page.goto(job["link"], wait_until="domcontentloaded", timeout=60000)
 
             # Wait for React to fully render
             await page.wait_for_timeout(5000)
@@ -680,7 +680,7 @@ async def fetch_jobs():
 
             await page.goto(
                 "https://www.jobsatamazon.co.uk/app#/jobSearch?locale=en-GB&country=GBR",
-                wait_until="networkidle", timeout=45000
+                wait_until="domcontentloaded", timeout=60000
             )
             await page.wait_for_timeout(3000)
 
@@ -909,19 +909,45 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
                 locale="en-GB", timezone_id="Europe/London",
             )
 
-            saved = load_cookies()
-            if saved:
-                await context.add_cookies(saved)
-            elif account["session"]:
-                await context.add_cookies(account["session"])
-            elif account["cookies"]:
+            # Load cookies — try all sources in order of freshness
+            cookies_loaded = False
+
+            # 1. Try AMAZON_COOKIES env var first (manually set fresh cookies)
+            amazon_cookies_env = os.environ.get("AMAZON_COOKIES", "")
+            if amazon_cookies_env:
                 try:
-                    await context.add_cookies(json.loads(account["cookies"]))
+                    env_cookies = json.loads(amazon_cookies_env)
+                    await context.add_cookies(env_cookies)
+                    log.info(f"✅ Loaded {len(env_cookies)} cookies from AMAZON_COOKIES env var")
+                    cookies_loaded = True
+                except Exception as e:
+                    log.warning(f"⚠️ Failed to load AMAZON_COOKIES env: {e}")
+
+            # 2. Also add saved session cookies on top
+            if not cookies_loaded:
+                saved = load_cookies()
+                if saved:
+                    try:
+                        await context.add_cookies(saved)
+                        log.info(f"✅ Loaded {len(saved)} cookies from saved file")
+                        cookies_loaded = True
+                    except:
+                        pass
+
+            # 3. Try account session cookies
+            if not cookies_loaded and account["session"]:
+                try:
+                    await context.add_cookies(account["session"])
+                    log.info("✅ Loaded cookies from account session")
+                    cookies_loaded = True
                 except:
                     pass
 
+            if not cookies_loaded:
+                log.warning("⚠️ No cookies available — will likely hit login wall")
+
             page = await context.new_page()
-            await page.goto(job["link"], wait_until="networkidle", timeout=30000)
+            await page.goto(job["link"], wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(3000)
 
             content = await page.inner_text("body")
@@ -1134,7 +1160,7 @@ async def navigate_job(job, chat_id=None):
             if saved:
                 await context.add_cookies(saved)
             page = await context.new_page()
-            await page.goto(job["link"], wait_until="networkidle", timeout=30000)
+            await page.goto(job["link"], wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(2000)
             for sel in ["button:has-text('Apply')","a:has-text('Apply')"]:
                 try:
