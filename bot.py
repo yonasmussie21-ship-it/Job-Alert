@@ -768,7 +768,7 @@ async def tg_alert(job, status="new", chat_id=None, distance=None,
         "applying":    f"🤖 <b>AUTO-SUBMITTING{' (Acc '+str(account_id)+')' if account_id else ''}...</b>",
         "applied":     f"✅ <b>APPLIED FOR YOU{' (Acc '+str(account_id)+')' if account_id else ''}!</b>",
         "ready":       "👆 <b>APPLICATION READY — TAP TO SUBMIT!</b>",
-        "prepared":    "🤖 <b>APPLICATION PREPARED — TAP TO CONFIRM!</b>",
+        "prepared":    "✅ <b>SHIFT SELECTED — TAP TO CONTINUE!</b>",
         "fresh_alert": "🌿 <b>AMAZON FRESH — MANUAL APPLY ONLY</b>",
     }
     header = headers_map.get(status, "⚠️ <b>OPEN MANUALLY!</b>")
@@ -815,7 +815,7 @@ async def tg_alert(job, status="new", chat_id=None, distance=None,
     elif status == "ready":
         text += "\n👆 <b>Tap OPEN APPLICATION → Log in → Submit!</b>\n━━━━━━━━━━━━━━━━━━━━━"
     elif status == "prepared":
-        text += "\n👆 <b>Bot has prepared your application + selected best shift!</b>\n🔐 Tap OPEN APPLICATION → Log in → Confirm → DONE!\n━━━━━━━━━━━━━━━━━━━━━"
+        text += "\n✅ <b>Bot selected the best shift for you!</b>\n👆 Tap OPEN APPLICATION → Schedule appointment → Review → Submit!\n━━━━━━━━━━━━━━━━━━━━━"
     elif status == "fresh_alert":
         text += "\n🌿 <b>Fresh excluded from auto-submit</b>\n━━━━━━━━━━━━━━━━━━━━━"
 
@@ -1001,14 +1001,20 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
                 except:
                     pass
 
-            # Shift selection
+            # ── SHIFT SELECTION ───────────────────────────────────────────
+            shift_selected = False
             try:
-                await page.wait_for_selector("button:has-text('Select this job')", timeout=8000)
-                shift_buttons = await page.query_selector_all("button:has-text('Select this job')")
+                await page.wait_for_selector(
+                    "button:has-text('Select this job'), button:has-text('Select shift')",
+                    timeout=10000
+                )
+                shift_buttons = await page.query_selector_all(
+                    "button:has-text('Select this job'), button:has-text('Select shift')"
+                )
                 if shift_buttons:
                     best_btn = shift_buttons[0]
                     best_pri = 999
-                    cards    = await page.query_selector_all(
+                    cards = await page.query_selector_all(
                         "[class*='shift'],[class*='card'],[class*='schedule']"
                     )
                     for i, card in enumerate(cards[:len(shift_buttons)]):
@@ -1023,8 +1029,27 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
                     await best_btn.click()
                     await page.wait_for_timeout(3000)
                     log.info(f"✅ Best shift selected")
+                    shift_selected = True
+
+                    # Click Accept shift
+                    for sel in [
+                        "button:has-text('Accept')",
+                        "button:has-text('Accept shift')",
+                        "button:has-text('Confirm shift')",
+                        "button:has-text('Continue')",
+                    ]:
+                        try:
+                            btn = await page.wait_for_selector(sel, timeout=5000)
+                            if btn:
+                                await btn.click()
+                                await page.wait_for_timeout(3000)
+                                log.info(f"✅ Shift accepted: {sel}")
+                                break
+                        except:
+                            pass
+
             except:
-                log.info("ℹ️ No shift selection page")
+                log.info("ℹ️ No shift selection page found")
 
             # ── HALF BOT HALF HUMAN — works on any server ─────────────────
             # Bot has navigated, selected best shift, reached confirmation
