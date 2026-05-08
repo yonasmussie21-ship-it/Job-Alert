@@ -844,22 +844,54 @@ async def send_all_shifts(job, status="new", chat_id=None, distance=None, score=
 async def amazon_login_with_otp(page, chat_id):
     try:
         log.info("🔐 Attempting Amazon auto-login...")
-        email_field = await page.query_selector("input[type='email'], input[name='email']")
-        if email_field:
-            await email_field.fill(AMAZON_EMAIL)
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(2000)
 
-        pass_field = await page.query_selector("input[type='password'], input[name='password']")
-        if pass_field:
-            await pass_field.fill(AMAZON_PIN)
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(3000)
+        # Step 1 — Enter email
+        await page.wait_for_timeout(2000)
+        for sel in ["input[type='email']", "input[name='email']", "input[name='username']"]:
+            email_field = await page.query_selector(sel)
+            if email_field and await email_field.is_visible():
+                await email_field.clear()
+                await email_field.fill(AMAZON_EMAIL)
+                log.info(f"✅ Email entered")
+                break
 
+        # Click Continue/Next after email
+        for sel in ["button:has-text('Continue')", "input[type='submit']",
+                    "button[type='submit']", "button:has-text('Next')"]:
+            try:
+                btn = await page.query_selector(sel)
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    await page.wait_for_timeout(2000)
+                    break
+            except:
+                pass
+
+        # Step 2 — Enter PIN/Password
+        await page.wait_for_timeout(2000)
+        for sel in ["input[type='password']", "input[name='password']",
+                    "input[name='pin']", "input[placeholder*='PIN']",
+                    "input[placeholder*='password']"]:
+            pass_field = await page.query_selector(sel)
+            if pass_field and await pass_field.is_visible():
+                await pass_field.clear()
+                await pass_field.fill(AMAZON_PIN)
+                log.info(f"✅ PIN entered")
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(3000)
+                break
+
+        # Step 3 — Check for OTP
         content = await page.inner_text("body")
-        if any(w in content.lower() for w in ["verification","otp","one-time","passcode"]):
+        otp_keywords = ["verification", "otp", "one-time", "passcode",
+                        "authentication code", "security code", "verify"]
+
+        if any(w in content.lower() for w in otp_keywords):
+            log.info("📱 OTP required — asking user...")
             await tg_send(
-                "🔐 <b>Amazon needs your OTP!</b>\n\nCheck your phone and reply with the code:",
+                "🔐 <b>Amazon needs your OTP code!</b>\n\n"
+                "Check your phone/email for the 6-digit code.\n"
+                "<b>Reply here with the code now:</b>",
                 chat_id=chat_id
             )
             event = asyncio.Event()
@@ -868,20 +900,53 @@ async def amazon_login_with_otp(page, chat_id):
                 await asyncio.wait_for(event.wait(), timeout=120)
                 otp = otp_codes.pop(chat_id, None)
                 otp_waiting.pop(chat_id, None)
+
                 if otp:
-                    otp_field = await page.query_selector(
-                        "input[type='text'], input[name='otpCode'], input[autocomplete='one-time-code']"
-                    )
-                    if otp_field:
-                        await otp_field.fill(otp)
-                        await page.keyboard.press("Enter")
-                        await page.wait_for_timeout(3000)
-                        log.info("✅ OTP submitted!")
-                        return True
+                    # Try multiple OTP field selectors
+                    for sel in [
+                        "input[autocomplete='one-time-code']",
+                        "input[name='otpCode']",
+                        "input[type='text']",
+                        "input[inputmode='numeric']",
+                        "input[placeholder*='code']",
+                    ]:
+                        otp_field = await page.query_selector(sel)
+                        if otp_field and await otp_field.is_visible():
+                            await otp_field.clear()
+                            await otp_field.fill(otp)
+                            await page.keyboard.press("Enter")
+                            await page.wait_for_timeout(3000)
+                            log.info("✅ OTP submitted!")
+                            break
+
+                    # Verify login succeeded
+                    content = await page.inner_text("body")
+                    if any(w in content.lower() for w in ["sign in", "login", "otp", "verification"]):
+                        log.warning("⚠️ Still on login page after OTP")
+                        return False
+
+                    log.info("✅ Login successful!")
+                    return True
+                else:
+                    log.warning("⚠️ No OTP received")
+                    return False
+
             except asyncio.TimeoutError:
-                await tg_send("⏱️ OTP timeout — please apply manually", chat_id=chat_id)
+                await tg_send(
+                    "⏱️ <b>OTP timeout!</b> Please apply manually.",
+                    chat_id=chat_id
+                )
                 return False
+
+        # Check if login succeeded without OTP
+        content = await page.inner_text("body")
+        if any(w in content.lower() for w in ["sign in", "log in", "enter your email"]):
+            log.warning("⚠️ Still on login page — login may have failed")
+            return False
+
+        log.info("✅ Login successful (no OTP needed)!")
         return True
+
     except Exception as e:
         log.error(f"Login error: {e}")
         return False
@@ -934,14 +999,29 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
 
             content = await page.inner_text("body")
 
-            # Handle login wall
-            if "sign in" in content.lower() or "log in" in content.lower():
-                log.warning("🔐 Login wall — attempting auto-login...")
+            # ── Detect login wall more accurately ─────────────────────────
+            login_keywords = [
+                "sign in", "log in", "signin", "login",
+                "email address", "enter your email",
+                "create account", "amazon sign-in"
+            ]
+            is_login_wall = any(k in content.lower() for k in login_keywords)
+            is_job_page   = any(k in content.lower() for k in [
+                "apply", "warehouse", "operative", "shift", "hourly"
+            ])
+
+            if is_login_wall and not is_job_page:
+                log.warning("🔐 Login wall detected — attempting auto-login with OTP...")
                 login_ok = await amazon_login_with_otp(page, cid)
                 if not login_ok:
+                    log.warning("❌ Login failed — sending manual alert")
                     await tg_alert(job, "ready", chat_id=cid)
                     await browser.close()
                     return
+                # Re-read content after login
+                await page.wait_for_timeout(3000)
+                content = await page.inner_text("body")
+                log.info("✅ Logged in — continuing auto-submit...")
 
             applied = False
 
