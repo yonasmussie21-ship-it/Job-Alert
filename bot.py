@@ -951,6 +951,152 @@ async def amazon_login_with_otp(page, chat_id):
         log.error(f"Login error: {e}")
         return False
 
+# ─── DIRECT API AUTO SUBMIT ───────────────────────────────────────────────────
+async def extract_auth_from_cookies(cookies):
+    """Extract HVH_ACCESS_TOKEN and other auth from cookies"""
+    auth = {}
+    for c in cookies:
+        name = c.get("name", "")
+        if name == "HVH_ACCESS_TOKEN":
+            auth["token"] = c.get("value", "")
+        elif name == "hvhcid":
+            auth["hvhcid"] = c.get("value", "")
+        elif name == "aws-waf-token":
+            auth["waf_token"] = c.get("value", "")
+        elif name == "JSESSIONID":
+            auth["jsessionid"] = c.get("value", "")
+    return auth
+
+async def get_candidate_applications(cookies, auth):
+    """Query Amazon API for active applications using GraphQL"""
+    try:
+        # Build cookie string
+        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "cookie": cookie_str,
+            "authorization": auth.get("token", ""),
+            "bb-ui-version": "bb-ui-v2",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "origin": "https://www.jobsatamazon.co.uk",
+            "referer": "https://www.jobsatamazon.co.uk/app",
+        }
+
+        # First get candidate ID
+        query_candidate = {
+            "operationName": "queryCandidate",
+            "query": """query queryCandidate($bbCandidateId: String!) {
+                queryCandidate(bbCandidateId: $bbCandidateId) {
+                    candidateId
+                    candidateSFId
+                    firstName
+                    lastName
+                    emailId
+                    __typename
+                }
+            }""",
+            "variables": {"bbCandidateId": auth.get("hvhcid", "")}
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://www.jobsatamazon.co.uk/graphql",
+                json=query_candidate,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    candidate = data.get("data", {}).get("queryCandidate", {})
+                    log.info(f"✅ Got candidate: {candidate.get('firstName')} {candidate.get('lastName')}")
+
+            # Now get applications
+            query_apps = {
+                "operationName": "queryApplicationsByBBCandidateIdV2",
+                "query": """query queryApplicationsByBBCandidateIdV2($locale: String!, $bbCandidateId: String!) {
+                    queryApplicationsByBBCandidateIdV2(locale: $locale, bbCandidateId: $bbCandidateId) {
+                        applications {
+                            active
+                            applicationId
+                            applicationState
+                            step
+                            subStep
+                            continueApplicationLink
+                            jobDetail {
+                                jobId
+                                jobTitle
+                                city
+                                state
+                                postalCode
+                                totalPayRateMax
+                            }
+                            sfShift {
+                                shiftCode
+                                hoursPerWeek
+                                startTime
+                                endTime
+                                firstDayOnSite
+                            }
+                        }
+                    }
+                }""",
+                "variables": {
+                    "locale": "en-GB",
+                    "bbCandidateId": auth.get("hvhcid", "")
+                }
+            }
+
+            async with session.post(
+                "https://www.jobsatamazon.co.uk/graphql",
+                json=query_apps,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    apps = (data.get("data", {})
+                               .get("queryApplicationsByBBCandidateIdV2", {})
+                               .get("applications", []))
+                    active = [a for a in apps if a.get("active")]
+                    log.info(f"✅ Got {len(active)} active applications")
+                    return active, headers, cookie_str
+    except Exception as e:
+        log.error(f"API error: {e}")
+    return [], {}, ""
+
+async def api_submit_job(job, cookies, auth, cid):
+    """Submit application directly via Amazon's API"""
+    try:
+        active_apps, headers, cookie_str = await get_candidate_applications(cookies, auth)
+
+        # Find matching application for this job
+        job_id = job.get("id", "")
+        matching = None
+        for app in active_apps:
+            if app.get("jobDetail", {}).get("jobId") == job_id:
+                matching = app
+                break
+
+        if not matching:
+            log.warning(f"⚠️ No active application found for {job_id}")
+            return False
+
+        app_id = matching.get("applicationId")
+        continue_link = matching.get("continueApplicationLink")
+        step = matching.get("step")
+        log.info(f"✅ Found application {app_id} at step {step}")
+        log.info(f"✅ Continue link: {continue_link}")
+
+        if continue_link:
+            # Navigate directly to continue link — skip all the button clicking!
+            return continue_link, app_id
+
+    except Exception as e:
+        log.error(f"API submit error: {e}")
+    return None, None
+
 # ─── AUTO SUBMIT ─────────────────────────────────────────────────────────────
 async def auto_submit_account(job, account, chat_id=None, tier="owner"):
     cid    = chat_id or CHAT_ID
@@ -1060,7 +1206,40 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
                 await browser.close()
                 return
 
-            # ── PAGE 2: "Your journey to becoming an Amazon Associate" ──────
+            # ── Try direct API approach first ─────────────────────────────
+            browser_cookies = await context.cookies()
+            auth = await extract_auth_from_cookies(browser_cookies)
+
+            if auth.get("token") and auth.get("hvhcid"):
+                log.info("🚀 Trying direct API approach...")
+                continue_link, app_id = await api_submit_job(job, browser_cookies, auth, cid)
+
+                if continue_link:
+                    log.info(f"✅ Got continue link — navigating directly!")
+                    await page.goto(continue_link, wait_until="domcontentloaded", timeout=60000)
+                    await page.wait_for_timeout(5000)
+                    shift_selected = True
+
+                    # Click Prepare for your Appointment or Submit
+                    for sel in [
+                        "button:has-text('Prepare for your Appointment')",
+                        "button:has-text('Submit')",
+                        "button:has-text('Continue')",
+                        "button:has-text('Next')",
+                    ]:
+                        try:
+                            btn = await page.wait_for_selector(sel, timeout=5000)
+                            if btn and await btn.is_visible():
+                                await btn.click()
+                                await page.wait_for_timeout(3000)
+                                log.info(f"✅ Clicked: {sel}")
+                                break
+                        except:
+                            pass
+
+                    await tg_alert(job, "prepared", chat_id=cid, account_id=acc_id)
+                    await browser.close()
+                    return
             try:
                 btn = await page.wait_for_selector(
                     "button:has-text('Next')", timeout=6000
