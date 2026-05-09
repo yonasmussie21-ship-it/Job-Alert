@@ -1132,24 +1132,32 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
                 log.info("ℹ️ No shift selection page found")
 
             # ── HALF BOT HALF HUMAN — works on any server ─────────────────
-            # Bot has navigated, selected best shift, reached confirmation
-            # Now send subscriber the exact URL to tap and confirm themselves
-            # This works perfectly from Frankfurt — no IP issues
             final_url = page.url if page.url != "about:blank" else job["link"]
             job["link"] = final_url
 
-            # Check what page we reached
             current_content = await page.inner_text("body")
 
-            if any(w in current_content.lower() for w in [
-                "select", "shift", "schedule", "confirm", "accept", "pre-hire",
-                "start application", "appointment", "checklist"
-            ]):
-                # Bot reached a meaningful page — send prepared alert
-                log.info(f"✅ Bot navigated to: {final_url}")
+            # Check we actually got past login and reached a meaningful page
+            is_still_login = any(w in final_url.lower() for w in [
+                "signin", "login", "sign-in"
+            ]) or any(w in current_content.lower() for w in [
+                "enter your email", "sign in to your account",
+                "create account", "forgot your password"
+            ])
+
+            is_meaningful_page = (
+                not is_still_login and
+                any(w in current_content.lower() for w in [
+                    "shift", "schedule", "select", "confirm",
+                    "pre-hire", "appointment", "checklist"
+                ])
+            )
+
+            if is_meaningful_page:
+                log.info(f"✅ Bot navigated past login to: {final_url}")
                 await tg_alert(job, "prepared", chat_id=cid, account_id=acc_id)
             else:
-                # Didn't get far — send basic ready alert
+                log.warning(f"⚠️ Bot stuck at login or unknown page: {final_url}")
                 await tg_alert(job, "ready", chat_id=cid)
 
             # Save cookies for next time
