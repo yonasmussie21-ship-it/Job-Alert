@@ -1598,6 +1598,7 @@ Keep going Yonas! 💪""")
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
 async def handle_updates():
     offset = 0
+    processed = set()
     while True:
         try:
             async with aiohttp.ClientSession() as s:
@@ -1606,8 +1607,14 @@ async def handle_updates():
                 ) as r:
                     data = await r.json()
                     for update in data.get("result",[]):
-                        offset = update["update_id"] + 1
-                        await process_update(update)
+                        uid = update["update_id"]
+                        offset = uid + 1
+                        if uid not in processed:
+                            processed.add(uid)
+                            # Keep set small
+                            if len(processed) > 1000:
+                                processed.clear()
+                            await process_update(update)
         except Exception as e:
             log.error(f"Update error: {e}")
         await asyncio.sleep(2)
