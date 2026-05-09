@@ -1810,6 +1810,21 @@ async def main():
     log.info(f"👥 Subscribers: {len(subscribers)} | 🤖 Accounts: {len(ACCOUNTS)}")
     log.info(f"📧 Login: {'✅' if AMAZON_EMAIL and AMAZON_PIN else '❌'}")
 
+    # ── Clear pending Telegram updates on startup ──────────────────────────
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"{TELEGRAM_API}/getUpdates?offset=-1&timeout=1"
+            ) as r:
+                data = await r.json()
+                results = data.get("result", [])
+                if results:
+                    last_id = results[-1]["update_id"]
+                    await s.get(f"{TELEGRAM_API}/getUpdates?offset={last_id+1}&timeout=1")
+                    log.info(f"✅ Cleared {len(results)} pending updates")
+    except Exception as e:
+        log.warning(f"Could not clear updates: {e}")
+
     asyncio.create_task(handle_updates())
     asyncio.create_task(send_daily_summary())
 
