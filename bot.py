@@ -368,7 +368,7 @@ Examples: <b>Birmingham</b>, <b>Leeds</b>, <b>B1 1BB</b>""", chat_id=cid)
 Add another location or type <b>DONE</b> to skip.""", chat_id=cid)
 
     elif step == "location_2":
-        if text.upper() != "DONE":
+        if text.strip().upper() not in ["DONE", "SKIP", "NO", "N"]:
             state["locations"].append(text.strip())
         state["step"]   = "radius"
         onboarding[cid] = state
@@ -1060,76 +1060,103 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
                 await browser.close()
                 return
 
-            for sel in ["button:has-text('Continue')","button:has-text('Next')"]:
-                try:
-                    btn = await page.wait_for_selector(sel, timeout=4000)
-                    if btn:
-                        await btn.click()
-                        await page.wait_for_timeout(2000)
-                        break
-                except:
-                    pass
+            # ── PAGE 2: "Your journey to becoming an Amazon Associate" ──────
+            try:
+                btn = await page.wait_for_selector(
+                    "button:has-text('Next')", timeout=6000
+                )
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    await page.wait_for_timeout(3000)
+                    log.info("✅ Next clicked (Page 2)")
+            except:
+                pass
 
-            for sel in ["button:has-text('Start Application')","[data-test='start-application']"]:
+            # ── PAGE 3: Eligibility checklist ─────────────────────────────
+            for sel in [
+                "button:has-text('Start Application')",
+                "button:has-text('Start application')",
+                "[data-test='start-application']",
+            ]:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=5000)
-                    if btn:
+                    btn = await page.wait_for_selector(sel, timeout=6000)
+                    if btn and await btn.is_visible():
                         await btn.click()
-                        await page.wait_for_timeout(3000)
+                        await page.wait_for_timeout(4000)
                         log.info("✅ Start Application clicked")
                         break
                 except:
                     pass
 
-            # ── SHIFT SELECTION ───────────────────────────────────────────
-            shift_selected = False
+            # ── PAGE 4: POPUP — "You have an active job application" ───────
+            # Must click Continue to proceed (not Go to dashboard)
             try:
-                await page.wait_for_selector(
-                    "button:has-text('Select this job'), button:has-text('Select shift')",
-                    timeout=10000
+                btn = await page.wait_for_selector(
+                    "button:has-text('Continue')", timeout=5000
                 )
-                shift_buttons = await page.query_selector_all(
-                    "button:has-text('Select this job'), button:has-text('Select shift')"
-                )
-                if shift_buttons:
-                    best_btn = shift_buttons[0]
-                    best_pri = 999
-                    cards = await page.query_selector_all(
-                        "[class*='shift'],[class*='card'],[class*='schedule']"
-                    )
-                    for i, card in enumerate(cards[:len(shift_buttons)]):
-                        try:
-                            pri = shift_priority(await card.inner_text())
-                            if pri < best_pri:
-                                best_pri = pri
-                                if i < len(shift_buttons):
-                                    best_btn = shift_buttons[i]
-                        except:
-                            pass
-                    await best_btn.click()
+                if btn and await btn.is_visible():
+                    await btn.click()
                     await page.wait_for_timeout(3000)
-                    log.info(f"✅ Best shift selected")
-                    shift_selected = True
-
-                    # Click Accept shift
-                    for sel in [
-                        "button:has-text('Accept')",
-                        "button:has-text('Accept shift')",
-                        "button:has-text('Confirm shift')",
-                        "button:has-text('Continue')",
-                    ]:
-                        try:
-                            btn = await page.wait_for_selector(sel, timeout=5000)
-                            if btn:
-                                await btn.click()
-                                await page.wait_for_timeout(3000)
-                                log.info(f"✅ Shift accepted: {sel}")
-                                break
-                        except:
-                            pass
-
+                    log.info("✅ Active application popup — Continue clicked")
             except:
-                log.info("ℹ️ No shift selection page found")
+                pass
+
+            # ── PAGE 4b: Login wall check ──────────────────────────────────
+            content = await page.inner_text("body")
+            login_keywords = ["sign in", "log in", "signin", "email address",
+                              "enter your email", "create account"]
+            is_job_page = any(k in content.lower() for k in [
+                "apply", "warehouse", "shift", "appointment", "pre-hire", "select this job"
+            ])
+            if any(k in content.lower() for k in login_keywords) and not is_job_page:
+                log.warning("🔐 Login wall — attempting login...")
+                login_ok = await amazon_login_with_otp(page, cid)
+                if not login_ok:
+                    await tg_alert(job, "ready", chat_id=cid)
+                    await browser.close()
+                    return
+                await page.wait_for_timeout(3000)
+
+            # ── PAGE 5: Shift selection — "Select this job" ────────────────
+            shift_selected = False
+            await page.wait_for_timeout(5000)  # wait for React to render shifts
+
+            try:
+                btn = await page.wait_for_selector(
+                    "button:has-text('Select this job')", timeout=10000
+                )
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    await page.wait_for_timeout(4000)
+                    log.info("✅ Select this job clicked!")
+                    shift_selected = True
+            except:
+                log.info("ℹ️ No 'Select this job' button found")
+
+            # ── PAGE 6: "Important Notice" — Accept Offer ──────────────────
+            if shift_selected:
+                try:
+                    btn = await page.wait_for_selector(
+                        "button:has-text('Accept Offer')", timeout=8000
+                    )
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await page.wait_for_timeout(4000)
+                        log.info("✅ Accept Offer clicked!")
+                except:
+                    log.info("ℹ️ No Accept Offer button")
+
+            # ── PAGE 7: Pre-hire appointment ───────────────────────────────
+            try:
+                btn = await page.wait_for_selector(
+                    "button:has-text('Prepare for your Appointment')", timeout=8000
+                )
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    await page.wait_for_timeout(3000)
+                    log.info("✅ Prepare for Appointment clicked!")
+            except:
+                pass
 
             # ── HALF BOT HALF HUMAN — works on any server ─────────────────
             final_url = page.url if page.url != "about:blank" else job["link"]
@@ -1153,11 +1180,14 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
                 ])
             )
 
-            if is_meaningful_page:
-                log.info(f"✅ Bot navigated past login to: {final_url}")
+            if is_meaningful_page and shift_selected:
+                log.info(f"✅ Shift actually selected — notifying user")
                 await tg_alert(job, "prepared", chat_id=cid, account_id=acc_id)
+            elif is_meaningful_page:
+                log.info(f"✅ Bot past login but no shift selected — sending ready")
+                await tg_alert(job, "ready", chat_id=cid)
             else:
-                log.warning(f"⚠️ Bot stuck at login or unknown page: {final_url}")
+                log.warning(f"⚠️ Bot stuck at login: {final_url}")
                 await tg_alert(job, "ready", chat_id=cid)
 
             # Save cookies for next time
