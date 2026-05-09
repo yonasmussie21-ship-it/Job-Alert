@@ -1067,35 +1067,138 @@ async def get_candidate_applications(cookies, auth):
     return [], {}, ""
 
 async def api_submit_job(job, cookies, auth, cid):
-    """Submit application directly via Amazon's API"""
+    """Submit application directly via Amazon's REST API — no browser needed"""
     try:
-        active_apps, headers, cookie_str = await get_candidate_applications(cookies, auth)
-
-        # Find matching application for this job
         job_id = job.get("id", "")
-        matching = None
-        for app in active_apps:
-            if app.get("jobDetail", {}).get("jobId") == job_id:
-                matching = app
-                break
+        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+        today = datetime.now().strftime("%d/%m/%Y")
 
-        if not matching:
-            log.warning(f"⚠️ No active application found for {job_id}")
-            return False
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "cookie": cookie_str,
+            "authorization": auth.get("token", ""),
+            "bb-ui-version": "bb-ui-v2",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "origin": "https://www.jobsatamazon.co.uk",
+            "referer": f"https://www.jobsatamazon.co.uk/application/uk/?jobId={job_id}",
+        }
 
-        app_id = matching.get("applicationId")
-        continue_link = matching.get("continueApplicationLink")
-        step = matching.get("step")
-        log.info(f"✅ Found application {app_id} at step {step}")
-        log.info(f"✅ Continue link: {continue_link}")
+        base = "https://www.jobsatamazon.co.uk/application/api"
 
-        if continue_link:
-            # Navigate directly to continue link — skip all the button clicking!
-            return continue_link, app_id
+        async with aiohttp.ClientSession() as session:
+
+            # ── Step 1: Get CSRF token ─────────────────────────────────────
+            async with session.get(
+                "https://www.jobsatamazon.co.uk/authorize/api/csrf?countryCode=UK",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                csrf_data = await r.json() if r.status == 200 else {}
+                csrf_token = csrf_data.get("token", "")
+                if csrf_token:
+                    headers["x-csrf-token"] = csrf_token
+                    log.info("✅ CSRF token obtained")
+
+            # ── Step 2: Get active applications ───────────────────────────
+            active_apps, _, _ = await get_candidate_applications(cookies, auth)
+
+            # Check if application already exists for this job
+            app_id = None
+            for app in active_apps:
+                if app.get("jobDetail", {}).get("jobId") == job_id:
+                    app_id = app.get("applicationId")
+                    step = app.get("step", "")
+                    log.info(f"✅ Found existing application {app_id} at step {step}")
+
+                    # If already at shift selection or beyond — navigate directly
+                    continue_link = app.get("continueApplicationLink")
+                    if continue_link and "shift" in continue_link.lower():
+                        log.info(f"✅ Already at shift stage!")
+                        return continue_link, app_id
+                    break
+
+            # ── Step 3: Create new application if needed ───────────────────
+            if not app_id:
+                log.info(f"🆕 Creating new application for {job_id}...")
+                async with session.post(
+                    f"{base}/candidate-application/application",
+                    json={"jobId": job_id, "locale": "en-GB"},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as r:
+                    if r.status in [200, 201]:
+                        data = await r.json()
+                        app_id = data.get("applicationId") or data.get("id")
+                        log.info(f"✅ Application created: {app_id}")
+                    else:
+                        text = await r.text()
+                        log.warning(f"⚠️ Create app failed {r.status}: {text[:200]}")
+                        return None, None
+
+            if not app_id:
+                log.warning("⚠️ No application ID obtained")
+                return None, None
+
+            headers["referer"] = f"https://www.jobsatamazon.co.uk/application/uk/?applicationId={app_id}&jobId={job_id}"
+
+            # ── Step 4: Update workflow to job-opportunities ───────────────
+            async with session.put(
+                f"{base}/candidate-application/update-workflow-step-name",
+                json={"applicationId": app_id, "workflowStepName": "job-opportunities"},
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                log.info(f"✅ Workflow → job-opportunities ({r.status})")
+
+            # ── Step 5: Submit shift preferences ──────────────────────────
+            async with session.put(
+                f"{base}/candidate-application/candidate/shiftPreferences",
+                json={
+                    "earliestStartDate": today,
+                    "preferredDaysToWork": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
+                    "hoursPerWeek": [{"maximumValue": 40, "minimumValue": 36}],
+                    "shiftTimePattern": "Any"
+                },
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                log.info(f"✅ Shift preferences submitted ({r.status})")
+
+            # ── Step 6: Update workflow to additional-information ──────────
+            async with session.put(
+                f"{base}/candidate-application/update-workflow-step-name",
+                json={"applicationId": app_id, "workflowStepName": "additional-information"},
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                log.info(f"✅ Workflow → additional-information ({r.status})")
+
+            # ── Step 7: Update workflow to review-submit ───────────────────
+            async with session.put(
+                f"{base}/candidate-application/update-workflow-step-name",
+                json={"applicationId": app_id, "workflowStepName": "review-submit"},
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                log.info(f"✅ Workflow → review-submit ({r.status})")
+
+            # ── Step 8: Submit application ─────────────────────────────────
+            async with session.put(
+                f"{base}/candidate-application/submit-application",
+                json={"applicationId": app_id, "locale": "en-GB"},
+                headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                text = await r.text()
+                log.info(f"✅ Submit application ({r.status}): {text[:100]}")
+                if r.status not in [200, 201, 204]:
+                    log.warning(f"⚠️ Submit may have failed: {text[:300]}")
+
+            log.info(f"🎉 Application submitted via API! app_id={app_id}")
+
+            # Return checklist URL for shift selection
+            checklist_url = f"https://www.jobsatamazon.co.uk/checklist/{job_id}/{app_id}"
+            return checklist_url, app_id
 
     except Exception as e:
         log.error(f"API submit error: {e}")
     return None, None
+
 
 # ─── AUTO SUBMIT ─────────────────────────────────────────────────────────────
 async def auto_submit_account(job, account, chat_id=None, tier="owner"):
