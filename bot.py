@@ -1008,9 +1008,12 @@ async def get_candidate_applications(cookies, auth):
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    candidate = data.get("data", {}).get("queryCandidate", {})
-                    log.info(f"✅ Got candidate: {candidate.get('firstName')} {candidate.get('lastName')}")
+                    try:
+                        data = await resp.json()
+                        candidate = data.get("data", {}).get("queryCandidate", {}) or {}
+                        log.info(f"✅ Got candidate: {candidate.get('firstName')} {candidate.get('lastName')}")
+                    except:
+                        log.warning("⚠️ Could not parse candidate response")
 
             # Now get applications
             query_apps = {
@@ -1084,7 +1087,7 @@ async def api_submit_job(job, cookies, auth, cid):
             "referer": f"https://www.jobsatamazon.co.uk/application/uk/?jobId={job_id}",
         }
 
-        base = "https://www.jobsatamazon.co.uk/application/api"
+        base = "https://www.jobsatamazon.co.uk/application/api/candidate-application"
 
         async with aiohttp.ClientSession() as session:
 
@@ -1121,7 +1124,7 @@ async def api_submit_job(job, cookies, auth, cid):
             if not app_id:
                 log.info(f"🆕 Creating new application for {job_id}...")
                 async with session.post(
-                    f"{base}/candidate-application/application",
+                    f"{base}/application",
                     json={"jobId": job_id, "locale": "en-GB"},
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=15)
@@ -1143,7 +1146,7 @@ async def api_submit_job(job, cookies, auth, cid):
 
             # ── Step 4: Update workflow to job-opportunities ───────────────
             async with session.put(
-                f"{base}/candidate-application/update-workflow-step-name",
+                f"{base}/update-workflow-step-name",
                 json={"applicationId": app_id, "workflowStepName": "job-opportunities"},
                 headers=headers, timeout=aiohttp.ClientTimeout(total=10)
             ) as r:
@@ -1151,7 +1154,7 @@ async def api_submit_job(job, cookies, auth, cid):
 
             # ── Step 5: Submit shift preferences ──────────────────────────
             async with session.put(
-                f"{base}/candidate-application/candidate/shiftPreferences",
+                f"{base}/candidate/shiftPreferences",
                 json={
                     "earliestStartDate": today,
                     "preferredDaysToWork": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
@@ -1164,7 +1167,7 @@ async def api_submit_job(job, cookies, auth, cid):
 
             # ── Step 6: Update workflow to additional-information ──────────
             async with session.put(
-                f"{base}/candidate-application/update-workflow-step-name",
+                f"{base}/update-workflow-step-name",
                 json={"applicationId": app_id, "workflowStepName": "additional-information"},
                 headers=headers, timeout=aiohttp.ClientTimeout(total=10)
             ) as r:
@@ -1172,7 +1175,7 @@ async def api_submit_job(job, cookies, auth, cid):
 
             # ── Step 7: Update workflow to review-submit ───────────────────
             async with session.put(
-                f"{base}/candidate-application/update-workflow-step-name",
+                f"{base}/update-workflow-step-name",
                 json={"applicationId": app_id, "workflowStepName": "review-submit"},
                 headers=headers, timeout=aiohttp.ClientTimeout(total=10)
             ) as r:
@@ -1180,7 +1183,7 @@ async def api_submit_job(job, cookies, auth, cid):
 
             # ── Step 8: Submit application ─────────────────────────────────
             async with session.put(
-                f"{base}/candidate-application/submit-application",
+                f"{base}/submit-application",
                 json={"applicationId": app_id, "locale": "en-GB"},
                 headers=headers, timeout=aiohttp.ClientTimeout(total=15)
             ) as r:
