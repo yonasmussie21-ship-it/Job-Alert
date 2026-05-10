@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for job-alert on 2026-05-09T23:05:04Z
+# fly.toml app configuration file generated for job-alert-roq2hg on 2026-05-10T13:47:28Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'job-alert'
-primary_region = 'lhr'
+app = 'job-alert-roq2hg'
+primary_region = 'ams'
 
 [build]
   dockerfile = 'Dockerfile'
