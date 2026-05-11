@@ -1,6 +1,5 @@
 FROM python:3.11.8-slim
 
-# Install system dependencies for Playwright
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -28,15 +27,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy requirements and install
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# Install Playwright browsers
 RUN python -m playwright install chromium
 RUN python -m playwright install-deps chromium
 
-# Copy bot
-COPY bot.py .
+# ✅ Copy ALL files
+COPY . .
 
-CMD ["python", "bot.py"]
+# ✅ Run main.py
+CMD ["python", "main.py"]
