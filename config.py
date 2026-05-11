@@ -1,0 +1,143 @@
+import os
+import logging
+from urllib.parse import quote
+
+# ─── LOGGING ─────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+# ─── TELEGRAM ────────────────────────────────────────────────────────────────
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
+CHAT_ID      = os.environ.get("CHAT_ID", "1027065157")
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# ─── PROXY ───────────────────────────────────────────────────────────────────
+DECODO_USER  = os.environ.get("DECODO_USER", "")
+DECODO_PASS  = os.environ.get("DECODO_PASS", "")
+DECODO_HOST  = os.environ.get("DECODO_HOST", "gb.decodo.com")
+DECODO_PORT  = os.environ.get("DECODO_PORT", "30004")
+
+# ─── AMAZON AUTH ─────────────────────────────────────────────────────────────
+AMAZON_EMAIL = os.environ.get("AMAZON_EMAIL", "")
+AMAZON_PIN   = os.environ.get("AMAZON_PIN", "")
+
+# ─── FILE PATHS ──────────────────────────────────────────────────────────────
+SUBSCRIBERS_FILE = "/tmp/subscribers.json"
+COOKIES_FILE     = "/tmp/amazon_session.json"
+
+# ─── JOB FILTERS ─────────────────────────────────────────────────────────────
+WAREHOUSE_KEYWORDS = [
+    "warehouse", "fulfillment", "fulfilment", "sortation",
+    "sort centre", "sort center", "delivery station",
+    "fc associate", "warehouse operative", "warehouse associate",
+    "sortation operative", "fulfillment associate", "fulfilment associate",
+    "seasonal associate", "process assistant", "picker", "packer",
+    "stower", "problem solver", "production operator", "site assistant",
+    "amazon associate", "operations associate",
+]
+
+BLOCKED_KEYWORDS = [
+    "customer service", "software", "engineer", "manager",
+    "corporate", "marketing", " hr ", "finance", "recruiter",
+    "sales", "vcc", "loss prevention", "learning ambassador",
+    "data entry", "legal", "it support", "business analyst",
+]
+
+FRESH_KEYWORDS = ["amazon fresh", "whole foods", "fresh grocery"]
+
+# ─── UK CITY → POSTCODE MAP ──────────────────────────────────────────────────
+CITY_POSTCODES = {
+    "birmingham": "B1 1BB", "london": "EC1A 1BB", "manchester": "M1 1AE",
+    "leeds": "LS1 1BA", "glasgow": "G1 1AA", "liverpool": "L1 1JF",
+    "sheffield": "S1 1AA", "bristol": "BS1 1AA", "newcastle": "NE1 1AA",
+    "nottingham": "NG1 1AA", "leicester": "LE1 1AA", "coventry": "CV1 1AA",
+    "wolverhampton": "WV1 1AA", "derby": "DE1 1AA", "cardiff": "CF10 1AA",
+    "edinburgh": "EH1 1AA", "belfast": "BT1 1AA", "southampton": "SO14 1AA",
+    "portsmouth": "PO1 1AA", "oxford": "OX1 1AA", "cambridge": "CB1 1AA",
+    "reading": "RG1 1AA", "luton": "LU1 1AA", "northampton": "NN1 1AA",
+    "milton keynes": "MK9 1AA", "warrington": "WA1 1AA", "hull": "HU1 1AA",
+    "doncaster": "DN1 1AA", "chesterfield": "S40 1AA", "wakefield": "WF1 1AA",
+    "durham": "DH1 1AA", "sunderland": "SR1 1AA", "middlesbrough": "TS1 1AA",
+    "bolton": "BL1 1AA", "wigan": "WN1 1AA", "stockport": "SK1 1AA",
+    "stoke": "ST1 1AA", "swansea": "SA1 1AA", "exeter": "EX1 1AA",
+    "enfield": "EN1 1AA", "slough": "SL1 1AA", "watford": "WD17 1AA",
+    "rugby": "CV21 1AA", "dunstable": "LU5 4AA", "coalville": "LE67 1AA",
+    "knowsley": "L33 1AA", "west thurrock": "RM20 1AA", "motherwell": "ML1 1AA",
+    "barking": "IG11 1AA", "tilbury": "RM18 1AA", "bathgate": "EH48 2FB",
+    "gloucester": "GL4 3HR", "poole": "BH15 2AA", "bournemouth": "BH1 1AA",
+    "swindon": "SN1 1AA", "peterborough": "PE1 1AA", "ipswich": "IP1 1AA",
+    "norwich": "NR1 1AA", "basildon": "SS14 1AA", "chelmsford": "CM1 1AA",
+    "colchester": "CO1 1AA", "stevenage": "SG1 1AA",
+}
+
+CITY_COORDS = {
+    "B1 1BB": (52.4862, -1.8904), "EC1A 1BB": (51.5200, -0.0990),
+    "M1 1AE": (53.4808, -2.2426), "LS1 1BA": (53.7997, -1.5492),
+    "G1 1AA": (55.8642, -4.2518), "L1 1JF": (53.4084, -2.9916),
+    "S1 1AA": (53.3811, -1.4701), "BS1 1AA": (51.4545, -2.5879),
+    "NE1 1AA": (54.9783, -1.6178), "NG1 1AA": (52.9540, -1.1549),
+    "LE1 1AA": (52.6369, -1.1398), "CV1 1AA": (52.4068, -1.5197),
+    "WV1 1AA": (52.5852, -2.1297), "DE1 1AA": (52.9225, -1.4746),
+    "CF10 1AA": (51.4816, -3.1791), "EH1 1AA": (55.9533, -3.1883),
+    "BT1 1AA": (54.5973, -5.9301), "SO14 1AA": (50.9097, -1.4044),
+    "PO1 1AA": (50.7989, -1.0919), "OX1 1AA": (51.7520, -1.2577),
+    "CB1 1AA": (52.2053, 0.1218),  "RG1 1AA": (51.4543, -0.9781),
+    "LU1 1AA": (51.8787, -0.4200), "NN1 1AA": (52.2405, -0.9027),
+    "MK9 1AA": (52.0406, -0.7594), "WA1 1AA": (53.3900, -2.5970),
+    "HU1 1AA": (53.7457, -0.3367), "DN1 1AA": (53.5228, -1.1286),
+    "WF1 1AA": (53.6830, -1.4977), "DH1 1AA": (54.7761, -1.5733),
+    "SR1 1AA": (54.9069, -1.3838), "TS1 1AA": (54.5740, -1.2343),
+    "BL1 1AA": (53.5780, -2.4286), "WN1 1AA": (53.5450, -2.6333),
+    "SK1 1AA": (53.4083, -2.1578), "ST1 1AA": (53.0271, -2.1772),
+    "SA1 1AA": (51.6214, -3.9436), "EX1 1AA": (50.7236, -3.5275),
+    "EN1 1AA": (51.6522, -0.0808), "SL1 1AA": (51.5105, -0.5950),
+    "WD17 1AA": (51.6565, -0.3903), "CV21 1AA": (52.3711, -1.2660),
+    "LU5 4AA": (51.8868, -0.5216), "LE67 1AA": (52.7236, -1.3698),
+    "L33 1AA": (53.4597, -2.8480), "RM20 1AA": (51.4833, 0.2667),
+    "ML1 1AA": (55.7900, -3.9833), "IG11 1AA": (51.5390, 0.0799),
+    "RM18 1AA": (51.4617, 0.3590), "EH48 2FB": (55.9069, -3.6427),
+    "GL4 3HR": (51.8585, -2.2180), "BH15 2AA": (50.7192, -1.9874),
+    "BH1 1AA": (50.7209, -1.8795), "SN1 1AA": (51.5558, -1.7797),
+    "PE1 1AA": (52.5695, -0.2405), "IP1 1AA": (52.0567, 1.1482),
+    "NR1 1AA": (52.6309, 1.2974),  "SS14 1AA": (51.5790, 0.4553),
+    "CM1 1AA": (51.7356, 0.4685),  "CO1 1AA": (51.8960, 0.8919),
+    "SG1 1AA": (51.9024, -0.2082), "S40 1AA": (53.2354, -1.4210),
+}
+
+# ─── MULTI-ACCOUNT CONFIG ────────────────────────────────────────────────────
+def load_accounts():
+    accounts = []
+    for i in range(1, 6):
+        email   = os.environ.get(f"AMAZON_EMAIL_{i}", "")
+        pin     = os.environ.get(f"AMAZON_PIN_{i}", "")
+        cookies = os.environ.get(f"AMAZON_COOKIES_{i}", "")
+        if i == 1:
+            email   = email   or AMAZON_EMAIL
+            pin     = pin     or AMAZON_PIN
+            cookies = cookies or os.environ.get("AMAZON_COOKIES", "")
+        if email or cookies:
+            accounts.append({
+                "id": i, "email": email, "pin": pin,
+                "cookies": cookies, "session": [], "logged_in": False,
+            })
+    return accounts
+
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
+def get_proxy_url():
+    if DECODO_USER and DECODO_PASS:
+        encoded_pass = quote(DECODO_PASS, safe="")
+        return f"http://{DECODO_USER}:{encoded_pass}@{DECODO_HOST}:{DECODO_PORT}"
+    return None
+
+def get_tier(sub_cid, prefs):
+    if sub_cid == CHAT_ID:
+        return "owner"
+    return prefs.get("tier", "free")
+
+def is_peak_time():
+    from datetime import datetime
+    now  = datetime.utcnow()
+    h, m = now.hour, now.minute
+    am   = (h == 10 and m >= 55) or (h == 11 and m <= 25)
+    pm   = (h == 22 and m >= 55) or (h == 23 and m <= 25)
+    return am or pm
