@@ -52,11 +52,6 @@ SUBSCRIBERS_FILE = "/tmp/subscribers.json"
 COOKIES_FILE     = "/tmp/amazon_session.json"
 
 # ─── TIERS ───────────────────────────────────────────────────────────────────
-# free     = alerts only
-# standard = alerts + application prepared (stops before submit) £5/mo
-# premium  = full auto-submit £10/mo
-# owner    = everything, always
-
 def get_tier(sub_cid, prefs):
     if sub_cid == CHAT_ID:
         return "owner"
@@ -96,12 +91,9 @@ def is_fresh_job(job) -> bool:
     return any(kw in title or kw in location for kw in FRESH_KEYWORDS)
 
 def score_job(job):
-    """Score job quality. Returns (score, skip)."""
     hours    = job.get("hours")
     contract = job.get("contract", "").lower()
     schedule = job.get("schedule", "")
-
-    # Hard filter — skip part-time
     if hours:
         try:
             if int(hours) < 36:
@@ -109,7 +101,6 @@ def score_job(job):
                 return 0, True
         except:
             pass
-
     score = 0
     if "permanent" in contract:      score += 50
     if is_night_shift(schedule):     score += 15
@@ -452,7 +443,6 @@ def parse_card(card):
         shift_code  = card.get("shiftCode") or ""
         schedule    = shift_code if shift_code else None
 
-        # Hard filter — skip part time
         if hours:
             try:
                 if int(hours) < 36:
@@ -513,7 +503,6 @@ async def fetch_job_details(job):
 
             page = await context.new_page()
 
-            # Capture shift data from GraphQL
             shifts_data = []
             async def handle_response(response):
                 try:
@@ -530,8 +519,6 @@ async def fetch_job_details(job):
 
             page.on("response", handle_response)
             await page.goto(job["link"], wait_until="domcontentloaded", timeout=60000)
-
-            # Wait for React to fully render
             await page.wait_for_timeout(5000)
             try:
                 await page.wait_for_function(
@@ -544,7 +531,6 @@ async def fetch_job_details(job):
 
             content = await page.inner_text("body")
 
-            # Extract First Day
             for pattern in [
                 r'(?:Tentative start date|Start date|First day)[:\s]+([A-Za-z]+,?\s+\d+\s+[A-Za-z]+\s+\d{4})',
                 r'(?:Tentative start date|Start date|First day)[:\s]+([A-Za-z]+ \d+, \d{4})',
@@ -555,7 +541,6 @@ async def fetch_job_details(job):
                     job["firstDay"] = m.group(1).strip()
                     break
 
-            # Extract Shifts
             shift_patterns = re.findall(
                 r'([A-Za-z]{3}(?:,\s*[A-Za-z]{3})*\s+\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})',
                 content
@@ -569,18 +554,15 @@ async def fetch_job_details(job):
                 job["shifts"]   = [s.get("scheduleDisplay","") for s in shifts_data if s.get("scheduleDisplay")]
                 job["schedule"] = job["shifts"][0] if job["shifts"] else None
 
-            # Extract Hours
             m = re.search(r'(\d+)\s*(?:hrs?|hours?)\s*(?:per\s*week|/\s*week)', content, re.IGNORECASE)
             if m:
                 job["hours"] = m.group(1)
 
-            # Extract Contract
             for ct in ["Permanent","Full-time","Fixed-term","Seasonal","Temporary","Part-time"]:
                 if ct.lower() in content.lower():
                     job["contract"] = ct
                     break
 
-            # Extract Description (clean)
             desc_match = re.search(
                 r'((?:Pick|Sort|Process|Receive|Load|Unload|Pack|Ship|Stow)[^.\n]{15,120}\.)',
                 content, re.IGNORECASE
@@ -599,15 +581,8 @@ async def fetch_job_details(job):
         log.warning(f"Detail fetch error: {e}")
     return job
 
-# ─── CORE SCRAPER — ONE SEARCH, ALL UK JOBS ───────────────────────────────────
+# ─── CORE SCRAPER ─────────────────────────────────────────────────────────────
 async def fetch_jobs():
-    """
-    Simple and correct:
-    1. Load jobsatamazon.co.uk once
-    2. Capture the real GraphQL request
-    3. Replay through Decodo UK proxy → Amazon returns ALL UK jobs
-    4. Parse and filter results
-    """
     all_jobs     = {}
     proxy        = get_proxy_url()
     captured     = {}
@@ -646,7 +621,6 @@ async def fetch_jobs():
                             for h in ["content-length","host",":method",
                                       ":path",":scheme",":authority"]:
                                 headers.pop(h, None)
-                            # Only modify valid fields
                             try:
                                 body_json  = json.loads(body)
                                 search_req = body_json.get("variables", {}).get("searchJobRequest", {})
@@ -699,7 +673,6 @@ async def fetch_jobs():
     except Exception as e:
         log.error(f"Browser error: {e}")
 
-    # Replay via Decodo UK proxy → gets ALL UK jobs
     if captured and proxy:
         log.info("🌐 Replaying via Decodo UK proxy (all UK jobs)...")
         cards = await replay_via_proxy(
@@ -844,8 +817,6 @@ async def send_all_shifts(job, status="new", chat_id=None, distance=None, score=
 async def amazon_login_with_otp(page, chat_id):
     try:
         log.info("🔐 Attempting Amazon auto-login...")
-
-        # Step 1 — Enter email
         await page.wait_for_timeout(2000)
         for sel in ["input[type='email']", "input[name='email']", "input[name='username']"]:
             email_field = await page.query_selector(sel)
@@ -855,7 +826,6 @@ async def amazon_login_with_otp(page, chat_id):
                 log.info(f"✅ Email entered")
                 break
 
-        # Click Continue/Next after email
         for sel in ["button:has-text('Continue')", "input[type='submit']",
                     "button[type='submit']", "button:has-text('Next')"]:
             try:
@@ -867,7 +837,6 @@ async def amazon_login_with_otp(page, chat_id):
             except:
                 pass
 
-        # Step 2 — Enter PIN/Password
         await page.wait_for_timeout(2000)
         for sel in ["input[type='password']", "input[name='password']",
                     "input[name='pin']", "input[placeholder*='PIN']",
@@ -881,7 +850,6 @@ async def amazon_login_with_otp(page, chat_id):
                 await page.wait_for_timeout(3000)
                 break
 
-        # Step 3 — Check for OTP
         content = await page.inner_text("body")
         otp_keywords = ["verification", "otp", "one-time", "passcode",
                         "authentication code", "security code", "verify"]
@@ -902,7 +870,6 @@ async def amazon_login_with_otp(page, chat_id):
                 otp_waiting.pop(chat_id, None)
 
                 if otp:
-                    # Try multiple OTP field selectors
                     for sel in [
                         "input[autocomplete='one-time-code']",
                         "input[name='otpCode']",
@@ -919,7 +886,6 @@ async def amazon_login_with_otp(page, chat_id):
                             log.info("✅ OTP submitted!")
                             break
 
-                    # Verify login succeeded
                     content = await page.inner_text("body")
                     if any(w in content.lower() for w in ["sign in", "login", "otp", "verification"]):
                         log.warning("⚠️ Still on login page after OTP")
@@ -938,7 +904,6 @@ async def amazon_login_with_otp(page, chat_id):
                 )
                 return False
 
-        # Check if login succeeded without OTP
         content = await page.inner_text("body")
         if any(w in content.lower() for w in ["sign in", "log in", "enter your email"]):
             log.warning("⚠️ Still on login page — login may have failed")
@@ -953,7 +918,6 @@ async def amazon_login_with_otp(page, chat_id):
 
 # ─── DIRECT API AUTO SUBMIT ───────────────────────────────────────────────────
 async def extract_auth_from_cookies(cookies):
-    """Extract HVH_ACCESS_TOKEN and other auth from cookies"""
     auth = {}
     for c in cookies:
         name = c.get("name", "")
@@ -968,11 +932,8 @@ async def extract_auth_from_cookies(cookies):
     return auth
 
 async def get_candidate_applications(cookies, auth):
-    """Query Amazon API for active applications using GraphQL"""
     try:
-        # Build cookie string
         cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -984,7 +945,6 @@ async def get_candidate_applications(cookies, auth):
             "referer": "https://www.jobsatamazon.co.uk/app",
         }
 
-        # First get candidate ID
         query_candidate = {
             "operationName": "queryCandidate",
             "query": """query queryCandidate($bbCandidateId: String!) {
@@ -1015,7 +975,6 @@ async def get_candidate_applications(cookies, auth):
                     except:
                         log.warning("⚠️ Could not parse candidate response")
 
-            # Now get applications
             query_apps = {
                 "operationName": "queryApplicationsByBBCandidateIdV2",
                 "query": """query queryApplicationsByBBCandidateIdV2($locale: String!, $bbCandidateId: String!) {
@@ -1070,21 +1029,20 @@ async def get_candidate_applications(cookies, auth):
     return [], {}, ""
 
 async def api_submit_job(job, cookies, auth, cid):
-    """Submit application directly via Amazon's REST API — no browser needed"""
+    """Submit application directly via Amazon REST API — FIXED v2"""
     try:
-        job_id = job.get("id", "")
+        job_id     = job.get("id", "")
         cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-        today = datetime.now().strftime("%d/%m/%Y")
 
         headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "cookie": cookie_str,
+            "Content-Type":  "application/json",
+            "Accept":        "application/json",
+            "cookie":        cookie_str,
             "authorization": auth.get("token", ""),
             "bb-ui-version": "bb-ui-v2",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "origin": "https://www.jobsatamazon.co.uk",
-            "referer": f"https://www.jobsatamazon.co.uk/application/uk/?jobId={job_id}",
+            "user-agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "origin":        "https://www.jobsatamazon.co.uk",
+            "referer":       f"https://www.jobsatamazon.co.uk/application/uk/?jobId={job_id}",
         }
 
         base = "https://www.jobsatamazon.co.uk/application/api/candidate-application"
@@ -1094,33 +1052,66 @@ async def api_submit_job(job, cookies, auth, cid):
             # ── Step 1: Get CSRF token ─────────────────────────────────────
             async with session.get(
                 "https://www.jobsatamazon.co.uk/authorize/api/csrf?countryCode=UK",
-                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as r:
-                csrf_data = await r.json() if r.status == 200 else {}
+                csrf_data  = await r.json() if r.status == 200 else {}
                 csrf_token = csrf_data.get("token", "")
                 if csrf_token:
                     headers["x-csrf-token"] = csrf_token
                     log.info("✅ CSRF token obtained")
 
-            # ── Step 2: Get active applications ───────────────────────────
-            active_apps, _, _ = await get_candidate_applications(cookies, auth)
+            # ── Step 2: Get candidate ID ───────────────────────────────────
+            candidate_id = auth.get("hvhcid", "")
+            query_candidate = {
+                "operationName": "queryCandidate",
+                "query": """query queryCandidate($bbCandidateId: String!) {
+                    queryCandidate(bbCandidateId: $bbCandidateId) {
+                        candidateId
+                        candidateSFId
+                        firstName
+                        lastName
+                        __typename
+                    }
+                }""",
+                "variables": {"bbCandidateId": candidate_id}
+            }
+            async with session.post(
+                "https://www.jobsatamazon.co.uk/graphql",
+                json=query_candidate,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status == 200:
+                    try:
+                        data         = await r.json()
+                        candidate    = data.get("data", {}).get("queryCandidate", {}) or {}
+                        sf_id        = candidate.get("candidateSFId", "")
+                        candidate_id = sf_id or candidate_id
+                        log.info(f"✅ Candidate ID: {candidate_id[:12]}...")
+                    except:
+                        log.warning("⚠️ Could not parse candidate response")
 
-            # Check if application already exists for this job
+            # ── Step 3: Check for existing application ────────────────────
             app_id = None
-            for app in active_apps:
-                if app.get("jobDetail", {}).get("jobId") == job_id:
-                    app_id = app.get("applicationId")
-                    step = app.get("step", "")
-                    log.info(f"✅ Found existing application {app_id} at step {step}")
+            async with session.get(
+                f"{base}/applications?jobId={job_id}&locale=en-GB",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    try:
+                        data   = await r.json()
+                        apps   = data if isinstance(data, list) else data.get("applications", [])
+                        for app in apps:
+                            if app.get("jobId") == job_id or app.get("active"):
+                                app_id = app.get("applicationId") or app.get("id")
+                                log.info(f"✅ Found existing application: {app_id}")
+                                break
+                    except:
+                        pass
 
-                    # If already at shift selection or beyond — navigate directly
-                    continue_link = app.get("continueApplicationLink")
-                    if continue_link and "shift" in continue_link.lower():
-                        log.info(f"✅ Already at shift stage!")
-                        return continue_link, app_id
-                    break
-
-            # ── Step 3: Create new application if needed ───────────────────
+            # ── Step 4: Create new application if needed ──────────────────
             if not app_id:
                 log.info(f"🆕 Creating new application for {job_id}...")
                 async with session.post(
@@ -1129,81 +1120,100 @@ async def api_submit_job(job, cookies, auth, cid):
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=15)
                 ) as r:
+                    text = await r.text()
                     if r.status in [200, 201]:
-                        data = await r.json()
-                        app_id = data.get("applicationId") or data.get("id")
-                        log.info(f"✅ Application created: {app_id}")
+                        try:
+                            data   = json.loads(text)
+                            app_id = data.get("applicationId") or data.get("id")
+                            log.info(f"✅ Application created: {app_id}")
+                        except:
+                            log.warning(f"⚠️ Could not parse create response: {text[:200]}")
                     else:
-                        text = await r.text()
-                        log.warning(f"⚠️ Create app failed {r.status}: {text[:200]}")
+                        log.warning(f"⚠️ Create app failed {r.status}: {text[:300]}")
                         return None, None
 
             if not app_id:
-                log.warning("⚠️ No application ID obtained")
+                log.warning("⚠️ No application ID — cannot proceed")
                 return None, None
 
-            headers["referer"] = f"https://www.jobsatamazon.co.uk/application/uk/?applicationId={app_id}&jobId={job_id}"
+            headers["referer"] = (
+                f"https://www.jobsatamazon.co.uk/application/uk/"
+                f"?applicationId={app_id}&jobId={job_id}"
+            )
 
-            # ── Step 4: Update workflow to job-opportunities ───────────────
-            async with session.put(
-                f"{base}/update-workflow-step-name",
-                json={"applicationId": app_id, "workflowStepName": "job-opportunities"},
-                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                log.info(f"✅ Workflow → job-opportunities ({r.status})")
-
-            # ── Step 5: Submit shift preferences ──────────────────────────
-            async with session.put(
-                f"{base}/candidate/shiftPreferences",
-                json={
-                    "earliestStartDate": today,
-                    "preferredDaysToWork": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
-                    "hoursPerWeek": [{"maximumValue": 40, "minimumValue": 36}],
-                    "shiftTimePattern": "Any"
-                },
-                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                log.info(f"✅ Shift preferences submitted ({r.status})")
-
-            # ── Step 6: Update workflow to additional-information ──────────
-            async with session.put(
-                f"{base}/update-workflow-step-name",
-                json={"applicationId": app_id, "workflowStepName": "additional-information"},
-                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                log.info(f"✅ Workflow → additional-information ({r.status})")
-
-            # ── Step 7: Update workflow to review-submit ───────────────────
-            async with session.put(
-                f"{base}/update-workflow-step-name",
-                json={"applicationId": app_id, "workflowStepName": "review-submit"},
-                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                log.info(f"✅ Workflow → review-submit ({r.status})")
-
-            # ── Step 8: Submit application ─────────────────────────────────
-            async with session.put(
-                f"{base}/submit-application",
+            # ── Step 5: Get available schedules ───────────────────────────
+            schedule_id = None
+            async with session.post(
+                f"{base}/job/get-all-schedules/{job_id}",
                 json={"applicationId": app_id, "locale": "en-GB"},
-                headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status == 200:
+                    try:
+                        data      = await r.json()
+                        schedules = (data.get("availableSchedules", {})
+                                        .get("schedules", []))
+                        if schedules:
+                            best = sorted(
+                                schedules,
+                                key=lambda s: shift_priority(
+                                    s.get("scheduleText","") or
+                                    s.get("externalJobTitle","")
+                                )
+                            )[0]
+                            schedule_id = (best.get("scheduleId") or
+                                           best.get("scheduleID") or
+                                           best.get("id"))
+                            log.info(f"✅ Schedule selected: {schedule_id}")
+                        else:
+                            log.warning("⚠️ No schedules available for this job")
+                    except Exception as e:
+                        log.warning(f"⚠️ Schedule parse error: {e}")
+                else:
+                    text = await r.text()
+                    log.warning(f"⚠️ get-all-schedules {r.status}: {text[:200]}")
+
+            # ── Step 6: Advance workflow steps ────────────────────────────
+            for step_name in ["job-opportunities", "additional-information", "review-submit"]:
+                async with session.put(
+                    f"{base}/update-workflow-step-name",
+                    json={"applicationId": app_id, "workflowStepName": step_name},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
+                    log.info(f"✅ Workflow → {step_name} ({r.status})")
+
+            # ── Step 7: Submit application ─────────────────────────────────
+            submit_body = {
+                "applicationId": app_id,
+                "jobId":         job_id,
+                "candidateId":   candidate_id,
+            }
+            if schedule_id:
+                submit_body["scheduleId"] = schedule_id
+
+            async with session.post(
+                f"{base}/submit-application",
+                json=submit_body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20)
             ) as r:
                 text = await r.text()
-                log.info(f"✅ Submit application ({r.status}): {text[:100]}")
-                if r.status not in [200, 201, 204]:
-                    log.warning(f"⚠️ Submit may have failed: {text[:300]}")
-
-            log.info(f"🎉 Application submitted via API! app_id={app_id}")
-
-            # Return checklist URL for shift selection
-            checklist_url = f"https://www.jobsatamazon.co.uk/checklist/{job_id}/{app_id}"
-            return checklist_url, app_id
+                log.info(f"🚀 Submit response ({r.status}): {text[:200]}")
+                if r.status in [200, 201, 204]:
+                    log.info(f"🎉 Application submitted! app_id={app_id}")
+                    return f"https://www.jobsatamazon.co.uk/checklist/{job_id}/{app_id}", app_id
+                else:
+                    log.warning(f"⚠️ Submit failed {r.status}: {text[:300]}")
+                    return None, app_id
 
     except Exception as e:
         log.error(f"API submit error: {e}")
     return None, None
 
 
-# ─── AUTO SUBMIT — API ONLY (no browser, lightweight) ────────────────────────
+# ─── AUTO SUBMIT ─────────────────────────────────────────────────────────────
 async def auto_submit_account(job, account, chat_id=None, tier="owner"):
     cid    = chat_id or CHAT_ID
     acc_id = account["id"]
@@ -1216,7 +1226,6 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
     await tg_alert(job, "applying", chat_id=cid, account_id=acc_id)
 
     try:
-        # ── Load cookies ──────────────────────────────────────────────────
         cookies = []
         amazon_cookies_env = os.environ.get("AMAZON_COOKIES", "")
         if amazon_cookies_env:
@@ -1234,7 +1243,6 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
             await tg_alert(job, "ready", chat_id=cid)
             return
 
-        # Fix sameSite for aiohttp
         clean_cookies = []
         for c in cookies:
             clean_cookies.append({
@@ -1242,7 +1250,6 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
                 "value": c.get("value", ""),
             })
 
-        # ── Extract auth ──────────────────────────────────────────────────
         auth = await extract_auth_from_cookies(cookies)
 
         if not auth.get("token"):
@@ -1252,24 +1259,19 @@ async def auto_submit_account(job, account, chat_id=None, tier="owner"):
 
         log.info(f"✅ Auth token found, hvhcid: {auth.get('hvhcid','?')[:8]}...")
 
-        # ── Try direct API submit ─────────────────────────────────────────
         checklist_url, app_id = await api_submit_job(job, cookies, auth, cid)
 
         if checklist_url and app_id:
             log.info(f"🎉 API submit successful! Notifying user...")
-            await tg_alert(job, "prepared", chat_id=cid, account_id=acc_id)
+            await tg_alert(job, "applied", chat_id=cid, account_id=acc_id)
             return
 
-        # ── API failed — send manual alert ────────────────────────────────
         log.warning("⚠️ API submit failed — sending manual alert")
         await tg_alert(job, "ready", chat_id=cid)
 
     except Exception as e:
         log.error(f"Auto-submit error: {e}")
         await tg_alert(job, "ready", chat_id=cid)
-
-
-
 
 
 # ─── MAIN CHECK ──────────────────────────────────────────────────────────────
@@ -1294,16 +1296,11 @@ async def check_jobs():
         known_jobs[jid] = job
         job_history.append(job)
 
-        # Score the job
         job_score, skip = score_job(job)
         if skip:
             continue
 
-        # ── OWNER ONLY MODE — subscribers paused ─────────────────────────
-        # Only process owner (CHAT_ID) for now
-        owner_prefs = subscribers.get(CHAT_ID, {})
-
-        # Distance for info only
+        owner_prefs   = subscribers.get(CHAT_ID, {})
         job_postcode  = job.get("postcode", "")
         best_distance = None
         if job_postcode:
@@ -1313,12 +1310,10 @@ async def check_jobs():
                     if best_distance is None or d < best_distance:
                         best_distance = d
 
-        # Alert owner
         await send_all_shifts(job, "new", chat_id=CHAT_ID,
                               distance=best_distance,
                               score=job_score if job_score > 0 else None)
 
-        # Auto-submit ALL jobs — no radius filter, owner decides after
         if ACCOUNTS and not is_fresh_job(job):
             log.info(f"🤖 Auto-submitting for owner: {job['location']}")
             asyncio.create_task(
@@ -1399,7 +1394,6 @@ async def handle_updates():
                         offset = uid + 1
                         if uid not in processed:
                             processed.add(uid)
-                            # Keep set small
                             if len(processed) > 1000:
                                 processed.clear()
                             await process_update(update)
@@ -1425,7 +1419,6 @@ async def process_update(update):
     name    = msg.get("chat",{}).get("first_name","Friend")
     text_lw = text.lower()
 
-    # OTP handler
     if cid in otp_waiting and text and text.isdigit():
         otp_codes[cid] = text
         otp_waiting[cid].set()
@@ -1570,7 +1563,7 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
         await tg_send("🗑️ Cache cleared — bot will re-alert all jobs next scan.", chat_id=cid)
 
     elif text_lw == "/help":
-        await tg_send("""👑 <b>Amazon KING BOT v16</b>
+        await tg_send("""👑 <b>Amazon KING BOT v17</b>
 ━━━━━━━━━━━━━━━━━
 /start          — Welcome & setup
 /setup          — Update preferences
@@ -1593,12 +1586,11 @@ Best: {best.get('location','?')} £{best.get('pay','?')}/hr""", chat_id=cid)
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("👑 Amazon KING BOT v16 Starting!")
+    log.info("👑 Amazon KING BOT v17 Starting!")
     log.info(f"🌐 Proxy: {'Decodo ✅' if get_proxy_url() else '❌'}")
     log.info(f"👥 Subscribers: {len(subscribers)} | 🤖 Accounts: {len(ACCOUNTS)}")
     log.info(f"📧 Login: {'✅' if AMAZON_EMAIL and AMAZON_PIN else '❌'}")
 
-    # ── Clear pending Telegram updates on startup ──────────────────────────
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(
@@ -1617,14 +1609,13 @@ async def main():
     asyncio.create_task(send_daily_summary())
 
     await asyncio.sleep(2)
-    await tg_send(f"""👑 <b>Amazon KING BOT v16 ONLINE!</b>
+    await tg_send(f"""👑 <b>Amazon KING BOT v17 ONLINE!</b>
 ━━━━━━━━━━━━━━━━━
+✅ Fixed submit endpoint
+✅ scheduleId now included
+✅ candidateSFId resolved
 ✅ One search → ALL UK jobs
-✅ Subscriber radius filtering
-✅ 3 tier system (Free/Standard/Premium)
-✅ Full shift details
 ✅ 36hr+ filter (no part-time)
-✅ OTP auto-login
 ✅ Decodo UK proxy
 ⚡ 3s peak / 10s normal
 ━━━━━━━━━━━━━━━━━
@@ -1632,8 +1623,7 @@ async def main():
 📧 Login: {'✅ Ready' if AMAZON_EMAIL and AMAZON_PIN else '❌'}
 👥 {len(subscribers)} subscriber(s) | 🤖 {len(ACCOUNTS)} account(s)
 ━━━━━━━━━━━━━━━━━
-Send /test to preview!
-Share: t.me/Jibhub_bot""")
+Send /test to preview!""")
 
     await check_jobs()
 
