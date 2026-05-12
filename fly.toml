@@ -1,8 +1,3 @@
-# fly.toml app configuration file generated for job-alert-dnzwuw on 2026-05-11T21:37:57Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
 app = 'job-alert-dnzwuw'
 primary_region = 'lhr'
 
@@ -15,17 +10,20 @@ primary_region = 'lhr'
 [[mounts]]
   source = 'bot_data'
   destination = '/data'
-
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
-  min_machines_running = 0
   processes = ['app']
+
+[restart]
+  policy = "always"
+
+[deploy]
+  strategy = "rolling"
+
+[scale]
+  count = 1
 
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
   memory_mb = 1024
+  swap_size_mb = 512
