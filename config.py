@@ -1,7 +1,11 @@
 import os
 import logging
+import random
+from dataclasses import dataclass, asdict
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 # ─── TIMEZONE ────────────────────────────────────────────────────────────────
 TZ = ZoneInfo("Europe/London")
@@ -14,28 +18,43 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+DEBUG: bool = os.environ.get("DEBUG", "0") == "1"
+if DEBUG:
+    log.setLevel(logging.DEBUG)
+    log.debug("[CONFIG] Debug mode enabled")
+
+# ─── GENERAL SETTINGS ────────────────────────────────────────────────────────
+MAX_ACCOUNTS: int = int(os.environ.get("MAX_ACCOUNTS", "5"))
+COOKIE_FRESH_HOURS: int = int(os.environ.get("COOKIE_FRESH_HOURS", "12"))
+
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID = os.environ.get("CHAT_ID", "1027065157")
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
+BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
+CHAT_ID: str = os.environ.get("CHAT_ID", "1027065157")
+TELEGRAM_API: str = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
 # ─── PROXY ───────────────────────────────────────────────────────────────────
-DECODO_USER = os.environ.get("DECODO_USER", "")
-DECODO_PASS = os.environ.get("DECODO_PASS", "")
-DECODO_HOST = os.environ.get("DECODO_HOST", "gb.decodo.com")
-DECODO_PORT = os.environ.get("DECODO_PORT", "30004")
+DECODO_USER: str = os.environ.get("DECODO_USER", "")
+DECODO_PASS: str = os.environ.get("DECODO_PASS", "")
+DECODO_HOST: str = os.environ.get("DECODO_HOST", "gb.decodo.com")
+DECODO_PORT: str = os.environ.get("DECODO_PORT", "30004")
+
+PROXY_POOL: List[str] = [
+    p.strip()
+    for p in os.environ.get("PROXY_POOL", "").split(",")
+    if p.strip()
+]
 
 # ─── AMAZON ──────────────────────────────────────────────────────────────────
-AMAZON_EMAIL = os.environ.get("AMAZON_EMAIL", "")
-AMAZON_PIN = os.environ.get("AMAZON_PIN", "")
+AMAZON_EMAIL: str = os.environ.get("AMAZON_EMAIL", "")
+AMAZON_PIN: str = os.environ.get("AMAZON_PIN", "")
 
 # ─── STORAGE ─────────────────────────────────────────────────────────────────
-DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.exists("/data") else "/tmp")
+DATA_DIR: str = os.environ.get("DATA_DIR", "/data" if os.path.exists("/data") else "/tmp")
 os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "owner_bot.db")
+DB_PATH: str = os.path.join(DATA_DIR, "owner_bot.db")
 
 # ─── JOB FILTERS ─────────────────────────────────────────────────────────────
-WAREHOUSE_KEYWORDS = [
+WAREHOUSE_KEYWORDS: List[str] = [
     "warehouse", "fulfillment", "fulfilment", "sortation", "sort centre", "sort center",
     "delivery station", "fc associate", "warehouse operative", "warehouse associate",
     "sortation operative", "fulfillment associate", "fulfilment associate",
@@ -44,15 +63,24 @@ WAREHOUSE_KEYWORDS = [
     "amazon associate", "operations associate",
 ]
 
-BLOCKED_KEYWORDS = [
+BLOCKED_KEYWORDS: List[str] = [
     "customer service", "software", "engineer", "manager", "corporate", "marketing",
     " hr ", "finance", "recruiter", "sales", "vcc", "loss prevention",
     "learning ambassador", "data entry", "legal", "it support", "business analyst",
 ]
 
-FRESH_KEYWORDS = ["amazon fresh", "whole foods", "fresh grocery"]
+FRESH_KEYWORDS: List[str] = [
+    "amazon fresh",
+    "whole foods",
+    "fresh grocery",
+]
 
-CITY_POSTCODES = {
+JOB_TYPES: Dict[str, List[str]] = {
+    "warehouse": WAREHOUSE_KEYWORDS,
+    "fresh": FRESH_KEYWORDS,
+}
+
+CITY_POSTCODES: Dict[str, str] = {
     "birmingham": "B1 1BB",
     "london": "EC1A 1BB",
     "manchester": "M1 1AE",
@@ -100,7 +128,7 @@ CITY_POSTCODES = {
     "gloucester": "GL4 3HR",
 }
 
-CITY_COORDS = {
+CITY_COORDS: Dict[str, Tuple[float, float]] = {
     "B1 1BB": (52.4862, -1.8904),
     "EC1A 1BB": (51.5200, -0.0990),
     "M1 1AE": (53.4808, -2.2426),
@@ -148,28 +176,67 @@ CITY_COORDS = {
     "GL4 3HR": (51.8585, -2.2180),
 }
 
-# ─── SAFETY CHECK ────────────────────────────────────────────────────────────
 missing_coords = [
-    postcode for postcode in CITY_POSTCODES.values()
+    postcode
+    for postcode in CITY_POSTCODES.values()
     if postcode not in CITY_COORDS
 ]
 
 if missing_coords:
-    log.warning(f"Missing coordinates for postcodes: {missing_coords}")
+    log.warning("[CONFIG] Missing coordinates for postcodes: %s", missing_coords)
 
 
-# ─── HELPERS ─────────────────────────────────────────────────────────────────
-def get_proxy_url():
+@dataclass
+class AmazonAccount:
+    id: int
+    email: str
+    pin: str
+    cookies: str
+    session: List[Any]
+    logged_in: bool = False
+    priority: int = 1
+    cookie_timestamp: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def now_london() -> datetime:
+    return datetime.now(TZ)
+
+
+def cookie_is_fresh(cookie_ts: Optional[str]) -> bool:
+    if not cookie_ts:
+        return False
+
+    try:
+        ts = datetime.fromisoformat(cookie_ts)
+
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=TZ)
+
+        age_hours = (now_london() - ts).total_seconds() / 3600
+        return age_hours < COOKIE_FRESH_HOURS
+
+    except Exception as e:
+        if DEBUG:
+            log.debug("[COOKIE_TS_INVALID] %s", e)
+        return False
+
+
+def get_proxy_url() -> Optional[str]:
+    if PROXY_POOL:
+        return random.choice(PROXY_POOL)
+
     if DECODO_USER and DECODO_PASS:
         password = quote(DECODO_PASS, safe="")
         return f"http://{DECODO_USER}:{password}@{DECODO_HOST}:{DECODO_PORT}"
+
     return None
 
 
-def is_peak_time():
-    from datetime import datetime
-
-    now = datetime.now(TZ)
+def is_peak_time() -> bool:
+    now = now_london()
     h, m = now.hour, now.minute
 
     morning_peak = (h == 10 and m >= 55) or (h == 11 and m <= 25)
@@ -178,32 +245,77 @@ def is_peak_time():
     return morning_peak or evening_peak
 
 
-def now_london():
-    from datetime import datetime
-    return datetime.now(TZ)
+def next_peak_window() -> str:
+    return "10:55–11:25 or 22:55–23:25 (London time)"
 
 
-def load_accounts():
-    accounts = []
+def validate_env() -> None:
+    if not BOT_TOKEN:
+        log.warning("[ENV] BOT_TOKEN missing — Telegram disabled")
 
-    for i in range(1, 6):
+    if not TELEGRAM_API:
+        log.warning("[ENV] TELEGRAM_API unavailable")
+
+    if not CHAT_ID:
+        log.warning("[ENV] CHAT_ID missing — owner chat not set")
+
+    if not AMAZON_EMAIL and not os.environ.get("AMAZON_COOKIES"):
+        log.warning("[ENV] No Amazon email or global cookies provided")
+
+    if not get_proxy_url():
+        log.warning("[ENV] No proxy configured")
+
+
+def load_accounts() -> List[Dict[str, Any]]:
+    accounts: List[AmazonAccount] = []
+
+    for i in range(1, MAX_ACCOUNTS + 1):
         email = os.environ.get(f"AMAZON_EMAIL_{i}", "")
         pin = os.environ.get(f"AMAZON_PIN_{i}", "")
         cookies = os.environ.get(f"AMAZON_COOKIES_{i}", "")
+        cookie_ts = os.environ.get(f"AMAZON_COOKIES_{i}_TS", "")
+        priority_str = os.environ.get(f"AMAZON_PRIORITY_{i}", "")
 
         if i == 1:
             email = email or AMAZON_EMAIL
             pin = pin or AMAZON_PIN
             cookies = cookies or os.environ.get("AMAZON_COOKIES", "")
+            cookie_ts = cookie_ts or os.environ.get("AMAZON_COOKIES_TS", "")
 
-        if email or cookies:
-            accounts.append({
-                "id": i,
-                "email": email,
-                "pin": pin,
-                "cookies": cookies,
-                "session": [],
-                "logged_in": False,
-            })
+        if not (email or cookies):
+            continue
 
-    return accounts
+        try:
+            priority = int(priority_str) if priority_str else i
+        except ValueError:
+            priority = i
+
+        account = AmazonAccount(
+            id=i,
+            email=email,
+            pin=pin,
+            cookies=cookies,
+            session=[],
+            logged_in=False,
+            priority=priority,
+            cookie_timestamp=cookie_ts or None,
+        )
+
+        accounts.append(account)
+
+    accounts.sort(key=lambda account: account.priority)
+
+    if DEBUG:
+        for account in accounts:
+            log.debug(
+                "[ACCOUNT] id=%s email=%s priority=%s fresh_cookies=%s",
+                account.id,
+                account.email or "(cookies-only)",
+                account.priority,
+                cookie_is_fresh(account.cookie_timestamp),
+            )
+
+    return [account.as_dict() for account in accounts]
+
+
+validate_env()
