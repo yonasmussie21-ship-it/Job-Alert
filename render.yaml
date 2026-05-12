@@ -4,6 +4,8 @@ services:
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
+    autoDeploy: true
+    healthCheckPath: /health
     envVars:
       - key: EMAIL_FROM
         value: YOUR_GMAIL@gmail.com
@@ -13,3 +15,7 @@ services:
         value: YOUR_GMAIL_APP_PASSWORD
       - key: CHECK_EVERY
         value: 300
+    disk:
+      name: job-data
+      mountPath: /data
+      sizeGB: 1
