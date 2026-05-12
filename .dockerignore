@@ -1,0 +1,76 @@
+# ─── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+*.dist-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Environment / Secrets ──────────────────────────────────────────
+.env
+.env.*
+*.env
+secrets.json
+secrets.yaml
+
+# ─── Git ────────────────────────────────────────────────────────────
+.git
+.gitignore
+.gitattributes
+
+# ─── Data & Logs ────────────────────────────────────────────────────
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+
+# ─── Bot Runtime / Debug Files ──────────────────────────────────────
+capture_log.json
+amazon_cookies.json
+*.har
+*.json.bak
+
+# ─── Archives ───────────────────────────────────────────────────────
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# ─── Testing / CI ───────────────────────────────────────────────────
+tests/
+*_test.py
+test_*.py
+.github/
+.circleci/
+
+# ─── Documentation ──────────────────────────────────────────────────
+docs/
+*.md
+!README.md
+
+# ─── OS Junk ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+
+# ─── Editor Junk ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.orig
+
+# ─── Old / Unused Files (only if truly unused) ──────────────────────
+bot.py
+index.html
+render.yaml
+capture.py
