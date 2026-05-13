@@ -24,7 +24,12 @@ require_root() {
 install_packages() {
   log "Updating system and installing dependencies..."
   apt update
-  apt install -y "${PYTHON_BIN}" python3-venv python3-pip git rsync ca-certificates
+  apt install -y "${PYTHON_BIN}" python3-venv python3-pip git rsync ca-certificates curl iptables-persistent
+
+  log "Opening firewall ports..."
+  iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+  iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+  netfilter-persistent save 2>/dev/null || true
 }
 
 create_user() {
@@ -46,7 +51,12 @@ setup_app_dir() {
 copy_app_files() {
   log "Copying application files into ${APP_DIR}..."
 
-  rsync -av \
+  if git -C . rev-parse --git-dir > /dev/null 2>&1; then
+    log "Pulling latest code from git..."
+    git -C . pull origin main || true
+  fi
+
+  rsync -av --delete \
     --exclude '.git' \
     --exclude 'venv' \
     --exclude '.venv' \
@@ -63,6 +73,9 @@ copy_app_files() {
     ./ "${APP_DIR}/"
 
   chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+
+  echo "DEPLOYED_AT=$(date -Iseconds)" > "${APP_DIR}/.deploy-meta"
+  chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.deploy-meta"
 }
 
 create_venv() {
@@ -85,6 +98,15 @@ install_requirements() {
   else
     log "No requirements.txt found, skipping dependency install."
   fi
+}
+
+install_playwright() {
+  log "Installing Playwright dependencies and browsers..."
+  sudo -u "${APP_USER}" bash -lc "
+    source '${VENV_DIR}/bin/activate'
+    python -m playwright install-deps chromium
+    python -m playwright install chromium
+  "
 }
 
 create_env_file() {
@@ -138,6 +160,7 @@ Type=simple
 User=${APP_USER}
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=${ENV_FILE}
+ExecStartPre=/usr/bin/test -s ${ENV_FILE}
 ExecStart=${VENV_DIR}/bin/python ${APP_DIR}/main.py
 Restart=always
 RestartSec=10
@@ -145,6 +168,10 @@ KillSignal=SIGINT
 TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -176,7 +203,20 @@ start_or_wait() {
 
   log "Restarting ${APP_NAME} service..."
   systemctl restart "${APP_NAME}.service"
-  sleep 2
+  sleep 3
+
+  BOT_TOKEN=$(grep -E '^BOT_TOKEN=' "${ENV_FILE}" | cut -d= -f2- || true)
+  CHAT_ID=$(grep -E '^CHAT_ID=' "${ENV_FILE}" | cut -d= -f2- || true)
+
+  if [[ -n "${BOT_TOKEN}" && -n "${CHAT_ID}" ]]; then
+    curl -s "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+      -d chat_id="${CHAT_ID}" \
+      -d text="✅ Amazon Bot deployed and running on Oracle London" > /dev/null || true
+    log "Telegram health check sent."
+  else
+    log "Telegram health check skipped (BOT_TOKEN or CHAT_ID missing)."
+  fi
+
   systemctl status "${APP_NAME}.service" --no-pager || true
 }
 
@@ -206,6 +246,7 @@ main() {
   copy_app_files
   create_venv
   install_requirements
+  install_playwright
   create_env_file
   create_systemd_service
   clean_old_logs
