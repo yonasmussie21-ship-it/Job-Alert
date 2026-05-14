@@ -1,257 +1,160 @@
 #!/bin/bash
 set -euo pipefail
 
-APP_USER="amazonbot"
 APP_NAME="amazon-bot"
-APP_DIR="/opt/${APP_NAME}"
-PYTHON_BIN="python3"
-SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
-ENV_FILE="${APP_DIR}/.env"
-VENV_DIR="${APP_DIR}/venv"
-ENV_CREATED=0
+APP_USER="amazonbot"
 
-log() {
-  echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
-}
+BASE_DIR="/opt/${APP_NAME}"
+RELEASES_DIR="${BASE_DIR}/releases"
+CURRENT_LINK="${BASE_DIR}/current"
+SHARED_DIR="${BASE_DIR}/shared"
+
+ENV_FILE="${BASE_DIR}/.env"
+SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
+
+PYTHON_BIN="python3"
+
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+NEW_RELEASE="${RELEASES_DIR}/${TIMESTAMP}"
+VENV_DIR="${NEW_RELEASE}/venv"
+
+log() { echo "[$(date +'%F %T')] $*"; }
+fail() { echo "❌ $*" >&2; exit 1; }
 
 require_root() {
-  if [[ "$(id -u)" -ne 0 ]]; then
-    echo "This script must be run as root: sudo ./oracle-setup.sh" >&2
-    exit 1
-  fi
+  [[ "$(id -u)" -eq 0 ]] || fail "Run as root"
 }
 
 install_packages() {
-  log "Updating system and installing dependencies..."
   apt update
-  apt install -y "${PYTHON_BIN}" python3-venv python3-pip git rsync ca-certificates curl iptables-persistent
-
-  log "Opening firewall ports..."
-  iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-  iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-  netfilter-persistent save 2>/dev/null || true
+  apt install -y python3 python3-venv python3-pip rsync curl git
 }
 
-create_user() {
-  if id "${APP_USER}" &>/dev/null; then
-    log "User ${APP_USER} already exists."
-  else
-    log "Creating service user ${APP_USER}..."
-    useradd -r -m -d "${APP_DIR}" -s /usr/sbin/nologin "${APP_USER}"
+ensure_user() {
+  id "${APP_USER}" &>/dev/null || \
+  useradd -r -m -d "${BASE_DIR}" -s /usr/sbin/nologin "${APP_USER}"
+}
+
+ensure_dirs() {
+  mkdir -p "${RELEASES_DIR}" "${SHARED_DIR}/data"
+  chown -R "${APP_USER}:${APP_USER}" "${BASE_DIR}"
+}
+
+ensure_env() {
+  if [[ ! -f "${ENV_FILE}" ]]; then
+    cat > "${ENV_FILE}" <<EOF
+BOT_TOKEN=
+CHAT_ID=
+DATA_DIR=${SHARED_DIR}/data
+EOF
+    chmod 600 "${ENV_FILE}"
+    chown "${APP_USER}:${APP_USER}" "${ENV_FILE}"
+    fail "Fill .env then rerun"
   fi
 }
 
-setup_app_dir() {
-  log "Preparing app directory: ${APP_DIR}"
-  mkdir -p "${APP_DIR}"
-  mkdir -p "${APP_DIR}/data"
-  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
-}
+copy_code() {
+  cd /opt/amazon-bot-src
+  git fetch origin
+  git reset --hard origin/main
 
-copy_app_files() {
-  log "Copying application files into ${APP_DIR}..."
+  mkdir -p "${NEW_RELEASE}"
 
-  if git -C . rev-parse --git-dir > /dev/null 2>&1; then
-    log "Pulling latest code from git..."
-    git -C . pull origin main || true
-  fi
-
-  rsync -av --delete \
+  rsync -a --delete \
     --exclude '.git' \
     --exclude 'venv' \
-    --exclude '.venv' \
     --exclude '__pycache__' \
-    --exclude '*.pyc' \
-    --exclude '.env' \
-    --exclude '*.db' \
-    --exclude '*.sqlite' \
-    --exclude '*.sqlite3' \
-    --exclude '*.log' \
-    --exclude 'data/' \
-    --exclude '/data/' \
-    --exclude 'ssh-key-*.key' \
-    ./ "${APP_DIR}/"
+    ./ "${NEW_RELEASE}/"
 
-  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+  git rev-parse HEAD > "${NEW_RELEASE}/.commit"
 
-  echo "DEPLOYED_AT=$(date -Iseconds)" > "${APP_DIR}/.deploy-meta"
-  chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.deploy-meta"
+  chown -R "${APP_USER}:${APP_USER}" "${NEW_RELEASE}"
 }
 
-create_venv() {
-  if [[ ! -d "${VENV_DIR}" ]]; then
-    log "Creating virtual environment..."
-    sudo -u "${APP_USER}" "${PYTHON_BIN}" -m venv "${VENV_DIR}"
-  else
-    log "Virtual environment already exists."
-  fi
-}
+setup_venv() {
+  sudo -u "${APP_USER}" python3 -m venv "${VENV_DIR}"
 
-install_requirements() {
-  if [[ -f "${APP_DIR}/requirements.txt" ]]; then
-    log "Installing Python dependencies..."
-    sudo -u "${APP_USER}" bash -lc "
-      source '${VENV_DIR}/bin/activate'
-      python -m pip install --upgrade pip
-      python -m pip install -r '${APP_DIR}/requirements.txt'
-    "
-  else
-    log "No requirements.txt found, skipping dependency install."
-  fi
-}
-
-install_playwright() {
-  log "Installing Playwright dependencies and browsers..."
   sudo -u "${APP_USER}" bash -lc "
     source '${VENV_DIR}/bin/activate'
-    python -m playwright install-deps chromium
-    python -m playwright install chromium
+    pip install --upgrade pip
+    pip install --no-cache-dir -r '${NEW_RELEASE}/requirements.txt'
   "
 }
 
-create_env_file() {
-  if [[ ! -f "${ENV_FILE}" ]]; then
-    ENV_CREATED=1
-    log "Creating .env file at ${ENV_FILE}..."
-
-    cat > "${ENV_FILE}" <<EOF
-# Environment variables for ${APP_NAME}
-
-BOT_TOKEN=
-CHAT_ID=
-
-AMAZON_EMAIL=
-AMAZON_PIN=
-AMAZON_COOKIES=
-
-DECODO_USER=
-DECODO_PASS=
-DECODO_HOST=gb.decodo.com
-DECODO_PORT=30004
-PROXY_POOL=
-
-DATA_DIR=${APP_DIR}/data
-DEBUG=0
-MAX_ACCOUNTS=5
-COOKIE_FRESH_HOURS=12
-ENABLE_FULL_SUBMIT=false
-EOF
-
-    chown "${APP_USER}:${APP_USER}" "${ENV_FILE}"
-    chmod 600 "${ENV_FILE}"
-  else
-    log ".env file already exists."
+install_playwright() {
+  if [[ ! -f "${BASE_DIR}/.playwright-installed" ]]; then
+    sudo -u "${APP_USER}" bash -lc "
+      source '${VENV_DIR}/bin/activate'
+      python -m playwright install chromium
+    "
+    touch "${BASE_DIR}/.playwright-installed"
   fi
 }
 
-create_systemd_service() {
-  log "Creating/updating systemd service: ${SERVICE_FILE}"
-
+ensure_service() {
   cat > "${SERVICE_FILE}" <<EOF
 [Unit]
-Description=Amazon Job Bot
-Wants=network-online.target
-After=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=10
+Description=Amazon Bot
+After=network.target
 
 [Service]
-Type=simple
 User=${APP_USER}
-WorkingDirectory=${APP_DIR}
+WorkingDirectory=${CURRENT_LINK}
 EnvironmentFile=${ENV_FILE}
-ExecStartPre=/usr/bin/test -s ${ENV_FILE}
-ExecStart=${VENV_DIR}/bin/python ${APP_DIR}/main.py
+
+ExecStartPre=/usr/bin/test -f ${CURRENT_LINK}/main.py
+
+ExecStart=${CURRENT_LINK}/venv/bin/python ${CURRENT_LINK}/main.py
+
 Restart=always
-RestartSec=10
-KillSignal=SIGINT
-TimeoutStopSec=30
-StandardOutput=journal
-StandardError=journal
-ProtectSystem=full
-ProtectHome=true
+RestartSec=5
+LimitNOFILE=65535
+
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=${BASE_DIR}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable "${APP_NAME}.service"
+  systemctl enable "${APP_NAME}"
 }
 
-clean_old_logs() {
-  log "Cleaning old journal logs..."
-  journalctl --vacuum-time=7d || true
+switch_release() {
+  ln -sfn "${NEW_RELEASE}" "${CURRENT_LINK}"
+  chown -h "${APP_USER}:${APP_USER}" "${CURRENT_LINK}"
 }
 
-start_or_wait() {
-  if [[ "${ENV_CREATED}" -eq 1 ]]; then
-    log "Service not started because .env was just created."
-    echo
-    echo "Edit your secrets first:"
-    echo "  sudo nano ${ENV_FILE}"
-    echo
-    echo "Then start the bot:"
-    echo "  sudo systemctl restart ${APP_NAME}.service"
-    echo
-    echo "View logs:"
-    echo "  sudo journalctl -u ${APP_NAME}.service -f"
-    return
-  fi
-
-  log "Restarting ${APP_NAME} service..."
-  systemctl restart "${APP_NAME}.service"
-  sleep 3
-
-  BOT_TOKEN=$(grep -E '^BOT_TOKEN=' "${ENV_FILE}" | cut -d= -f2- || true)
-  CHAT_ID=$(grep -E '^CHAT_ID=' "${ENV_FILE}" | cut -d= -f2- || true)
-
-  if [[ -n "${BOT_TOKEN}" && -n "${CHAT_ID}" ]]; then
-    curl -s "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-      -d chat_id="${CHAT_ID}" \
-      -d text="✅ Amazon Bot deployed and running on Oracle London" > /dev/null || true
-    log "Telegram health check sent."
-  else
-    log "Telegram health check skipped (BOT_TOKEN or CHAT_ID missing)."
-  fi
-
-  systemctl status "${APP_NAME}.service" --no-pager || true
+restart_service() {
+  systemctl restart "${APP_NAME}"
+  sleep 2
 }
 
-print_commands() {
-  echo
-  echo "✅ Setup complete."
-  echo
-  echo "Useful commands:"
-  echo "  Edit env: sudo nano ${ENV_FILE}"
-  echo "  Start:    sudo systemctl start ${APP_NAME}.service"
-  echo "  Stop:     sudo systemctl stop ${APP_NAME}.service"
-  echo "  Restart:  sudo systemctl restart ${APP_NAME}.service"
-  echo "  Status:   sudo systemctl status ${APP_NAME}.service"
-  echo "  Logs:     sudo journalctl -u ${APP_NAME}.service -f"
-  echo
-  echo "To redeploy after changing files:"
-  echo "  cd <your-repo-folder>"
-  echo "  sudo ./oracle-setup.sh"
-  echo
+cleanup() {
+  find "${RELEASES_DIR}" -mindepth 1 -maxdepth 1 -type d \
+    | sort -r | tail -n +4 | xargs -r rm -rf
 }
 
 main() {
   require_root
   install_packages
-  create_user
-  setup_app_dir
-  copy_app_files
-  create_venv
-  install_requirements
+  ensure_user
+  ensure_dirs
+  ensure_env
+
+  copy_code
+  setup_venv
   install_playwright
-  create_env_file
-  create_systemd_service
-  clean_old_logs
-  start_or_wait
-  print_commands
+
+  ensure_service
+  switch_release
+  restart_service
+  cleanup
+
+  log "✅ Deploy complete"
 }
 
 main "$@"
