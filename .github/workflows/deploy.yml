@@ -28,19 +28,18 @@ jobs:
 
           ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Verify SSH connection
+      - name: Test SSH connection
         run: |
-          ssh -o BatchMode=yes \
+          ssh -o StrictHostKeyChecking=no \
               ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
-              "echo 'SSH connection successful'"
+              "echo '✅ SSH connected'"
 
-      - name: Deploy application
+      - name: Deploy to server
         run: |
-          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << EOF
             set -euxo pipefail
 
-            echo "Starting deployment..."
+            echo "🚀 Starting deployment..."
 
             cd /home/ubuntu/Job-Alert/repo
 
@@ -51,15 +50,13 @@ jobs:
             chmod +x deploy.sh
             ./deploy.sh
 
-            echo "Deployment complete"
-
+            echo "✅ Deployment complete"
           EOF
 
-      - name: Deployment Summary
+      - name: Success message
         if: success()
-        run: echo "✅ Deployment completed successfully"
+        run: echo "✅ Deployment finished successfully"
 
-      - name: Failure Summary
+      - name: Failure message
         if: failure()
         run: echo "❌ Deployment failed"
-``
