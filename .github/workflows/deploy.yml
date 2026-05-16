@@ -1,0 +1,65 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Production Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Verify SSH connection
+        run: |
+          ssh -o BatchMode=yes \
+              ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
+              "echo 'SSH connection successful'"
+
+      - name: Deploy application
+        run: |
+          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+
+            set -euxo pipefail
+
+            echo "Starting deployment..."
+
+            cd /home/ubuntu/Job-Alert/repo
+
+            git fetch origin main
+            git reset --hard origin/main
+            git clean -fd
+
+            chmod +x deploy.sh
+            ./deploy.sh
+
+            echo "Deployment complete"
+
+          EOF
+
+      - name: Deployment Summary
+        if: success()
+        run: echo "✅ Deployment completed successfully"
+
+      - name: Failure Summary
+        if: failure()
+        run: echo "❌ Deployment failed"
+``
