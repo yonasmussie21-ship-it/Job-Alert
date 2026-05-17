@@ -1,5 +1,5 @@
-sudo tee /opt/amazon-bot/current/main.py << 'MAINEOF'
-import asyncio
+sudo python3 << 'PYEOF'
+code = '''import asyncio
 import logging
 import signal
 import sys
@@ -62,7 +62,11 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def run_health_server() -> HTTPServer:
     server = HTTPServer((HOST, PORT), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True, name="health-server")
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+        name="health-server",
+    )
     thread.start()
     log.info("[HEALTH] server started on %s:%s", HOST, PORT)
     return server
@@ -95,6 +99,7 @@ def ensure_owner_subscriber() -> Dict[str, Any]:
 
 def install_signal_handlers(shutdown_event: asyncio.Event) -> None:
     loop = asyncio.get_running_loop()
+
     def shutdown(sig_name: str) -> None:
         if shutdown_event.is_set():
             return
@@ -102,15 +107,22 @@ def install_signal_handlers(shutdown_event: asyncio.Event) -> None:
         health_state["ready"] = False
         health_state["shutting_down"] = True
         shutdown_event.set()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, shutdown, sig.name)
 
 
-def create_task(tasks, shutdown_event, coro, name):
+def create_task(
+    tasks: List[asyncio.Task],
+    shutdown_event: asyncio.Event,
+    coro,
+    name: str,
+) -> asyncio.Task:
     task = asyncio.create_task(coro, name=name)
-    def done(t):
-        if t.cancelled():
+
+    def done(t: asyncio.Task) -> None:
+        if not t.done() or t.cancelled():
             return
         exc = t.exception()
         if exc:
@@ -118,12 +130,13 @@ def create_task(tasks, shutdown_event, coro, name):
             health_state["critical_tasks_alive"] = False
             health_state["ready"] = False
             shutdown_event.set()
+
     task.add_done_callback(done)
     tasks.append(task)
     return task
 
 
-async def shutdown_tasks(tasks) -> None:
+async def shutdown_tasks(tasks: List[asyncio.Task]) -> None:
     if not tasks:
         return
     log.info("[SHUTDOWN] cancelling %s tasks", len(tasks))
@@ -156,16 +169,18 @@ async def main() -> int:
 
     log.info(
         "[STARTUP] accounts=%s subscribers=%s known_jobs=%s",
-        len(accounts), len(subscribers), len(state["known_jobs"]),
+        len(accounts),
+        len(subscribers),
+        len(state["known_jobs"]),
     )
 
     await safe_tg_send(
-        f"👑 <b>Amazon Bot Online</b>\n"
-        f"━━━━━━━━━━━━━━━━━\n"
-        f"👥 Subscribers: {len(subscribers)}\n"
-        f"🤖 Accounts: {len(accounts)}\n"
-        f"📦 Known jobs: {len(state['known_jobs'])}\n"
-        f"━━━━━━━━━━━━━━━━━"
+        "\\U0001f451 <b>Amazon Bot Online</b>\\n"
+        "\\u2501\\u2501\\u2501\\u2501\\u2501\\u2501\\u2501\\u2501\\u2501\\n"
+        f"\\U0001f465 Subscribers: {len(subscribers)}\\n"
+        f"\\U0001f916 Accounts: {len(accounts)}\\n"
+        f"\\U0001f4e6 Known jobs: {len(state[\\x27known_jobs\\x27])}\\n"
+        "\\u2501\\u2501\\u2501\\u2501\\u2501\\u2501\\u2501\\u2501\\u2501"
     )
 
     tasks: List[asyncio.Task] = []
@@ -190,7 +205,7 @@ async def main() -> int:
     with suppress(Exception):
         await close_session()
 
-    await safe_tg_send("🛑 Bot shutting down")
+    await safe_tg_send("Bot shutting down")
     log.info("[SHUTDOWN] complete")
     return 0 if health_state["critical_tasks_alive"] else 1
 
@@ -213,4 +228,9 @@ if __name__ == "__main__":
         with suppress(Exception):
             server.server_close()
     sys.exit(exit_code)
-MAINEOF
+'''
+
+with open("/opt/amazon-bot/current/main.py", "w") as f:
+    f.write(code)
+print("Written", len(code.splitlines()), "lines")
+PYEOF
