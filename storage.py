@@ -1,76 +1,52 @@
-import asyncio
 import aiosqlite
-from config import DB_PATH, log
+from typing import List, Tuple
 
-CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS jobs (
-    id TEXT PRIMARY KEY,
-    title TEXT,
-    location TEXT,
-    url TEXT,
-    seen INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"""
+DB_PATH = "jobs.db"
 
 
-class Storage:
-    def __init__(self, db_path=DB_PATH):
-        self.db_path = db_path
-        self._lock = asyncio.Lock()
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            location TEXT,
+            url TEXT
+        )
+        """)
+        await db.commit()
 
-    async def init(self):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(CREATE_TABLE_SQL)
-            await db.commit()
-        log.info("✅ Database initialized")
 
-    async def save_job(self, job: dict) -> bool:
-        """
-        Save job if not exists.
-        Returns True if inserted, False if duplicate.
-        """
-        async with self._lock:
-            async with aiosqlite.connect(self.db_path) as db:
-                try:
-                    await db.execute(
-                        "INSERT INTO jobs (id, title, location, url) VALUES (?, ?, ?, ?)",
-                        (
-                            job.get("id"),
-                            job.get("title"),
-                            job.get("location"),
-                            job.get("url"),
-                        ),
-                    )
-                    await db.commit()
-                    return True
-                except Exception:
-                    return False
+async def job_exists(job_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM jobs WHERE id = ?",
+            (job_id,)
+        )
+        row = await cursor.fetchone()
+        return row is not None
 
-    async def get_new_jobs(self):
-        """
-        Get jobs not yet sent to Telegram
-        """
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT id, title, location, url FROM jobs WHERE seen = 0"
-            )
-            rows = await cursor.fetchall()
-            return rows
 
-    async def mark_seen(self, job_id: str):
-        """
-        Mark job as sent
-        """
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE jobs SET seen = 1 WHERE id = ?",
-                (job_id,),
-            )
-            await db.commit()
+async def save_job(job_id: str, title: str, location: str, url: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO jobs (id, title, location, url) VALUES (?, ?, ?, ?)",
+            (job_id, title, location, url)
+        )
+        await db.commit()
 
-    async def count_jobs(self) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("SELECT COUNT(*) FROM jobs")
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+
+async def get_all_jobs() -> List[Tuple[str, str, str, str]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT * FROM jobs")
+        return await cursor.fetchall()
+
+
+# ✅ SAFE DEBUG HELPER (optional)
+async def debug_print_jobs():
+    try:
+        jobs = await get_all_jobs()
+        print(f"✅ Total jobs stored: {len(jobs)}")
+    except Exception as e:
+        print(f"❌ DB debug error: {e}")
+``
