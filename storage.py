@@ -39,14 +39,13 @@ async def save_job(job_id: str, title: str, location: str, url: str):
 async def get_all_jobs() -> List[Tuple[str, str, str, str]]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT * FROM jobs")
-        return await cursor.fetchall()
+        rows = await cursor.fetchall()
+        return rows
 
 
-# ✅ SAFE DEBUG HELPER (optional)
 async def debug_print_jobs():
     try:
         jobs = await get_all_jobs()
         print(f"✅ Total jobs stored: {len(jobs)}")
     except Exception as e:
-        print(f"❌ DB debug error: {e}")
-``
+        print(f"❌ Error reading DB: {e}")
