@@ -1,9 +1,10 @@
 import asyncio
 import json
-import os
 import logging
-from dataclasses import dataclass
-from typing import Optional, Any, Dict
+import os
+import uuid
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, Optional
 
 import aiohttp
 
@@ -20,6 +21,7 @@ CSRF_URL = "https://www.jobsatamazon.co.uk/authorize/api/csrf?countryCode=UK"
 GRAPHQL_URL = "https://www.jobsatamazon.co.uk/graphql"
 
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 
 @dataclass
@@ -41,11 +43,22 @@ class PrepareResult:
 
 
 def _is_full_submit_enabled() -> bool:
-    return os.environ.get("ENABLE_FULL_SUBMIT", "false").lower() == "true"
+    return (
+        os.environ.get("ENABLE_FULL_SUBMIT", "false").lower() == "true"
+        and os.environ.get("CONFIRM_FULL_SUBMIT", "") == "I_UNDERSTAND"
+    )
 
 
-def _extract_auth(cookies: list) -> dict:
-    auth = {}
+def _safe_json_loads(raw: str, label: str) -> Optional[Any]:
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        log.warning("[%s_JSON_FAILED] %s", label, e)
+        return None
+
+
+def _extract_auth(cookies: list) -> Dict[str, str]:
+    auth: Dict[str, str] = {}
 
     for c in cookies:
         name = c.get("name", "")
@@ -61,17 +74,24 @@ def _extract_auth(cookies: list) -> dict:
     return auth
 
 
-def _build_headers(cookies: list, auth: dict, job_id: str = "") -> dict:
-    cookie_str = "; ".join(
+def _build_cookie_header(cookies: list) -> str:
+    return "; ".join(
         f"{c.get('name')}={c.get('value')}"
         for c in cookies
         if c.get("name") and c.get("value")
     )
 
-    return {
+
+def _build_headers(
+    cookies: list,
+    auth: Dict[str, str],
+    job_id: str = "",
+    request_id: str = "",
+) -> Dict[str, str]:
+    headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "cookie": cookie_str,
+        "cookie": _build_cookie_header(cookies),
         "authorization": auth.get("token", ""),
         "bb-ui-version": "bb-ui-v2",
         "user-agent": (
@@ -83,34 +103,36 @@ def _build_headers(cookies: list, auth: dict, job_id: str = "") -> dict:
         "referer": f"https://www.jobsatamazon.co.uk/application/uk/?jobId={job_id}",
     }
 
+    if request_id:
+        headers["x-client-request-id"] = request_id
 
-def _load_account_cookies(account: dict) -> StepResult:
+    return headers
+
+
+def _load_account_cookies(account: Dict[str, Any]) -> StepResult:
     acc_id = account.get("id", ACCOUNT_ID)
 
     if account.get("cookies"):
-        try:
-            cookies = json.loads(account["cookies"])
-            log.info(f"[COOKIES_LOADED] {len(cookies)} from account {acc_id} env")
+        cookies = _safe_json_loads(account["cookies"], f"ACCOUNT_{acc_id}_COOKIES")
+        if isinstance(cookies, list):
+            log.info("[COOKIES_LOADED] account=%s source=account_env count=%s", acc_id, len(cookies))
             return StepResult(ok=True, data=cookies)
-        except Exception as e:
-            log.warning(f"[COOKIES_PARSE_FAILED] account={acc_id}: {e}")
 
     cookies = load_cookies(acc_id)
+
     if cookies:
-        log.info(f"[COOKIES_LOADED] {len(cookies)} from DB account={acc_id}")
+        log.info("[COOKIES_LOADED] account=%s source=storage count=%s", acc_id, len(cookies))
         return StepResult(ok=True, data=cookies)
 
     if acc_id == 1:
-        global_cookies = os.environ.get("AMAZON_COOKIES", "")
-        if global_cookies:
-            try:
-                cookies = json.loads(global_cookies)
-                log.info(f"[COOKIES_LOADED] {len(cookies)} from global env fallback")
+        raw = os.environ.get("AMAZON_COOKIES", "")
+        if raw:
+            cookies = _safe_json_loads(raw, "GLOBAL_COOKIES")
+            if isinstance(cookies, list):
+                log.info("[COOKIES_LOADED] account=%s source=global_env count=%s", acc_id, len(cookies))
                 return StepResult(ok=True, data=cookies)
-            except Exception as e:
-                log.warning(f"[COOKIES_GLOBAL_PARSE_FAILED] {e}")
 
-    log.warning(f"[COOKIES_NOT_FOUND] account={acc_id}")
+    log.warning("[COOKIES_NOT_FOUND] account=%s", acc_id)
     log_error("COOKIE_EXPIRED", f"account={acc_id}: no cookies")
 
     return StepResult(
@@ -122,14 +144,20 @@ def _load_account_cookies(account: dict) -> StepResult:
 
 def _validate_auth(auth: Dict[str, str], acc_id: int) -> StepResult:
     if not auth.get("token"):
-        msg = "No HVH_ACCESS_TOKEN in cookies"
-        log_error("COOKIE_EXPIRED", f"account={acc_id}: no token")
-        return StepResult(ok=False, status="cookie_expired", message=msg)
+        log_error("COOKIE_EXPIRED", f"account={acc_id}: no HVH_ACCESS_TOKEN")
+        return StepResult(
+            ok=False,
+            status="cookie_expired",
+            message="No HVH_ACCESS_TOKEN in cookies",
+        )
 
     if not auth.get("hvhcid"):
-        msg = "No hvhcid in cookies"
         log_error("COOKIE_EXPIRED", f"account={acc_id}: no hvhcid")
-        return StepResult(ok=False, status="cookie_expired", message=msg)
+        return StepResult(
+            ok=False,
+            status="cookie_expired",
+            message="No hvhcid in cookies",
+        )
 
     return StepResult(ok=True)
 
@@ -141,19 +169,13 @@ async def _request_text_with_retry(
     *,
     step: str,
     attempts: int = 3,
-    timeout: int = 15,
     **kwargs,
 ) -> StepResult:
     last_error = ""
 
     for attempt in range(1, attempts + 1):
         try:
-            async with session.request(
-                method,
-                url,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-                **kwargs,
-            ) as response:
+            async with session.request(method, url, **kwargs) as response:
                 text = await response.text()
 
                 if response.status in RETRY_STATUSES and attempt < attempts:
@@ -171,11 +193,11 @@ async def _request_text_with_retry(
                     ok=200 <= response.status < 300,
                     status=str(response.status),
                     message=text,
-                    data={
-                        "status": response.status,
-                        "text": text,
-                    },
+                    data={"status": response.status, "text": text},
                 )
+
+        except asyncio.CancelledError:
+            raise
 
         except Exception as e:
             last_error = str(e)
@@ -205,14 +227,13 @@ def _parse_json_step(text: str, step: str) -> StepResult:
         return StepResult(ok=False, message=f"{step} JSON parse failed")
 
 
-async def _get_csrf_token(session, headers: dict) -> StepResult:
+async def _get_csrf_token(session: aiohttp.ClientSession, headers: Dict[str, str]) -> StepResult:
     res = await _request_text_with_retry(
         session,
         "GET",
         CSRF_URL,
         headers=headers,
         step="CSRF",
-        timeout=10,
     )
 
     status_code = int(res.status) if res.status and res.status.isdigit() else None
@@ -227,10 +248,12 @@ async def _get_csrf_token(session, headers: dict) -> StepResult:
         return StepResult(ok=False, status="csrf_failed", message=f"CSRF failed: {res.message[:160]}")
 
     parsed = _parse_json_step(res.data["text"], "CSRF")
+
     if not parsed.ok:
         return StepResult(ok=False, status="csrf_failed", message=parsed.message)
 
     token = parsed.data.get("token", "")
+
     if not token:
         return StepResult(ok=False, status="csrf_failed", message="CSRF token missing")
 
@@ -238,7 +261,11 @@ async def _get_csrf_token(session, headers: dict) -> StepResult:
     return StepResult(ok=True, data=token)
 
 
-async def _resolve_candidate_id(session, headers: dict, hvhcid: str) -> StepResult:
+async def _resolve_candidate_id(
+    session: aiohttp.ClientSession,
+    headers: Dict[str, str],
+    hvhcid: str,
+) -> StepResult:
     payload = {
         "operationName": "queryCandidate",
         "query": """
@@ -262,7 +289,6 @@ async def _resolve_candidate_id(session, headers: dict, hvhcid: str) -> StepResu
         json=payload,
         headers=headers,
         step="CANDIDATE",
-        timeout=15,
     )
 
     if not res.ok:
@@ -270,6 +296,7 @@ async def _resolve_candidate_id(session, headers: dict, hvhcid: str) -> StepResu
         return StepResult(ok=False, message="Candidate lookup failed")
 
     parsed = _parse_json_step(res.data["text"], "CANDIDATE")
+
     if not parsed.ok:
         return StepResult(ok=False, message=parsed.message)
 
@@ -277,34 +304,31 @@ async def _resolve_candidate_id(session, headers: dict, hvhcid: str) -> StepResu
     sf_id = candidate.get("candidateSFId", "")
 
     if sf_id:
-        log.info(f"[CANDIDATE_ID_OK] {sf_id[:12]}...")
+        log.info("[CANDIDATE_ID_OK] %s...", sf_id[:12])
         return StepResult(
             ok=True,
-            data={
-                "candidate_id": sf_id,
-                "confirmed": True,
-            },
+            data={"candidate_id": sf_id, "confirmed": True},
         )
 
     log.warning("[CANDIDATE_ID_MISSING] candidateSFId not found")
 
     return StepResult(
         ok=True,
-        data={
-            "candidate_id": hvhcid,
-            "confirmed": False,
-        },
+        data={"candidate_id": hvhcid, "confirmed": False},
     )
 
 
-async def _find_existing_application(session, headers: dict, job_id: str) -> StepResult:
+async def _find_existing_application(
+    session: aiohttp.ClientSession,
+    headers: Dict[str, str],
+    job_id: str,
+) -> StepResult:
     res = await _request_text_with_retry(
         session,
         "GET",
         f"{BASE_URL}/applications?jobId={job_id}&locale=en-GB",
         headers=headers,
         step="APP_CHECK",
-        timeout=10,
     )
 
     if not res.ok:
@@ -312,22 +336,30 @@ async def _find_existing_application(session, headers: dict, job_id: str) -> Ste
         return StepResult(ok=False, message="Application check failed")
 
     parsed = _parse_json_step(res.data["text"], "APP_CHECK")
+
     if not parsed.ok:
         return StepResult(ok=False, message=parsed.message)
 
     apps = parsed.data if isinstance(parsed.data, list) else parsed.data.get("applications", [])
 
+    if not isinstance(apps, list):
+        return StepResult(ok=True, data=None)
+
     for app in apps:
         if app.get("jobId") == job_id:
             app_id = app.get("applicationId") or app.get("id")
             if app_id:
-                log.info(f"[APP_EXISTING] {app_id}")
+                log.info("[APP_EXISTING] %s", app_id)
                 return StepResult(ok=True, data=app_id)
 
     return StepResult(ok=True, data=None)
 
 
-async def _create_application(session, headers: dict, job_id: str) -> StepResult:
+async def _create_application(
+    session: aiohttp.ClientSession,
+    headers: Dict[str, str],
+    job_id: str,
+) -> StepResult:
     res = await _request_text_with_retry(
         session,
         "POST",
@@ -335,7 +367,6 @@ async def _create_application(session, headers: dict, job_id: str) -> StepResult
         json={"jobId": job_id, "locale": "en-GB"},
         headers=headers,
         step="APP_CREATE",
-        timeout=15,
     )
 
     if not res.ok:
@@ -344,6 +375,7 @@ async def _create_application(session, headers: dict, job_id: str) -> StepResult
         return StepResult(ok=False, message="Application creation failed")
 
     parsed = _parse_json_step(res.data["text"], "APP_CREATE")
+
     if not parsed.ok:
         log_error("APP_CREATE_PARSE_ERROR", res.data["text"][:200])
         return StepResult(ok=False, message="Application creation parse error")
@@ -354,11 +386,16 @@ async def _create_application(session, headers: dict, job_id: str) -> StepResult
         log_error("APP_ID_MISSING", res.data["text"][:200])
         return StepResult(ok=False, message="Application ID missing in response")
 
-    log.info(f"[APP_CREATED] {app_id}")
+    log.info("[APP_CREATED] %s", app_id)
     return StepResult(ok=True, data=app_id)
 
 
-async def _get_best_schedule(session, headers: dict, job_id: str, app_id: str) -> StepResult:
+async def _get_best_schedule(
+    session: aiohttp.ClientSession,
+    headers: Dict[str, str],
+    job_id: str,
+    app_id: str,
+) -> StepResult:
     res = await _request_text_with_retry(
         session,
         "POST",
@@ -366,7 +403,6 @@ async def _get_best_schedule(session, headers: dict, job_id: str, app_id: str) -
         json={"applicationId": app_id, "locale": "en-GB"},
         headers=headers,
         step="SCHEDULE",
-        timeout=15,
     )
 
     if not res.ok:
@@ -375,6 +411,7 @@ async def _get_best_schedule(session, headers: dict, job_id: str, app_id: str) -
         return StepResult(ok=False, status="no_schedule", message="Failed to fetch schedules")
 
     parsed = _parse_json_step(res.data["text"], "SCHEDULE")
+
     if not parsed.ok:
         log_error("SCHEDULE_PARSE_ERROR", res.data["text"][:200])
         return StepResult(ok=False, status="no_schedule", message="Failed to parse schedules")
@@ -393,14 +430,9 @@ async def _get_best_schedule(session, headers: dict, job_id: str, app_id: str) -
     )[0]
 
     schedule_id = best.get("scheduleId") or best.get("scheduleID") or best.get("id")
-    schedule_text = (
-        best.get("scheduleText", "")
-        or best.get("externalJobTitle", "")
-        or "Shift selected"
-    )
+    schedule_text = best.get("scheduleText") or best.get("externalJobTitle") or "Shift selected"
 
     if not schedule_id:
-        log.warning("[SCHEDULE_ID_MISSING]")
         return StepResult(
             ok=False,
             status="no_schedule",
@@ -408,7 +440,7 @@ async def _get_best_schedule(session, headers: dict, job_id: str, app_id: str) -
             data={"schedule_text": schedule_text},
         )
 
-    log.info(f"[SCHEDULE_SELECTED] {schedule_id} — {schedule_text}")
+    log.info("[SCHEDULE_SELECTED] %s — %s", schedule_id, schedule_text)
 
     return StepResult(
         ok=True,
@@ -419,7 +451,11 @@ async def _get_best_schedule(session, headers: dict, job_id: str, app_id: str) -
     )
 
 
-async def _advance_workflow(session, headers: dict, app_id: str) -> StepResult:
+async def _advance_workflow(
+    session: aiohttp.ClientSession,
+    headers: Dict[str, str],
+    app_id: str,
+) -> StepResult:
     for step_name in ["job-opportunities", "additional-information", "review-submit"]:
         res = await _request_text_with_retry(
             session,
@@ -431,15 +467,14 @@ async def _advance_workflow(session, headers: dict, app_id: str) -> StepResult:
             },
             headers=headers,
             step=f"WORKFLOW_{step_name}",
-            timeout=10,
         )
 
         status_code = int(res.status) if res.status and res.status.isdigit() else None
-        log.info(f"[WORKFLOW] → {step_name} ({res.status})")
+        log.info("[WORKFLOW] → %s (%s)", step_name, res.status)
 
         if status_code not in [200, 204]:
             msg = f"Workflow step {step_name} failed with {res.status}"
-            log.warning(f"[WORKFLOW_FAILED] {msg}")
+            log.warning("[WORKFLOW_FAILED] %s", msg)
             return StepResult(ok=False, message=msg)
 
     return StepResult(ok=True)
@@ -452,6 +487,9 @@ def _can_full_submit(
     app_id: Optional[str],
     job_id: Optional[str],
 ) -> StepResult:
+    if not _is_full_submit_enabled():
+        return StepResult(ok=False, message="Full submit disabled")
+
     if not job_id:
         return StepResult(ok=False, message="Full submit blocked: missing job ID")
 
@@ -468,8 +506,8 @@ def _can_full_submit(
 
 
 async def _submit_application(
-    session,
-    headers: dict,
+    session: aiohttp.ClientSession,
+    headers: Dict[str, str],
     job_id: str,
     app_id: str,
     candidate_id: str,
@@ -487,26 +525,26 @@ async def _submit_application(
         },
         headers=headers,
         step="SUBMIT",
-        timeout=20,
     )
 
-    log.info(f"[SUBMIT_RESPONSE] {res.status}: {res.message[:200]}")
+    log.info("[SUBMIT_RESPONSE] %s: %s", res.status, res.message[:200])
 
     status_code = int(res.status) if res.status and res.status.isdigit() else None
 
     if status_code in [200, 201, 204]:
-        log.info(f"[SUBMIT_SUCCESS] app_id={app_id}")
+        log.info("[SUBMIT_SUCCESS] app_id=%s", app_id)
         return StepResult(ok=True)
 
-    log.warning(f"[SUBMIT_FAILED] {res.status}: {res.message[:300]}")
+    log.warning("[SUBMIT_FAILED] %s: %s", res.status, res.message[:300])
     log_error("SUBMIT_FAILED", f"job={job_id} {res.status}: {res.message[:200]}")
 
     return StepResult(ok=False, message="Submit failed")
 
 
-async def prepare_application(job: dict, account: dict) -> dict:
-    job_id = job.get("id", "")
+async def prepare_application(job: Dict[str, Any], account: Dict[str, Any]) -> Dict[str, Any]:
+    job_id = str(job.get("id", "")).strip()
     acc_id = account.get("id", ACCOUNT_ID)
+    request_id = str(uuid.uuid4())
 
     result = PrepareResult(
         status="failed",
@@ -520,161 +558,176 @@ async def prepare_application(job: dict, account: dict) -> dict:
     if not job_id:
         result.message = "Missing job ID"
         log_error("PREPARE_MISSING_JOB_ID", str(job))
-        return result.__dict__
+        return asdict(result)
 
-    log.info(f"[AUTO_PREPARE_STARTED] job={job_id} account={acc_id}")
+    log.info("[AUTO_PREPARE_STARTED] job=%s account=%s request_id=%s", job_id, acc_id, request_id)
 
     cookies_res = _load_account_cookies(account)
+
     if not cookies_res.ok:
         result.status = cookies_res.status or "cookie_expired"
         result.message = cookies_res.message
-        return result.__dict__
+        return asdict(result)
 
     cookies = cookies_res.data
     auth = _extract_auth(cookies)
 
     auth_res = _validate_auth(auth, acc_id)
+
     if not auth_res.ok:
         result.status = auth_res.status or "cookie_expired"
         result.message = auth_res.message
-        return result.__dict__
+        return asdict(result)
 
-    headers = _build_headers(cookies, auth, job_id)
+    headers = _build_headers(cookies, auth, job_id, request_id=request_id)
 
-    log.info(f"[COOKIES_OK] hvhcid={auth.get('hvhcid', '?')[:8]}...")
+    log.info("[COOKIES_OK] account=%s hvhcid=%s...", acc_id, auth.get("hvhcid", "?")[:8])
 
-    async with aiohttp.ClientSession() as session:
-        csrf_res = await _get_csrf_token(session, headers)
+    try:
+        async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT) as session:
+            csrf_res = await _get_csrf_token(session, headers)
 
-        if not csrf_res.ok:
-            result.status = csrf_res.status or "cookie_expired"
-            result.message = csrf_res.message
-            log_error("CSRF_FAILED", f"account={acc_id}: {csrf_res.message}")
-            return result.__dict__
+            if not csrf_res.ok:
+                result.status = csrf_res.status or "cookie_expired"
+                result.message = csrf_res.message
+                log_error("CSRF_FAILED", f"account={acc_id}: {csrf_res.message}")
+                return asdict(result)
 
-        headers_with_csrf = dict(headers)
-        headers_with_csrf["x-csrf-token"] = csrf_res.data
+            headers_with_csrf = dict(headers)
+            headers_with_csrf["x-csrf-token"] = csrf_res.data
 
-        candidate_res = await _resolve_candidate_id(
-            session=session,
-            headers=headers_with_csrf,
-            hvhcid=auth.get("hvhcid", ""),
-        )
-
-        if not candidate_res.ok:
-            log.warning(f"[CANDIDATE_LOOKUP_ISSUE] {candidate_res.message}")
-            candidate_id = auth.get("hvhcid", "")
-            candidate_confirmed = False
-        else:
-            candidate_id = candidate_res.data["candidate_id"]
-            candidate_confirmed = candidate_res.data["confirmed"]
-
-        app_res = await _find_existing_application(session, headers_with_csrf, job_id)
-
-        if not app_res.ok:
-            log.warning(f"[APP_CHECK_PROBLEM] {app_res.message}")
-
-        app_id = app_res.data if app_res.ok else None
-
-        if not app_id:
-            create_res = await _create_application(session, headers_with_csrf, job_id)
-
-            if not create_res.ok:
-                result.message = create_res.message or "No application ID obtained"
-                log_error("APP_ID_MISSING", job_id)
-                return result.__dict__
-
-            app_id = create_res.data
-
-        result.app_id = app_id
-
-        headers_with_app = dict(headers_with_csrf)
-        headers_with_app["referer"] = (
-            f"https://www.jobsatamazon.co.uk/application/uk/"
-            f"?applicationId={app_id}&jobId={job_id}"
-        )
-
-        schedule_res = await _get_best_schedule(
-            session=session,
-            headers=headers_with_app,
-            job_id=job_id,
-            app_id=app_id,
-        )
-
-        if not schedule_res.ok:
-            result.status = schedule_res.status or "no_schedule"
-            result.schedule_id = None
-            result.message = schedule_res.message or "No schedule selected"
-            log_error("NO_SCHEDULE", f"job={job_id} app={app_id}")
-            return result.__dict__
-
-        schedule_id = schedule_res.data["schedule_id"]
-        schedule_text = schedule_res.data["schedule_text"]
-
-        result.schedule_id = schedule_id
-        result.message = schedule_text or "Shift selected"
-
-        wf_res = await _advance_workflow(session, headers_with_app, app_id)
-
-        if not wf_res.ok:
-            result.status = "failed"
-            result.message = f"Workflow failed: {wf_res.message}"
-            log_error("WORKFLOW_FAILED", f"job={job_id} app={app_id}: {wf_res.message}")
-            return result.__dict__
-
-        if _is_full_submit_enabled():
-            log.info("[FULL_SUBMIT_REQUESTED] ENABLE_FULL_SUBMIT=true")
-
-            guard = _can_full_submit(
-                candidate_confirmed=candidate_confirmed,
-                schedule_id=schedule_id,
-                app_id=app_id,
-                job_id=job_id,
+            candidate_res = await _resolve_candidate_id(
+                session=session,
+                headers=headers_with_csrf,
+                hvhcid=auth.get("hvhcid", ""),
             )
 
-            if not guard.ok:
-                result.message = guard.message
-                log_error("SUBMIT_BLOCKED", guard.message)
-                return result.__dict__
+            if not candidate_res.ok:
+                log.warning("[CANDIDATE_LOOKUP_ISSUE] %s", candidate_res.message)
+                candidate_id = auth.get("hvhcid", "")
+                candidate_confirmed = False
+            else:
+                candidate_id = candidate_res.data["candidate_id"]
+                candidate_confirmed = candidate_res.data["confirmed"]
 
-            submit_res = await _submit_application(
+            app_res = await _find_existing_application(session, headers_with_csrf, job_id)
+
+            if not app_res.ok:
+                log.warning("[APP_CHECK_PROBLEM] %s", app_res.message)
+
+            app_id = app_res.data if app_res.ok else None
+
+            if not app_id:
+                create_res = await _create_application(session, headers_with_csrf, job_id)
+
+                if not create_res.ok:
+                    result.message = create_res.message or "No application ID obtained"
+                    log_error("APP_ID_MISSING", job_id)
+                    return asdict(result)
+
+                app_id = create_res.data
+
+            result.app_id = app_id
+
+            headers_with_app = dict(headers_with_csrf)
+            headers_with_app["referer"] = (
+                f"https://www.jobsatamazon.co.uk/application/uk/"
+                f"?applicationId={app_id}&jobId={job_id}"
+            )
+            headers_with_app["x-client-request-id"] = f"{request_id}:{app_id}"
+
+            schedule_res = await _get_best_schedule(
                 session=session,
                 headers=headers_with_app,
                 job_id=job_id,
                 app_id=app_id,
-                candidate_id=candidate_id,
-                schedule_id=schedule_id,
             )
 
-            if submit_res.ok:
-                result.status = "submitted"
-                result.apply_url = (
-                    f"https://www.jobsatamazon.co.uk/checklist/{job_id}/{app_id}"
+            if not schedule_res.ok:
+                result.status = schedule_res.status or "no_schedule"
+                result.schedule_id = None
+                result.message = schedule_res.message or "No schedule selected"
+                log_error("NO_SCHEDULE", f"job={job_id} app={app_id}")
+                return asdict(result)
+
+            schedule_id = schedule_res.data["schedule_id"]
+            schedule_text = schedule_res.data["schedule_text"]
+
+            result.schedule_id = schedule_id
+            result.message = schedule_text or "Shift selected"
+
+            wf_res = await _advance_workflow(session, headers_with_app, app_id)
+
+            if not wf_res.ok:
+                result.status = "failed"
+                result.message = f"Workflow failed: {wf_res.message}"
+                log_error("WORKFLOW_FAILED", f"job={job_id} app={app_id}: {wf_res.message}")
+                return asdict(result)
+
+            if _is_full_submit_enabled():
+                log.info("[FULL_SUBMIT_REQUESTED] guarded full submit enabled")
+
+                guard = _can_full_submit(
+                    candidate_confirmed=candidate_confirmed,
+                    schedule_id=schedule_id,
+                    app_id=app_id,
+                    job_id=job_id,
                 )
-                save_application(job_id, app_id, "submitted")
-                return result.__dict__
 
-            result.message = submit_res.message or "Full submit failed"
-            return result.__dict__
+                if not guard.ok:
+                    result.message = guard.message
+                    log_error("SUBMIT_BLOCKED", guard.message)
+                    return asdict(result)
 
-        apply_url = (
-            f"https://www.jobsatamazon.co.uk/application/uk/"
-            f"?applicationId={app_id}&jobId={job_id}"
-        )
+                submit_res = await _submit_application(
+                    session=session,
+                    headers=headers_with_app,
+                    job_id=job_id,
+                    app_id=app_id,
+                    candidate_id=candidate_id,
+                    schedule_id=schedule_id,
+                )
 
-        result.status = "prepared"
-        result.apply_url = apply_url
-        result.message = schedule_text or "Shift selected"
+                if submit_res.ok:
+                    result.status = "submitted"
+                    result.apply_url = (
+                        f"https://www.jobsatamazon.co.uk/checklist/{job_id}/{app_id}"
+                    )
+                    save_application(job_id, app_id, "submitted")
+                    log.info("[AUTO_SUBMIT_SUCCESS] job=%s app=%s", job_id, app_id)
+                    return asdict(result)
 
-        save_application(job_id, app_id, "prepared")
+                result.message = submit_res.message or "Full submit failed"
+                return asdict(result)
 
-        log.info(f"[AUTO_PREPARE_SUCCESS] app_id={app_id}")
-        return result.__dict__
+            apply_url = (
+                f"https://www.jobsatamazon.co.uk/application/uk/"
+                f"?applicationId={app_id}&jobId={job_id}"
+            )
+
+            result.status = "prepared"
+            result.apply_url = apply_url
+            result.message = schedule_text or "Shift selected"
+
+            save_application(job_id, app_id, "prepared")
+
+            log.info("[AUTO_PREPARE_SUCCESS] job=%s app_id=%s", job_id, app_id)
+            return asdict(result)
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as e:
+        log.exception("[PREPARE_FATAL] job=%s account=%s error=%s", job_id, acc_id, e)
+        log_error("PREPARE_FATAL", f"job={job_id} account={acc_id}: {e}")
+        result.status = "failed"
+        result.message = "Unexpected prepare error"
+        return asdict(result)
 
 
 async def run_auto_prepare(
-    job: dict,
-    account: dict,
+    job: Dict[str, Any],
+    account: Dict[str, Any],
     alert_fn,
     chat_id: str = CHAT_ID,
 ) -> None:
@@ -697,7 +750,7 @@ async def run_auto_prepare(
         return
 
     if status == "no_schedule":
-        log.warning(f"[NO_SCHEDULE_ALERT] {result.get('message')}")
+        log.warning("[NO_SCHEDULE_ALERT] %s", result.get("message"))
         await alert_fn(job, "ready", chat_id=chat_id)
         return
 
@@ -721,5 +774,5 @@ async def run_auto_prepare(
         )
         return
 
-    log.warning(f"[PREPARE_FALLBACK] {result.get('message')}")
+    log.warning("[PREPARE_FALLBACK] %s", result.get("message"))
     await alert_fn(job, "ready", chat_id=chat_id)
