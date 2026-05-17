@@ -1,5 +1,5 @@
-import aiosqlite
 import asyncio
+import aiosqlite
 from config import DB_PATH, log
 
 CREATE_TABLE_SQL = """
@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
+
 class Storage:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
@@ -22,27 +23,34 @@ class Storage:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(CREATE_TABLE_SQL)
             await db.commit()
-        log.info("Database initialized")
+        log.info("✅ Database initialized")
 
-    async def save_job(self, job):
+    async def save_job(self, job: dict) -> bool:
+        """
+        Save job if not exists.
+        Returns True if inserted, False if duplicate.
+        """
         async with self._lock:
             async with aiosqlite.connect(self.db_path) as db:
                 try:
                     await db.execute(
                         "INSERT INTO jobs (id, title, location, url) VALUES (?, ?, ?, ?)",
                         (
-                            job["id"],
-                            job["title"],
-                            job["location"],
-                            job["url"],
+                            job.get("id"),
+                            job.get("title"),
+                            job.get("location"),
+                            job.get("url"),
                         ),
                     )
                     await db.commit()
                     return True
                 except Exception:
-                    return False  # already exists
+                    return False
 
     async def get_new_jobs(self):
+        """
+        Get jobs not yet sent to Telegram
+        """
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "SELECT id, title, location, url FROM jobs WHERE seen = 0"
@@ -50,7 +58,10 @@ class Storage:
             rows = await cursor.fetchall()
             return rows
 
-    async def mark_seen(self, job_id):
+    async def mark_seen(self, job_id: str):
+        """
+        Mark job as sent
+        """
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 "UPDATE jobs SET seen = 1 WHERE id = ?",
@@ -58,8 +69,8 @@ class Storage:
             )
             await db.commit()
 
-    async def count_jobs(self):
+    async def count_jobs(self) -> int:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM jobs")
-            (count,) = await cursor.fetchone()
-            return count
+            row = await cursor.fetchone()
+            return row[0] if row else 0
