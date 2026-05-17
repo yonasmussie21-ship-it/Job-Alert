@@ -1,376 +1,331 @@
+import asyncio
+import json
 import logging
-import os
-import random
-from dataclasses import dataclass, asdict, field
+import re
+import aiohttp
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
-from zoneinfo import ZoneInfo
-
-# ─── TIMEZONE ────────────────────────────────────────────────────────────────
-TZ = ZoneInfo("Europe/London")
-
-# ─── LOGGING ─────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+from config import BOT_TOKEN, CHAT_ID, TELEGRAM_API, get_tier
+from storage import save_subscribers
+from job_parser import is_night_shift, is_fresh_job, score_job, job_distance_miles
 
 log = logging.getLogger(__name__)
 
-DEBUG: bool = os.environ.get("DEBUG", "0") == "1"
+otp_waiting = {}
+otp_codes   = {}
+onboarding  = {}
 
-# ─── ENV HELPERS ─────────────────────────────────────────────────────────────
-def env_str(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
-
-
-def env_int(name: str, default: int) -> int:
-    raw = env_str(name)
-
-    if not raw:
-        return default
-
+async def tg_send(text, reply_markup=None, chat_id=None):
+    cid     = chat_id or CHAT_ID
+    payload = {"chat_id": cid, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        return int(raw)
-    except ValueError:
-        log.warning("[CONFIG] Invalid int for %s=%r, using %s", name, raw, default)
-        return default
-
-
-def env_list(name: str) -> List[str]:
-    return [x.strip() for x in env_str(name).split(",") if x.strip()]
-
-
-# ─── GENERAL SETTINGS ────────────────────────────────────────────────────────
-MAX_ACCOUNTS: int = env_int("MAX_ACCOUNTS", 5)
-COOKIE_FRESH_HOURS: int = env_int("COOKIE_FRESH_HOURS", 12)
-
-# ─── TELEGRAM ────────────────────────────────────────────────────────────────
-BOT_TOKEN: str = env_str("BOT_TOKEN")
-CHAT_ID: str = env_str("CHAT_ID")
-TELEGRAM_API: str = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
-
-# ─── PROXY ───────────────────────────────────────────────────────────────────
-DECODO_USER: str = env_str("DECODO_USER")
-DECODO_PASS: str = env_str("DECODO_PASS")
-DECODO_HOST: str = env_str("DECODO_HOST", "gb.decodo.com")
-DECODO_PORT: str = env_str("DECODO_PORT", "30004")
-PROXY_POOL: List[str] = env_list("PROXY_POOL")
-
-# ─── AMAZON ──────────────────────────────────────────────────────────────────
-AMAZON_EMAIL: str = env_str("AMAZON_EMAIL")
-AMAZON_PIN: str = env_str("AMAZON_PIN")
-AMAZON_COOKIES: str = env_str("AMAZON_COOKIES")
-AMAZON_COOKIES_TS: str = env_str("AMAZON_COOKIES_TS")
-
-# ─── STORAGE ─────────────────────────────────────────────────────────────────
-DEFAULT_DATA_DIR = "/data" if os.path.exists("/data") else "/tmp"
-DATA_DIR: str = env_str("DATA_DIR", DEFAULT_DATA_DIR)
-DB_PATH: str = os.path.join(DATA_DIR, "owner_bot.db")
-
-# ─── JOB FILTERS ─────────────────────────────────────────────────────────────
-WAREHOUSE_KEYWORDS: List[str] = [
-    "warehouse", "fulfillment", "fulfilment", "sortation", "sort centre",
-    "sort center", "delivery station", "fc associate", "warehouse operative",
-    "warehouse associate", "sortation operative", "fulfillment associate",
-    "fulfilment associate", "seasonal associate", "process assistant",
-    "picker", "packer", "stower", "problem solver", "production operator",
-    "site assistant", "amazon associate", "operations associate",
-]
-
-BLOCKED_KEYWORDS: List[str] = [
-    "customer service", "software", "engineer", "manager", "corporate",
-    "marketing", " hr ", "finance", "recruiter", "sales", "vcc",
-    "loss prevention", "learning ambassador", "data entry", "legal",
-    "it support", "business analyst",
-]
-
-FRESH_KEYWORDS: List[str] = [
-    "amazon fresh",
-    "whole foods",
-    "fresh grocery",
-]
-
-JOB_TYPES: Dict[str, List[str]] = {
-    "warehouse": WAREHOUSE_KEYWORDS,
-    "fresh": FRESH_KEYWORDS,
-}
-
-CITY_POSTCODES: Dict[str, str] = {
-    "birmingham": "B1 1BB",
-    "london": "EC1A 1BB",
-    "manchester": "M1 1AE",
-    "leeds": "LS1 1BA",
-    "glasgow": "G1 1AA",
-    "liverpool": "L1 1JF",
-    "sheffield": "S1 1AA",
-    "bristol": "BS1 1AA",
-    "newcastle": "NE1 1AA",
-    "nottingham": "NG1 1AA",
-    "leicester": "LE1 1AA",
-    "coventry": "CV1 1AA",
-    "wolverhampton": "WV1 1AA",
-    "derby": "DE1 1AA",
-    "cardiff": "CF10 1AA",
-    "edinburgh": "EH1 1AA",
-    "belfast": "BT1 1AA",
-    "southampton": "SO14 1AA",
-    "portsmouth": "PO1 1AA",
-    "oxford": "OX1 1AA",
-    "cambridge": "CB1 1AA",
-    "reading": "RG1 1AA",
-    "luton": "LU1 1AA",
-    "northampton": "NN1 1AA",
-    "milton keynes": "MK9 1AA",
-    "warrington": "WA1 1AA",
-    "hull": "HU1 1AA",
-    "doncaster": "DN1 1AA",
-    "chesterfield": "S40 1AA",
-    "wakefield": "WF1 1AA",
-    "durham": "DH1 1AA",
-    "sunderland": "SR1 1AA",
-    "middlesbrough": "TS1 1AA",
-    "bolton": "BL1 1AA",
-    "wigan": "WN1 1AA",
-    "stockport": "SK1 1AA",
-    "stoke": "ST1 1AA",
-    "swansea": "SA1 1AA",
-    "exeter": "EX1 1AA",
-    "swindon": "SN1 1AA",
-    "peterborough": "PE1 1AA",
-    "norwich": "NR1 1AA",
-    "basildon": "SS14 1AA",
-    "ipswich": "IP1 1AA",
-    "gloucester": "GL4 3HR",
-}
-
-CITY_COORDS: Dict[str, Tuple[float, float]] = {
-    "B1 1BB": (52.4862, -1.8904),
-    "EC1A 1BB": (51.5200, -0.0990),
-    "M1 1AE": (53.4808, -2.2426),
-    "LS1 1BA": (53.7997, -1.5492),
-    "G1 1AA": (55.8642, -4.2518),
-    "L1 1JF": (53.4084, -2.9916),
-    "S1 1AA": (53.3811, -1.4701),
-    "BS1 1AA": (51.4545, -2.5879),
-    "NE1 1AA": (54.9783, -1.6178),
-    "NG1 1AA": (52.9540, -1.1549),
-    "LE1 1AA": (52.6369, -1.1398),
-    "CV1 1AA": (52.4068, -1.5197),
-    "WV1 1AA": (52.5852, -2.1297),
-    "DE1 1AA": (52.9225, -1.4746),
-    "CF10 1AA": (51.4816, -3.1791),
-    "EH1 1AA": (55.9533, -3.1883),
-    "BT1 1AA": (54.5973, -5.9301),
-    "SO14 1AA": (50.9097, -1.4044),
-    "PO1 1AA": (50.7989, -1.0919),
-    "OX1 1AA": (51.7520, -1.2577),
-    "CB1 1AA": (52.2053, 0.1218),
-    "RG1 1AA": (51.4543, -0.9781),
-    "LU1 1AA": (51.8787, -0.4200),
-    "NN1 1AA": (52.2405, -0.9027),
-    "MK9 1AA": (52.0406, -0.7594),
-    "WA1 1AA": (53.3900, -2.5970),
-    "HU1 1AA": (53.7457, -0.3367),
-    "DN1 1AA": (53.5228, -1.1286),
-    "S40 1AA": (53.2350, -1.4216),
-    "WF1 1AA": (53.6830, -1.4977),
-    "DH1 1AA": (54.7761, -1.5733),
-    "SR1 1AA": (54.9069, -1.3838),
-    "TS1 1AA": (54.5740, -1.2343),
-    "BL1 1AA": (53.5780, -2.4286),
-    "WN1 1AA": (53.5450, -2.6333),
-    "SK1 1AA": (53.4083, -2.1578),
-    "ST1 1AA": (53.0271, -2.1772),
-    "SA1 1AA": (51.6214, -3.9436),
-    "EX1 1AA": (50.7236, -3.5275),
-    "SN1 1AA": (51.5558, -1.7797),
-    "PE1 1AA": (52.5695, -0.2405),
-    "NR1 1AA": (52.6309, 1.2974),
-    "SS14 1AA": (51.5790, 0.4553),
-    "IP1 1AA": (52.0567, 1.1482),
-    "GL4 3HR": (51.8585, -2.2180),
-}
-
-
-@dataclass
-class AmazonAccount:
-    id: int
-    email: str = ""
-    pin: str = ""
-    cookies: str = ""
-    session: List[Any] = field(default_factory=list)
-    logged_in: bool = False
-    priority: int = 1
-    cookie_timestamp: Optional[str] = None
-
-    def as_dict(self, include_secrets: bool = True) -> Dict[str, Any]:
-        data = asdict(self)
-
-        if not include_secrets:
-            data["pin"] = "***" if self.pin else ""
-            data["cookies"] = "***" if self.cookies else ""
-
-        return data
-
-
-def now_london() -> datetime:
-    return datetime.now(TZ)
-
-
-def ensure_data_dir() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-
-def validate_city_coords(strict: bool = False) -> None:
-    missing = [
-        postcode
-        for postcode in CITY_POSTCODES.values()
-        if postcode not in CITY_COORDS
-    ]
-
-    if missing:
-        msg = f"Missing coordinates for postcodes: {missing}"
-        if strict:
-            raise RuntimeError(msg)
-        log.warning("[CONFIG] %s", msg)
-
-
-def cookie_is_fresh(cookie_ts: Optional[str]) -> bool:
-    if not cookie_ts:
-        return False
-
-    try:
-        ts = datetime.fromisoformat(cookie_ts)
-
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=TZ)
-
-        age_hours = (now_london() - ts).total_seconds() / 3600
-        return age_hours < COOKIE_FRESH_HOURS
-
+        async with aiohttp.ClientSession() as s:
+            await s.post(f"{TELEGRAM_API}/sendMessage", json=payload)
     except Exception as e:
-        if DEBUG:
-            log.debug("[COOKIE_TS_INVALID] %s", e)
-        return False
+        log.error(f"Telegram error: {e}")
 
+async def tg_alert(job, status="new", chat_id=None, distance=None,
+                   account_id=None, shift_index=None, total_shifts=None, score=None):
+    cid = chat_id or CHAT_ID
+    headers_map = {
+        "new":         "🚨 <b>NEW AMAZON JOB — ACT NOW!</b>",
+        "applying":    f"🤖 <b>AUTO-SUBMITTING{' (Acc '+str(account_id)+')' if account_id else ''}...</b>",
+        "applied":     f"✅ <b>APPLIED FOR YOU{' (Acc '+str(account_id)+')' if account_id else ''}!</b>",
+        "ready":       "👆 <b>APPLICATION READY — TAP TO SUBMIT!</b>",
+        "prepared":    "✅ <b>SHIFT SELECTED — TAP TO CONTINUE!</b>",
+        "fresh_alert": "🌿 <b>AMAZON FRESH — MANUAL APPLY ONLY</b>",
+    }
+    header = headers_map.get(status, "⚠️ <b>OPEN MANUALLY!</b>")
+    pay_str  = job.get("pay_display") or f"{job.get('pay','?'):.2f}"
+    dist_str = f"\n📏 Distance: <b>{distance} miles</b>" if distance else ""
+    shifts   = job.get("shifts", [])
+    schedule = job.get("schedule")
+    if shift_index is not None and shifts and shift_index < len(shifts):
+        schedule = shifts[shift_index]
+    night     = " 🌙 NIGHT SHIFT" if is_night_shift(schedule or "") else ""
+    fresh     = " 🌿 FRESH" if is_fresh_job(job) else ""
+    perm      = " ⭐ PERMANENT" if "permanent" in job.get("contract","").lower() else ""
+    shift_str = ""
+    if total_shifts and total_shifts > 1 and shift_index is not None:
+        shift_str = f"\n🔄 <b>Shift {shift_index+1} of {total_shifts}</b>"
+    score_str = f"\n⭐ Score: <b>{score}</b>" if score else ""
+    first_day_str = job.get("firstDay") or "See listing"
+    schedule_str  = schedule or "See listing"
+    hours_str     = job.get("hours") or "See listing"
+    desc_str      = f"\n📝 {job.get('description')}" if job.get("description") else ""
+    job_id   = job.get("id","")
+    job_link = (f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}"
+                if job_id != "TEST-001"
+                else job.get("link","https://www.jobsatamazon.co.uk"))
+    text = f"""{header}{shift_str}{perm}
+━━━━━━━━━━━━━━━━━━━━━
+📍 <b>{job.get('location','Unknown')}</b>
+📦 {job.get('title','Warehouse Operative')}{night}{fresh}
+💰 <b>£{pay_str}/hr</b>
+📋 {job.get('contract','Seasonal')}
+📅 First Day: <b>{first_day_str}</b>
+🕘 Schedule: <b>{schedule_str}</b>
+🕐 Hours/Week: <b>{hours_str}</b>{dist_str}{score_str}{desc_str}
+━━━━━━━━━━━━━━━━━━━━━"""
+    if status == "applied":
+        text += "\n🎉 <b>Check your Amazon Jobs dashboard!</b>\n━━━━━━━━━━━━━━━━━━━━━"
+    elif status == "ready":
+        text += "\n👆 <b>Tap OPEN APPLICATION → Log in → Submit!</b>\n━━━━━━━━━━━━━━━━━━━━━"
+    elif status == "prepared":
+        text += "\n✅ <b>Bot selected the best shift for you!</b>\n👆 Tap OPEN APPLICATION → Schedule → Review → Submit!\n━━━━━━━━━━━━━━━━━━━━━"
+    elif status == "fresh_alert":
+        text += "\n🌿 <b>Fresh excluded from auto-submit</b>\n━━━━━━━━━━━━━━━━━━━━━"
+    markup = {
+        "inline_keyboard": [
+            [{"text": "🚀 OPEN APPLICATION", "url": job_link}],
+            [{"text": "✅ MARK SUBMITTED", "callback_data": f"applied_{job['id']}"},
+             {"text": "❌ IGNORE",          "callback_data": f"skip_{job['id']}"}]
+        ]
+    } if status in ["new","ready","prepared","fresh_alert"] else None
+    await tg_send(text, markup, chat_id=cid)
 
-def get_proxy_url() -> Optional[str]:
-    if PROXY_POOL:
-        return random.choice(PROXY_POOL)
+async def send_all_shifts(job, status="new", chat_id=None, distance=None, score=None):
+    shifts = job.get("shifts", [])
+    if not shifts or len(shifts) <= 1:
+        await tg_alert(job, status, chat_id=chat_id, distance=distance, score=score)
+        return
+    for i in range(len(shifts)):
+        await tg_alert(job, status, chat_id=chat_id, distance=distance,
+                       shift_index=i, total_shifts=len(shifts), score=score)
+        await asyncio.sleep(0.5)
 
-    if DECODO_USER and DECODO_PASS:
-        password = quote(DECODO_PASS, safe="")
-        return f"http://{DECODO_USER}:{password}@{DECODO_HOST}:{DECODO_PORT}"
+async def start_onboarding(cid, name="there"):
+    onboarding[cid] = {"step": "job_type", "locations": [], "name": name}
+    await tg_send(f"""👑 <b>Welcome {name}!</b>
 
-    return None
+I'm the Amazon Warehouse Job Alert Bot.
+I find UK warehouse jobs and alert you instantly!
 
+<b>Step 1 of 4 — Job Type</b>
+1️⃣ Full-time only
+2️⃣ Part-time only
+3️⃣ Both""", chat_id=cid)
 
-def is_peak_time() -> bool:
-    now = now_london()
-    h, m = now.hour, now.minute
+async def handle_onboarding(cid, text, subscribers):
+    state = onboarding.get(cid, {})
+    step  = state.get("step", "")
+    if step == "job_type":
+        mapping = {"1": "fulltime", "2": "parttime", "3": "both",
+                   "1️⃣": "fulltime", "2️⃣": "parttime", "3️⃣": "both"}
+        jt = mapping.get(text)
+        if not jt:
+            await tg_send("Please reply 1, 2 or 3 ☝️", chat_id=cid)
+            return
+        labels = {"fulltime":"Full-time only","parttime":"Part-time only","both":"Both"}
+        state["job_type"] = jt
+        state["step"]     = "location_1"
+        onboarding[cid]   = state
+        await tg_send(f"""✅ Job type: <b>{labels[jt]}</b>
 
-    morning_peak = (h == 10 and m >= 55) or (h == 11 and m <= 25)
-    evening_peak = (h == 22 and m >= 55) or (h == 23 and m <= 25)
+<b>Step 2 of 4 — Your Location</b>
+Enter your city or postcode:
+Examples: <b>Birmingham</b>, <b>Leeds</b>, <b>B1 1BB</b>""", chat_id=cid)
+    elif step == "location_1":
+        state["locations"] = [text.strip()]
+        state["step"]      = "location_2"
+        onboarding[cid]    = state
+        await tg_send(f"""✅ Location: <b>{text.strip()}</b>
 
-    return morning_peak or evening_peak
+<b>Step 3 of 4 — Second Location (Optional)</b>
+Add another location or type <b>DONE</b> to skip.""", chat_id=cid)
+    elif step == "location_2":
+        if text.strip().upper() not in ["DONE","SKIP","NO","N"]:
+            state["locations"].append(text.strip())
+        state["step"]   = "radius"
+        onboarding[cid] = state
+        await tg_send("""<b>Step 4 of 4 — Travel Radius</b>
+How far can you travel from your location?
+🚗 <b>10</b> — Very local
+🚗 <b>25</b> — Nearby
+🚗 <b>50</b> — Wide search""", chat_id=cid)
+    elif step == "radius":
+        try:
+            radius = int(re.search(r'\d+', text).group())
+        except:
+            await tg_send("Please enter a number e.g. <b>25</b>", chat_id=cid)
+            return
+        state["radius"] = radius
+        state["step"]   = "confirm"
+        onboarding[cid] = state
+        locs   = state.get("locations", [])
+        jt     = state.get("job_type", "both")
+        jlabel = {"fulltime":"Full-time only","parttime":"Part-time only",
+                  "both":"Full-time & Part-time"}.get(jt)
+        ltext  = "\n".join([f"📍 {'⭐ ' if i==0 else ''}{l}" for i, l in enumerate(locs)])
+        await tg_send(f"""<b>Confirm Your Preferences</b>
+━━━━━━━━━━━━━━━━━
+{ltext}
+🚗 Radius: <b>{radius} miles</b>
+📋 Type: <b>{jlabel}</b>
+━━━━━━━━━━━━━━━━━
+Reply <b>CONFIRM</b> or <b>RESTART</b>""", chat_id=cid)
+    elif step == "confirm":
+        if text.upper() == "CONFIRM":
+            subscribers[cid] = {
+                "name":           state.get("name","Friend"),
+                "locations":      state.get("locations",[]),
+                "radius":         state.get("radius",30),
+                "job_type":       state.get("job_type","both"),
+                "setup_complete": True,
+                "auto_apply":     False,
+                "tier":           "free",
+                "joined":         datetime.utcnow().isoformat(),
+            }
+            save_subscribers(subscribers)
+            onboarding.pop(cid, None)
+            await tg_send("""🎉 <b>You're all set!</b>
 
+You'll get instant alerts when Amazon warehouse jobs drop near you!
 
-def next_peak_window() -> str:
-    return "10:55–11:25 or 22:55–23:25 (London time)"
+Use /help for all commands.""", chat_id=cid)
+        elif text.upper() == "RESTART":
+            await start_onboarding(cid, state.get("name","there"))
+        else:
+            await tg_send("Reply <b>CONFIRM</b> or <b>RESTART</b>", chat_id=cid)
 
+async def handle_updates(state: dict):
+    offset    = 0
+    processed = set()
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"{TELEGRAM_API}/getUpdates?offset={offset}&timeout=10"
+                ) as r:
+                    data = await r.json()
+                    for update in data.get("result", []):
+                        uid    = update["update_id"]
+                        offset = uid + 1
+                        if uid not in processed:
+                            processed.add(uid)
+                            if len(processed) > 1000:
+                                processed.clear()
+                            await _process_update(update, state)
+        except Exception as e:
+            log.error(f"Update error: {e}")
+        await asyncio.sleep(2)
 
-def get_tier(chat_id: str, subscriber: Dict[str, Any]) -> str:
-    if CHAT_ID and str(chat_id) == str(CHAT_ID):
-        return "owner"
+async def _process_update(update, state):
+    subscribers = state["subscribers"]
+    known_jobs  = state["known_jobs"]
+    job_history = state["job_history"]
+    if "callback_query" in update:
+        cb = update["callback_query"]
+        d  = cb.get("data","")
+        if d.startswith("applied_"):
+            await tg_send("✅ Marked as submitted! Good luck! 💪🔥")
+        elif d.startswith("skip_"):
+            await tg_send("❌ Job ignored.")
+        return
+    msg     = update.get("message", {})
+    text    = msg.get("text","").strip()
+    cid     = str(msg.get("chat",{}).get("id", CHAT_ID))
+    name    = msg.get("chat",{}).get("first_name","Friend")
+    text_lw = text.lower()
+    if cid in otp_waiting and text and text.isdigit():
+        otp_codes[cid] = text
+        otp_waiting[cid].set()
+        await tg_send("✅ OTP received! Submitting...", chat_id=cid)
+        return
+    if cid in onboarding:
+        await handle_onboarding(cid, text, subscribers)
+        return
+    if text_lw == "/start":
+        if cid in subscribers and subscribers[cid].get("setup_complete"):
+            sub  = subscribers[cid]
+            locs = ", ".join(sub.get("locations",[]))
+            tier = get_tier(cid, sub)
+            auto = ("✅ Full auto-submit" if tier in ("owner","premium") else
+                    "📋 Prepare & notify" if tier == "standard" else
+                    "🔔 Alerts only")
+            await tg_send(f"""👋 <b>Welcome back {name}!</b>
 
-    return subscriber.get("tier", "free")
+📍 {locs}
+🚗 {sub.get('radius',30)} miles
+📋 {sub.get('job_type','both')}
+🤖 {auto}
 
-
-def load_accounts() -> List[Dict[str, Any]]:
-    accounts: List[AmazonAccount] = []
-
-    for i in range(1, MAX_ACCOUNTS + 1):
-        email = env_str(f"AMAZON_EMAIL_{i}")
-        pin = env_str(f"AMAZON_PIN_{i}")
-        cookies = env_str(f"AMAZON_COOKIES_{i}")
-        cookie_ts = env_str(f"AMAZON_COOKIES_{i}_TS")
-        priority = env_int(f"AMAZON_PRIORITY_{i}", i)
-
-        if i == 1:
-            email = email or AMAZON_EMAIL
-            pin = pin or AMAZON_PIN
-            cookies = cookies or AMAZON_COOKIES
-            cookie_ts = cookie_ts or AMAZON_COOKIES_TS
-
-        if not email and not cookies:
-            continue
-
-        accounts.append(
-            AmazonAccount(
-                id=i,
-                email=email,
-                pin=pin,
-                cookies=cookies,
-                priority=priority,
-                cookie_timestamp=cookie_ts or None,
-            )
+Use /help for all commands!""", chat_id=cid)
+        else:
+            await start_onboarding(cid, name)
+    elif text_lw == "/setup":
+        await start_onboarding(cid, name)
+    elif text_lw == "/status":
+        from config import get_proxy_url, is_peak_time
+        peak  = is_peak_time()
+        speed = "3s ⚡ PEAK" if peak else "10s 🔄 Normal"
+        proxy = "✅ Decodo UK" if get_proxy_url() else "❌ No proxy"
+        await tg_send(f"""📊 <b>Bot Status</b>
+━━━━━━━━━━━━━━━━━
+Status: {"⏸️ PAUSED" if state['bot_paused'] else "✅ RUNNING"}
+🌐 Proxy: {proxy}
+👥 Subscribers: {len(subscribers)}
+🤖 Accounts: {len(state['accounts'])}
+Jobs tracked: {len(known_jobs)}
+History: {len(job_history)}
+⚡ Speed: {speed}
+━━━━━━━━━━━━━━━━━""", chat_id=cid)
+    elif text_lw == "/scrape":
+        await tg_send("🔍 <b>Scanning ALL UK Amazon jobs...</b>", chat_id=cid)
+        from scheduler import check_jobs
+        count = await check_jobs(state)
+        await tg_send(
+            f"✅ New: {count} | Tracked: {len(known_jobs)}\n"
+            f"{'🎉 New jobs found!' if count > 0 else '⏳ No new jobs this scan'}",
+            chat_id=cid
         )
-
-    accounts.sort(key=lambda account: account.priority)
-
-    if DEBUG:
-        for account in accounts:
-            log.debug(
-                "[ACCOUNT] %s",
-                account.as_dict(include_secrets=False),
-            )
-
-    return [account.as_dict() for account in accounts]
-
-
-def validate_env(strict: bool = False) -> None:
-    warnings: List[str] = []
-    errors: List[str] = []
-
-    ensure_data_dir()
-    validate_city_coords(strict=strict)
-
-    if not BOT_TOKEN:
-        warnings.append("BOT_TOKEN missing — Telegram disabled")
-
-    if BOT_TOKEN and not TELEGRAM_API:
-        errors.append("TELEGRAM_API unavailable")
-
-    if not CHAT_ID:
-        warnings.append("CHAT_ID missing — owner chat not set")
-
-    accounts = load_accounts()
-
-    if not accounts:
-        warnings.append("No Amazon accounts configured")
-
-    if not get_proxy_url():
-        warnings.append("No proxy configured")
-
-    if MAX_ACCOUNTS < 1:
-        errors.append("MAX_ACCOUNTS must be at least 1")
-
-    if COOKIE_FRESH_HOURS < 1:
-        errors.append("COOKIE_FRESH_HOURS must be at least 1")
-
-    for warning in warnings:
-        log.warning("[ENV] %s", warning)
-
-    if errors:
-        message = "; ".join(errors)
-
-        if strict:
-            raise RuntimeError(message)
-
-        log.error("[ENV] %s", message)
-
-    if strict and warnings:
-        raise RuntimeError("; ".join(warnings))
+    elif text_lw == "/jobs":
+        if not known_jobs:
+            await tg_send("📭 No jobs yet — send /scrape to scan!", chat_id=cid)
+        else:
+            txt = f"📋 <b>Last {min(5,len(known_jobs))} Jobs:</b>\n━━━━━━━━━━━\n"
+            for job in list(known_jobs.values())[-5:]:
+                night = "🌙" if is_night_shift(job.get("schedule","")) else "☀️"
+                sched = job.get("schedule") or "See listing"
+                day   = job.get("firstDay") or "See listing"
+                txt  += f"{night} {job.get('location')}\n💰 £{job.get('pay')}/hr | {job.get('contract')}\n📅 {day} | {sched[:30]}\n\n"
+            await tg_send(txt, chat_id=cid)
+    elif text_lw == "/test":
+        test_job = {
+            "id": "TEST-001", "title": "Warehouse Operative",
+            "location": "Weybridge, England (West Surrey) KT13 0YU",
+            "postcode": "KT13 0YU", "pay": 15.30, "pay_display": "15.30",
+            "contract": "Seasonal | Full-time", "firstDay": "2026-05-10",
+            "shifts": [
+                "Sat, Sun, Mon, Tue 23:45 - 10:15",
+                "Fri, Sat, Sun, Mon, Tue 6:30 - 13:00",
+                "Fri, Sat, Sun, Mon 23:45 - 10:15",
+            ],
+            "schedule": "Sat, Sun, Mon, Tue 23:45 - 10:15",
+            "hours": "40",
+            "description": "Pick, pack and ship parcels at our fulfilment centre.",
+            "link": "https://www.jobsatamazon.co.uk",
+        }
+        await send_all_shifts(test_job, "new", chat_id=cid, distance=47.0, score=15)
+    elif text_lw == "/pause" and cid == CHAT_ID:
+        state["bot_paused"] = True
+        await tg_send("⏸️ Bot paused.", chat_id=cid)
+    elif text_lw == "/resume" and cid == CHAT_ID:
+        state["bot_paused"] = False
+        await tg_send("▶️ Bot resumed! 🔥", chat_id=cid)
+    elif text_lw == "/clearcache" and cid == CHAT_ID:
+        known_jobs.clear()
+        await tg_send("🗑️ Cache cleared.", chat_id=cid)
+    elif text_lw == "/help":
+        await tg_send("""👑 <b>Amazon KING BOT</b>
+━━━━━━━━━━━━━━━━━
+/start    — Welcome & setup
+/setup    — Update preferences
+/status   — Bot status
+/scrape   — Scan now
+/jobs     — Recent jobs
+/test     — Test alert
+/pause    — Pause bot (admin)
+/resume   — Resume bot (admin)
+━━━━━━━━━━━━━━━━━""", chat_id=cid)
