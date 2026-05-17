@@ -1,7 +1,11 @@
-import math
+import asyncio
 import logging
+import math
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
+
 import aiohttp
-from datetime import datetime, timedelta
 
 from config import (
     WAREHOUSE_KEYWORDS,
@@ -13,88 +17,81 @@ from config import (
 
 log = logging.getLogger(__name__)
 
-SESSION: aiohttp.ClientSession | None = None
+SESSION: Optional[aiohttp.ClientSession] = None
+POSTCODE_CACHE: dict[str, tuple[Optional[float], Optional[float], datetime]] = {}
 
-# Cache with expiry (prevents permanent caching of API failures)
-POSTCODE_CACHE: dict[str, tuple[float | None, float | None, datetime]] = {}
 CACHE_TTL = timedelta(minutes=10)
+POSTCODE_API_TIMEOUT = 5
+POSTCODE_RETRIES = 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SESSION MANAGEMENT
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def get_session() -> aiohttp.ClientSession:
-    global SESSION
-
-    if SESSION is None or SESSION.closed:
-        SESSION = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=5)
-        )
-
-    return SESSION
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-async def close_session() -> None:
-    global SESSION
-
-    if SESSION and not SESSION.closed:
-        await SESSION.close()
-
-    SESSION = None
+def normalize(text: Any) -> str:
+    text = str(text or "").lower().strip()
+    text = text.replace("–", "-").replace("—", "-")
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEXT NORMALIZATION
-# ─────────────────────────────────────────────────────────────────────────────
+def contains_phrase(text: str, phrase: str) -> bool:
+    phrase = normalize(phrase).strip()
 
-def normalize(text: str) -> str:
-    return str(text).lower().strip().replace("–", "-")
+    if not phrase:
+        return False
 
+    pattern = r"\b" + re.escape(phrase).replace(r"\ ", r"\s+") + r"\b"
+    return re.search(pattern, text) is not None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB FILTERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def is_warehouse_job(title: str) -> bool:
-    if not title:
+    title_norm = normalize(title)
+
+    if not title_norm:
         return False
 
-    title = normalize(title)
-    tokens = set(title.replace("-", " ").split())
-
-    # Blocked keywords as tokens
-    for blocked in BLOCKED_KEYWORDS:
-        b = normalize(blocked)
-        if b in tokens:
-            return False
-
-    return any(k in title for k in WAREHOUSE_KEYWORDS)
-
-
-def is_fresh_job(job: dict) -> bool:
-    title = normalize(job.get("title", ""))
-    location = normalize(job.get("location", ""))
-    return any(kw in title or kw in location for kw in FRESH_KEYWORDS)
-
-
-def is_night_shift(schedule) -> bool:
-    if not schedule or schedule == "TBC":
+    if any(contains_phrase(title_norm, blocked) for blocked in BLOCKED_KEYWORDS):
         return False
 
-    text = normalize(str(schedule))
-
-    night_terms = [
-        "night", "overnight", "nightshift", "night shift",
-        "18:", "19:", "20:", "21:", "22:", "23:",
-        "00:", "01:", "02:", "03:",
-    ]
-
-    return any(term in text for term in night_terms)
+    return any(contains_phrase(title_norm, keyword) for keyword in WAREHOUSE_KEYWORDS)
 
 
-def shift_priority(text) -> int:
-    text = normalize(str(text))
+def is_fresh_job(job: Dict[str, Any]) -> bool:
+    text = normalize(f"{job.get('title', '')} {job.get('location', '')}")
+    return any(contains_phrase(text, kw) for kw in FRESH_KEYWORDS)
+
+
+def is_night_shift(schedule: Any) -> bool:
+    text = normalize(schedule)
+
+    if not text or text == "tbc":
+        return False
+
+    return any(
+        term in text
+        for term in [
+            "night",
+            "overnight",
+            "nightshift",
+            "night shift",
+            "18:",
+            "19:",
+            "20:",
+            "21:",
+            "22:",
+            "23:",
+            "00:",
+            "01:",
+            "02:",
+            "03:",
+        ]
+    )
+
+
+def shift_priority(text: Any) -> int:
+    text = normalize(text)
 
     if any(term in text for term in ["18:", "19:", "20:", "21:", "22:", "23:"]):
         return 1
@@ -105,18 +102,35 @@ def shift_priority(text) -> int:
     return 3
 
 
-def score_job(job: dict) -> tuple[int, bool]:
-    hours = job.get("hours")
+def parse_hours(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return None
+
+
+def parse_pay(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+
+    try:
+        clean = str(value).replace("£", "").replace(",", "").strip()
+        return round(float(clean), 2)
+    except Exception:
+        return 0.0
+
+
+def score_job(job: Dict[str, Any]) -> tuple[int, bool]:
+    hours = parse_hours(job.get("hours"))
     contract = normalize(job.get("contract", ""))
     schedule = job.get("schedule", "")
 
-    if hours:
-        try:
-            if int(hours) < 36:
-                log.info("[SKIP] Part-time %shrs", hours)
-                return 0, True
-        except Exception:
-            pass
+    if hours is not None and hours < 36:
+        log.info("[SKIP] Part-time %shrs", hours)
+        return 0, True
 
     score = 0
 
@@ -126,42 +140,47 @@ def score_job(job: dict) -> tuple[int, bool]:
     if is_night_shift(schedule):
         score += 15
 
+    if hours and hours >= 36:
+        score += 10
+
     return score, False
 
 
-def job_matches_type(job: dict, job_type: str) -> bool:
-    if job_type == "both":
-        return True
-
+def job_matches_type(job: Dict[str, Any], job_type: str) -> bool:
+    job_type = normalize(job_type)
     contract = normalize(job.get("contract", ""))
 
+    if job_type in ("both", "any", ""):
+        return True
+
     if job_type == "fulltime":
-        return "full" in contract
+        return "full" in contract or "full-time" in contract or "full time" in contract
 
     if job_type == "parttime":
-        return any(x in contract for x in ["part", "reduced", "flex"] )
+        return any(x in contract for x in ["part", "reduced", "flex"])
 
     return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOCATION HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
 def resolve_location(location: str) -> str:
     loc = normalize(location)
+
+    if not loc:
+        return ""
 
     if loc in CITY_POSTCODES:
         return CITY_POSTCODES[loc]
 
     for city, postcode in CITY_POSTCODES.items():
-        if loc in city or city in loc:
+        city_norm = normalize(city)
+
+        if loc == city_norm or city_norm in loc or loc in city_norm:
             return postcode
 
-    return str(location).upper()
+    return str(location).strip().upper()
 
 
-def haversine_miles(lat1, lon1, lat2, lon2) -> float:
+def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     radius_miles = 3958.8
 
     lat1, lon1, lat2, lon2 = map(
@@ -179,36 +198,85 @@ def haversine_miles(lat1, lon1, lat2, lon2) -> float:
     return radius_miles * 2 * math.asin(math.sqrt(a))
 
 
-async def get_postcode_coords_api(postcode: str) -> tuple[float | None, float | None]:
-    clean = postcode.replace(" ", "").upper()
+def clean_postcode(postcode: str) -> str:
+    return str(postcode or "").replace(" ", "").upper().strip()
 
-    # Cache check with TTL
-    if clean in POSTCODE_CACHE:
-        lat, lon, ts = POSTCODE_CACHE[clean]
-        if datetime.utcnow() - ts < CACHE_TTL:
+
+async def get_session() -> aiohttp.ClientSession:
+    global SESSION
+
+    if SESSION is None or SESSION.closed:
+        timeout = aiohttp.ClientTimeout(total=POSTCODE_API_TIMEOUT)
+        SESSION = aiohttp.ClientSession(timeout=timeout)
+
+    return SESSION
+
+
+async def close_session() -> None:
+    global SESSION
+
+    if SESSION and not SESSION.closed:
+        await SESSION.close()
+
+    SESSION = None
+
+
+async def get_postcode_coords_api(postcode: str) -> tuple[Optional[float], Optional[float]]:
+    clean = clean_postcode(postcode)
+
+    if not clean:
+        return None, None
+
+    cached = POSTCODE_CACHE.get(clean)
+
+    if cached:
+        lat, lon, ts = cached
+        if utc_now() - ts < CACHE_TTL:
             return lat, lon
 
-    try:
-        session = await get_session()
+    url = f"https://api.postcodes.io/postcodes/{clean}"
 
-        async with session.get(f"https://api.postcodes.io/postcodes/{clean}") as response:
-            data = await response.json()
+    for attempt in range(1, POSTCODE_RETRIES + 1):
+        try:
+            session = await get_session()
 
-            if data.get("status") == 200:
-                result = data.get("result", {})
-                coords = result.get("latitude"), result.get("longitude")
-                POSTCODE_CACHE[clean] = (*coords, datetime.utcnow())
-                return coords
+            async with session.get(url) as response:
+                if response.status != 200:
+                    log.debug("[POSTCODE_API_STATUS] postcode=%s status=%s", clean, response.status)
+                    continue
 
-    except Exception as e:
-        log.debug("[POSTCODE_API_ERROR] %s", e)
+                data = await response.json()
 
-    POSTCODE_CACHE[clean] = (None, None, datetime.utcnow())
+                result = data.get("result") or {}
+                lat = result.get("latitude")
+                lon = result.get("longitude")
+
+                if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                    POSTCODE_CACHE[clean] = (float(lat), float(lon), utc_now())
+                    return float(lat), float(lon)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
+            log.debug("[POSTCODE_API_ERROR] postcode=%s attempt=%s error=%s", clean, attempt, e)
+
+        await asyncio.sleep(0.3 * attempt)
+
+    POSTCODE_CACHE[clean] = (None, None, utc_now())
     return None, None
 
 
-async def get_coords(postcode: str) -> tuple[float | None, float | None]:
-    clean = postcode.strip().upper()
+async def get_coords(postcode: str) -> tuple[Optional[float], Optional[float]]:
+    clean = clean_postcode(postcode)
+
+    if not clean:
+        return None, None
+
+    spaced = str(postcode or "").strip().upper()
+
+    if spaced in CITY_COORDS:
+        return CITY_COORDS[spaced]
 
     if clean in CITY_COORDS:
         return CITY_COORDS[clean]
@@ -216,34 +284,57 @@ async def get_coords(postcode: str) -> tuple[float | None, float | None]:
     return await get_postcode_coords_api(clean)
 
 
-async def job_distance_miles(job_postcode: str, location: str) -> float | None:
+async def job_distance_miles(job_postcode: str, location: str) -> Optional[float]:
     try:
-        postcode = resolve_location(location)
+        user_postcode = resolve_location(location)
 
-        lat1, lon1 = await get_coords(postcode)
+        lat1, lon1 = await get_coords(user_postcode)
         lat2, lon2 = await get_coords(job_postcode)
 
-        if all(value is not None for value in [lat1, lon1, lat2, lon2]):
-            return round(haversine_miles(lat1, lon1, lat2, lon2), 1)
+        if None in (lat1, lon1, lat2, lon2):
+            return None
+
+        return round(haversine_miles(float(lat1), float(lon1), float(lat2), float(lon2)), 1)
+
+    except asyncio.CancelledError:
+        raise
 
     except Exception as e:
-        log.debug("[DISTANCE_ERROR] %s", e)
+        log.debug("[DISTANCE_ERROR] job_postcode=%s location=%s error=%s", job_postcode, location, e)
+        return None
 
-    return None
+
+def build_location(city: str, state: str, geo: str, postcode: str) -> str:
+    parts = []
+
+    if city:
+        parts.append(city.strip())
+
+    if state and normalize(state) != normalize(city):
+        parts.append(state.strip())
+
+    base = ", ".join(parts)
+
+    if geo and postcode:
+        return f"{base} ({geo.strip()}) {postcode.strip()}".strip()
+
+    if geo:
+        return f"{base} ({geo.strip()})".strip()
+
+    if postcode:
+        return f"{base} {postcode.strip()}".strip()
+
+    return base or "Unknown UK Location"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PARSE AMAZON JOB CARD
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_card(card: dict) -> dict | None:
+def parse_card(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
-        job_id = str(card.get("jobId", ""))
+        job_id = str(card.get("jobId") or "").strip()
 
         if not job_id:
             return None
 
-        title = card.get("jobTitle", "") or ""
+        title = str(card.get("jobTitle") or "").strip()
 
         log.info("[SCAN] %s — %s", job_id, title)
 
@@ -251,79 +342,63 @@ def parse_card(card: dict) -> dict | None:
             log.info("[SKIP] Not warehouse: %s", title)
             return None
 
-        city = card.get("city") or card.get("locationName") or ""
-        state = card.get("state") or "England"
-        postcode = card.get("postalCode") or ""
-        geo = card.get("geoClusterDescription") or ""
+        hours = parse_hours(card.get("hoursPerWeek"))
 
-        pay_raw = card.get("totalPayRateMax") or card.get("totalPayRateMin") or 0
-
-        try:
-            pay = float(str(pay_raw).replace("£", "").strip())
-        except Exception:
-            pay = 0.0
-
-        employment = card.get("employmentType") or ""
-        job_type = card.get("jobType") or ""
-        contract = employment or job_type or "Seasonal"
-
-        hours = None
-
-        if card.get("hoursPerWeek"):
-            try:
-                hours = str(int(card.get("hoursPerWeek")))
-            except Exception:
-                hours = None
-
-        if hours and int(hours) < 36:
+        if hours is not None and hours < 36:
             log.info("[SKIP] Part-time %shrs", hours)
             return None
 
-        first_day = card.get("firstDayOnSite") or None
-        sched_count = card.get("scheduleCount", 0)
-        shift_code = card.get("shiftCode") or ""
-        schedule = shift_code if shift_code else None
+        city = str(card.get("city") or card.get("locationName") or "").strip()
+        state = str(card.get("state") or "England").strip()
+        postcode = str(card.get("postalCode") or "").strip().upper()
+        geo = str(card.get("geoClusterDescription") or "").strip()
 
-        parts = []
+        pay_raw = card.get("totalPayRateMax") or card.get("totalPayRateMin")
+        pay = parse_pay(pay_raw)
 
-        if city:
-            parts.append(city)
+        employment = str(card.get("employmentType") or "").strip()
+        amazon_job_type = str(card.get("jobType") or "").strip()
+        contract = employment or amazon_job_type or "Seasonal"
 
-        if state and state != city:
-            parts.append(state)
+        shift_code = str(card.get("shiftCode") or "").strip()
+        schedule = shift_code or None
 
-        # Clean location formatting
-        parts_clean = ", ".join(p.strip() for p in parts if p.strip())
+        location = build_location(city, state, geo, postcode)
 
-        if geo and postcode:
-            location = f"{parts_clean} ({geo}) {postcode}"
-        elif geo:
-            location = f"{parts_clean} ({geo})"
-        elif postcode:
-            location = f"{parts_clean} {postcode}"
-        else:
-            location = parts_clean or "Unknown UK Location"
-
-        log.info("[ACCEPT] %s — %s £%s/hr", title, location, pay)
-
-        return {
+        job = {
             "id": job_id,
             "title": title,
             "location": location,
             "postcode": postcode,
-            "pay": round(pay, 2),
+            "pay": pay,
             "pay_display": f"{pay:.2f}",
             "contract": contract,
-            "firstDay": first_day,
+            "firstDay": card.get("firstDayOnSite") or None,
             "schedule": schedule,
-            "hours": hours,
-            "sched_count": sched_count,
+            "hours": str(hours) if hours is not None else None,
+            "sched_count": card.get("scheduleCount", 0) or 0,
             "shifts": [],
             "description": None,
             "link": f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}",
-            "found_at": datetime.utcnow().isoformat(),
+            "found_at": utc_now().isoformat(),
         }
 
+        score, skipped = score_job(job)
+
+        if skipped:
+            return None
+
+        job["score"] = score
+        job["is_fresh"] = is_fresh_job(job)
+        job["shift_priority"] = shift_priority(schedule or "")
+
+        log.info("[ACCEPT] %s — %s £%s/hr score=%s", title, location, pay, score)
+
+        return job
+
+    except asyncio.CancelledError:
+        raise
+
     except Exception as e:
-        log.warning("[ERROR] Parse error: %s", e)
+        log.warning("[PARSE_ERROR] %s card=%s", e, card)
         return None
