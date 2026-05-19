@@ -1,4 +1,3 @@
-import base64
 import json
 import logging
 import os
@@ -7,6 +6,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from threading import RLock
 from typing import Any, Callable, Dict, List, Optional, TypeVar
+
+from cryptography.fernet import Fernet, InvalidToken
 
 from config import DATA_DIR, TZ
 
@@ -39,9 +40,11 @@ def _now_iso() -> str:
 
 def _file_lock(path: str) -> RLock:
     real_path = os.path.abspath(path)
+
     with _global_lock:
         if real_path not in _locks:
             _locks[real_path] = RLock()
+
         return _locks[real_path]
 
 
@@ -91,29 +94,13 @@ def _backup_file(path: str, suffix: str) -> Optional[str]:
         return None
 
 
-def _storage_metric(path: str, action: str) -> None:
-    try:
-        if os.path.exists(path):
-            log.debug(
-                "[STORAGE_METRIC] action=%s file=%s size=%s",
-                action,
-                os.path.basename(path),
-                os.path.getsize(path),
-            )
-    except Exception:
-        pass
-
-
 def _read_json_unlocked(path: str, default: T) -> T:
     if not os.path.exists(path):
         return default
 
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        _storage_metric(path, "read")
-        return data
+            return json.load(f)
 
     except json.JSONDecodeError as e:
         backup = _backup_file(path, "corrupt")
@@ -152,8 +139,6 @@ def _write_json_unlocked(path: str, data: Any, backup: bool = True) -> None:
         finally:
             os.close(dir_fd)
 
-        _storage_metric(path, "write")
-
     except Exception as e:
         log.warning("[STORAGE_WRITE_FAILED] %s: %s", path, e)
 
@@ -171,12 +156,23 @@ def _write_json(path: str, data: Any, backup: bool = True) -> None:
         _write_json_unlocked(path, data, backup=backup)
 
 
-def _update_json(path: str, default: T, updater: Callable[[T], T]) -> T:
+def _update_json(
+    path: str,
+    default: T,
+    updater: Callable[[T], T],
+    backup: bool = True,
+) -> T:
     with _locked(path):
         current = _read_json_unlocked(path, default)
         updated = updater(current)
-        _write_json_unlocked(path, updated)
+        _write_json_unlocked(path, updated, backup=backup)
         return updated
+
+
+def clear_known_jobs_cache() -> None:
+    global _known_jobs_cache
+    with _locked(KNOWN_JOBS_FILE):
+        _known_jobs_cache = None
 
 
 def load_subscribers() -> Dict[str, Any]:
@@ -185,10 +181,16 @@ def load_subscribers() -> Dict[str, Any]:
 
 
 def save_subscribers(subscribers: Dict[str, Any]) -> None:
+    if not isinstance(subscribers, dict):
+        log.warning("[SUBSCRIBERS_INVALID] Expected dict")
+        return
+
     _write_json(SUBSCRIBERS_FILE, subscribers)
 
 
-def update_subscribers(updater: Callable[[Dict[str, Any]], Dict[str, Any]]) -> Dict[str, Any]:
+def update_subscribers(
+    updater: Callable[[Dict[str, Any]], Dict[str, Any]]
+) -> Dict[str, Any]:
     return _update_json(SUBSCRIBERS_FILE, {}, updater)
 
 
@@ -212,13 +214,18 @@ def save_known_jobs(known_jobs: Dict[str, Any]) -> None:
 
     with _locked(KNOWN_JOBS_FILE):
         _known_jobs_cache = dict(known_jobs)
-        _write_json_unlocked(KNOWN_JOBS_FILE, _known_jobs_cache)
+        _write_json_unlocked(KNOWN_JOBS_FILE, _known_jobs_cache, backup=True)
 
 
 def save_known_job(job: Dict[str, Any]) -> None:
     global _known_jobs_cache
 
+    if not isinstance(job, dict):
+        log.warning("[KNOWN_JOB_INVALID] Expected dict")
+        return
+
     job_id = job.get("id")
+
     if not job_id:
         log.warning("[KNOWN_JOB_MISSING_ID] %s", job)
         return
@@ -229,12 +236,15 @@ def save_known_job(job: Dict[str, Any]) -> None:
             _known_jobs_cache = data if isinstance(data, dict) else {}
 
         _known_jobs_cache[str(job_id)] = job
-        _write_json_unlocked(KNOWN_JOBS_FILE, _known_jobs_cache)
+
+        # Avoid creating a backup every few seconds during scans.
+        _write_json_unlocked(KNOWN_JOBS_FILE, _known_jobs_cache, backup=False)
 
 
 def is_known_job(job_id: str) -> bool:
     if not job_id:
         return False
+
     return str(job_id) in load_known_jobs()
 
 
@@ -256,9 +266,14 @@ def save_job_history(history: List[Dict[str, Any]]) -> None:
 
 
 def append_job_history(entry: Dict[str, Any]) -> None:
+    if not isinstance(entry, dict):
+        log.warning("[JOB_HISTORY_ENTRY_INVALID] Expected dict")
+        return
+
     def updater(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not isinstance(history, list):
             history = []
+
         history.append(entry)
         return history[-MAX_JOB_HISTORY:]
 
@@ -266,6 +281,10 @@ def append_job_history(entry: Dict[str, Any]) -> None:
 
 
 def save_application(job_id: str, app_id: str, status: str) -> None:
+    if not job_id or not app_id:
+        log.warning("[APPLICATION_INVALID] job_id=%s app_id=%s", job_id, app_id)
+        return
+
     def updater(apps: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(apps, dict):
             apps = {}
@@ -286,38 +305,45 @@ def load_applications() -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def load_application(job_id: str) -> Optional[Dict[str, Any]]:
+    if not job_id:
+        return None
+
+    apps = load_applications()
+    app = apps.get(str(job_id))
+
+    return app if isinstance(app, dict) else None
+
+
 def _cookie_path(account_id: int) -> str:
     return os.path.join(COOKIES_DIR, f"account_{account_id}.json")
 
 
-def _get_cookie_secret() -> Optional[bytes]:
-    raw = os.environ.get("COOKIE_STORAGE_KEY", "").strip()
+def _get_fernet() -> Optional[Fernet]:
+    key = os.environ.get("COOKIE_STORAGE_KEY", "").strip()
 
-    if not raw:
+    if not key:
         return None
 
     try:
-        return base64.urlsafe_b64decode(raw)
-    except Exception:
-        log.warning("[COOKIE_KEY_INVALID] COOKIE_STORAGE_KEY is not valid base64")
+        return Fernet(key.encode("utf-8"))
+    except Exception as e:
+        log.warning("[COOKIE_KEY_INVALID] %s", e)
         return None
 
 
-def _xor_bytes(data: bytes, key: bytes) -> bytes:
-    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
-
-
 def _encode_cookie_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    key = _get_cookie_secret()
+    fernet = _get_fernet()
 
-    if not key:
+    if not fernet:
         return payload
 
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    encrypted = base64.urlsafe_b64encode(_xor_bytes(raw, key)).decode("ascii")
+    encrypted = fernet.encrypt(raw).decode("utf-8")
 
     return {
         "encrypted": True,
+        "algorithm": "fernet",
         "payload": encrypted,
         "saved_at": payload.get("saved_at"),
         "hvhcid": payload.get("hvhcid", ""),
@@ -328,16 +354,25 @@ def _decode_cookie_payload(data: Any) -> Any:
     if not isinstance(data, dict) or not data.get("encrypted"):
         return data
 
-    key = _get_cookie_secret()
+    if data.get("algorithm") != "fernet":
+        log.warning("[COOKIE_DECRYPT_UNSUPPORTED_ALGORITHM] %s", data.get("algorithm"))
+        return None
 
-    if not key:
+    fernet = _get_fernet()
+
+    if not fernet:
         log.warning("[COOKIE_DECRYPT_SKIPPED] missing COOKIE_STORAGE_KEY")
         return None
 
     try:
-        encrypted = base64.urlsafe_b64decode(data.get("payload", ""))
-        raw = _xor_bytes(encrypted, key)
+        token = data.get("payload", "").encode("utf-8")
+        raw = fernet.decrypt(token)
         return json.loads(raw.decode("utf-8"))
+
+    except InvalidToken:
+        log.warning("[COOKIE_DECRYPT_INVALID_TOKEN]")
+        return None
+
     except Exception as e:
         log.warning("[COOKIE_DECRYPT_FAILED] %s", e)
         return None
@@ -346,6 +381,7 @@ def _decode_cookie_payload(data: Any) -> Any:
 def load_cookie_record(account_id: int) -> Optional[Dict[str, Any]]:
     data = _read_json(_cookie_path(account_id), None)
     decoded = _decode_cookie_payload(data)
+
     return decoded if isinstance(decoded, dict) else None
 
 
@@ -386,6 +422,7 @@ def get_cookie_age_hours(account_id: int) -> Optional[float]:
         return None
 
     saved_at = data.get("saved_at")
+
     if not saved_at:
         return None
 
