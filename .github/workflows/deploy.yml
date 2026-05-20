@@ -1,114 +1,73 @@
-name: Deploy to Server (V2)
+- name: Deploy zero-downtime
+  run: |
+    ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << EOF
 
-on:
-  push:
-    branches:
-      - main
+    set -euxo pipefail
 
-concurrency:
-  group: production-deploy
-  cancel-in-progress: true
+    APP_DIR="/opt/amazon-bot"
+    RELEASES_DIR="\$APP_DIR/releases"
+    CURRENT_LINK="\$APP_DIR/current"
+    VENV_DIR="\$APP_DIR/venv"
 
-jobs:
-  deploy:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    NEW_RELEASE="\$RELEASES_DIR/$GITHUB_SHA"
+    PACKAGE="/tmp/release-$GITHUB_SHA.tar.gz"
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    LIVE_PORT=3000
+    NEW_PORT=3001
 
-      - name: Validate Python syntax
-        run: |
-          python3 -m py_compile main.py
+    mkdir -p "\$RELEASES_DIR"
+    rm -rf "\$NEW_RELEASE"
+    mkdir -p "\$NEW_RELEASE"
 
-      - name: Create release package
-        run: |
-          mkdir -p release
-          rsync -av \
-            --exclude '.git' \
-            --exclude 'venv' \
-            --exclude '__pycache__' \
-            --exclude '.github' \
-            ./ release/
+    tar -xzf "\$PACKAGE" -C "\$NEW_RELEASE"
 
-          tar -czf release.tar.gz -C release .
+    python3 -m py_compile "\$NEW_RELEASE/main.py"
 
-      - name: Setup SSH
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+    if [ ! -d "\$VENV_DIR" ]; then
+      python3 -m venv "\$VENV_DIR"
+      source "\$VENV_DIR/bin/activate"
+      pip install -r "\$NEW_RELEASE/requirements.txt"
+      python -m playwright install chromium
+    fi
 
-      - name: Upload release
-        run: |
-          scp -i ~/.ssh/id_rsa release.tar.gz \
-            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/tmp/release-${{ github.sha }}.tar.gz
+    # ✅ Start NEW version on 3001
+    echo "🚀 Starting new version on \$NEW_PORT"
+    ln -sfn "\$NEW_RELEASE" "\$CURRENT_LINK"
+    sudo systemctl start amazon-bot@\${NEW_PORT}
 
-      - name: Deploy on server atomic
-        run: |
-          ssh -i ~/.ssh/id_rsa \
-            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+    # ✅ Wait for NEW version to be ready
+    for i in {1..20}; do
+      if curl -fs http://localhost:\$NEW_PORT/health; then
+        echo "✅ New version is healthy"
+        break
+      fi
+      sleep 2
+    done
 
-          set -euxo pipefail
+    # ✅ Switch traffic (stop old, keep new)
+    echo "🔁 Switching traffic"
+    sudo systemctl stop amazon-bot@\${LIVE_PORT}
+    sudo systemctl restart amazon-bot@\${NEW_PORT}
 
-          APP_DIR="/opt/amazon-bot"
-          RELEASES_DIR="$APP_DIR/releases"
-          CURRENT_LINK="$APP_DIR/current"
-          SHARED_VENV="$APP_DIR/venv"
-          NEW_RELEASE="$RELEASES_DIR/${{ github.sha }}"
-          PACKAGE="/tmp/release-${{ github.sha }}.tar.gz"
+    # ✅ Promote new to live
+    mv "\$APP_DIR/current" "\$APP_DIR/current_old" || true
+    ln -sfn "\$NEW_RELEASE" "\$APP_DIR/current"
 
-          mkdir -p "$RELEASES_DIR"
+    # ✅ Verify after switch
+    for i in {1..10}; do
+      if curl -fs http://localhost:\$NEW_PORT/health; then
+        echo "✅ Zero-downtime deploy successful"
+        rm -f "\$PACKAGE"
+        exit 0
+      fi
+      sleep 2
+    done
 
-          rm -rf "$NEW_RELEASE"
-          mkdir -p "$NEW_RELEASE"
-          tar -xzf "$PACKAGE" -C "$NEW_RELEASE"
+    echo "❌ Deploy failed — rollback"
 
-          python3 -m py_compile "$NEW_RELEASE/main.py"
+    sudo systemctl stop amazon-bot@\${NEW_PORT}
+    sudo systemctl start amazon-bot@\${LIVE_PORT}
 
-          if [ ! -d "$SHARED_VENV" ]; then
-            python3 -m venv "$SHARED_VENV"
-          fi
+    exit 1
 
-          source "$SHARED_VENV/bin/activate"
-
-          python3 -m pip install --upgrade pip --quiet
-          python3 -m pip install -r "$NEW_RELEASE/requirements.txt" --quiet
-          python3 -m pip check || true
-          python3 -m playwright install chromium
-
-          PREVIOUS=""
-          if [ -L "$CURRENT_LINK" ]; then
-            PREVIOUS="$(readlink -f "$CURRENT_LINK")"
-          fi
-
-          ln -sfn "$NEW_RELEASE" "$CURRENT_LINK"
-
-          sudo systemctl restart amazon-bot
-
-          for i in {1..30}; do
-            if curl -fs http://localhost:3000/health; then
-              echo "✅ Deploy successful"
-              rm -f "$PACKAGE"
-              exit 0
-            fi
-            echo "Waiting for health... $i/30"
-            sleep 2
-          done
-
-          echo "❌ Deploy failed — rolling back"
-          journalctl -u amazon-bot -n 80 --no-pager || true
-
-          if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
-            ln -sfn "$PREVIOUS" "$CURRENT_LINK"
-            sudo systemctl restart amazon-bot
-            echo "Rolled back to $PREVIOUS"
-          else
-            echo "No previous release available"
-          fi
-
-          rm -f "$PACKAGE"
-          exit 1
-          EOF
+    EOF
