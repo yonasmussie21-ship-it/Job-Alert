@@ -1,17 +1,64 @@
-- name: Configure SSH
-  run: |
-    mkdir -p ~/.ssh
-    echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_rsa
-    chmod 600 ~/.ssh/id_rsa
-    ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+name: Deploy to Server
+on:
+  push:
+    branches:
+      - main
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
 
-- name: Test SSH connection
-  run: |
-    ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
-      "echo '✅ SSH connected'"
+jobs:
+  deploy:
+    name: Production Deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
-- name: Deploy to server
-  run: |
-    ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-      ...
-    EOF
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Test SSH connection
+        run: |
+          ssh -i ~/.ssh/id_rsa \
+              ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
+              "echo '✅ SSH connected'"
+
+      - name: Deploy to server
+        run: |
+          ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            set -euxo pipefail
+            echo "🚀 Starting deployment..."
+            cd /home/ubuntu/Job-Alert/repo
+            git fetch origin main
+            git reset --hard origin/main
+            git clean -fd
+            chmod +x deploy.sh
+            ./deploy.sh
+            echo "✅ Deployment complete"
+          EOF
+
+      - name: Success summary
+        if: success()
+        run: |
+          echo "## ✅ Deploy Successful" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** main | **Time:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="❌ Deploy failed. Check: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Failure summary
+        if: failure()
+        run: |
+          echo "## ❌ Deploy Failed" >> $GITHUB_STEP_SUMMARY
+          echo "Check logs above for details." >> $GITHUB_STEP_SUMMARY
