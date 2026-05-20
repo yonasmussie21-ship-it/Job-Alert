@@ -120,7 +120,6 @@ async def main():
 
     subscribers = ensure_owner_subscriber()
     accounts = load_accounts()
-
     state = {
         "subscribers": subscribers,
         "known_jobs": load_known_jobs(),
@@ -142,13 +141,11 @@ async def main():
     log.info("[READY] service healthy")
 
     await shutdown_event.wait()
-
     health_state["ready"] = False
     await shutdown_tasks(tasks)
 
     with suppress(Exception):
         await close_session()
-
     return 0 if health_state["critical_tasks_alive"] else 1
 
 
