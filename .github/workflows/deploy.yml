@@ -9,8 +9,8 @@
     CURRENT_LINK="\$APP_DIR/current"
     VENV_DIR="\$APP_DIR/venv"
 
-    NEW_RELEASE="\$RELEASES_DIR/$GITHUB_SHA"
-    PACKAGE="/tmp/release-$GITHUB_SHA.tar.gz"
+    NEW_RELEASE="\$RELEASES_DIR/${{ github.sha }}"
+    PACKAGE="/tmp/release-${{ github.sha }}.tar.gz"
 
     LIVE_PORT=3000
     NEW_PORT=3001
@@ -30,39 +30,36 @@
       python -m playwright install chromium
     fi
 
-    # ✅ Start NEW version on 3001
+    # ✅ Start new version
     echo "🚀 Starting new version on \$NEW_PORT"
     ln -sfn "\$NEW_RELEASE" "\$CURRENT_LINK"
     sudo systemctl start amazon-bot@\${NEW_PORT}
 
-    # ✅ Wait for NEW version to be ready
+    # ✅ Wait for health
     for i in {1..20}; do
       if curl -fs http://localhost:\$NEW_PORT/health; then
-        echo "✅ New version is healthy"
+        echo "✅ New version healthy"
         break
       fi
       sleep 2
     done
 
-    # ✅ Switch traffic (stop old, keep new)
+    # ✅ Switch traffic
     echo "🔁 Switching traffic"
     sudo systemctl stop amazon-bot@\${LIVE_PORT}
     sudo systemctl restart amazon-bot@\${NEW_PORT}
 
-    # ✅ Promote new to live
-    mv "\$APP_DIR/current" "\$APP_DIR/current_old" || true
-    ln -sfn "\$NEW_RELEASE" "\$APP_DIR/current"
-
-    # ✅ Verify after switch
+    # ✅ Final verification
     for i in {1..10}; do
       if curl -fs http://localhost:\$NEW_PORT/health; then
-        echo "✅ Zero-downtime deploy successful"
+        echo "✅ Zero-downtime deploy complete"
         rm -f "\$PACKAGE"
         exit 0
       fi
       sleep 2
     done
 
+    # ❌ Rollback
     echo "❌ Deploy failed — rollback"
 
     sudo systemctl stop amazon-bot@\${NEW_PORT}
@@ -71,3 +68,4 @@
     exit 1
 
     EOF
+``
