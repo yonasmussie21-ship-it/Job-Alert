@@ -1,64 +1,114 @@
-name: Deploy to Server
+name: Deploy to Server (V2)
+
 on:
   push:
     branches:
       - main
+
 concurrency:
   group: production-deploy
   cancel-in-progress: true
 
 jobs:
   deploy:
-    name: Production Deploy
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure SSH
+      - name: Validate Python syntax
+        run: |
+          python3 -m py_compile main.py
+
+      - name: Create release package
+        run: |
+          mkdir -p release
+          rsync -av \
+            --exclude '.git' \
+            --exclude 'venv' \
+            --exclude '__pycache__' \
+            --exclude '.github' \
+            ./ release/
+
+          tar -czf release.tar.gz -C release .
+
+      - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Test SSH connection
+      - name: Upload release
+        run: |
+          scp -i ~/.ssh/id_rsa release.tar.gz \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/tmp/release-${{ github.sha }}.tar.gz
+
+      - name: Deploy on server atomic
         run: |
           ssh -i ~/.ssh/id_rsa \
-              ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
-              "echo '✅ SSH connected'"
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
 
-      - name: Deploy to server
-        run: |
-          ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-            set -euxo pipefail
-            echo "🚀 Starting deployment..."
-            cd /home/ubuntu/Job-Alert/repo
-            git fetch origin main
-            git reset --hard origin/main
-            git clean -fd
-            chmod +x deploy.sh
-            ./deploy.sh
-            echo "✅ Deployment complete"
+          set -euxo pipefail
+
+          APP_DIR="/opt/amazon-bot"
+          RELEASES_DIR="$APP_DIR/releases"
+          CURRENT_LINK="$APP_DIR/current"
+          SHARED_VENV="$APP_DIR/venv"
+          NEW_RELEASE="$RELEASES_DIR/${{ github.sha }}"
+          PACKAGE="/tmp/release-${{ github.sha }}.tar.gz"
+
+          mkdir -p "$RELEASES_DIR"
+
+          rm -rf "$NEW_RELEASE"
+          mkdir -p "$NEW_RELEASE"
+          tar -xzf "$PACKAGE" -C "$NEW_RELEASE"
+
+          python3 -m py_compile "$NEW_RELEASE/main.py"
+
+          if [ ! -d "$SHARED_VENV" ]; then
+            python3 -m venv "$SHARED_VENV"
+          fi
+
+          source "$SHARED_VENV/bin/activate"
+
+          python3 -m pip install --upgrade pip --quiet
+          python3 -m pip install -r "$NEW_RELEASE/requirements.txt" --quiet
+          python3 -m pip check || true
+          python3 -m playwright install chromium
+
+          PREVIOUS=""
+          if [ -L "$CURRENT_LINK" ]; then
+            PREVIOUS="$(readlink -f "$CURRENT_LINK")"
+          fi
+
+          ln -sfn "$NEW_RELEASE" "$CURRENT_LINK"
+
+          sudo systemctl restart amazon-bot
+
+          for i in {1..30}; do
+            if curl -fs http://localhost:3000/health; then
+              echo "✅ Deploy successful"
+              rm -f "$PACKAGE"
+              exit 0
+            fi
+            echo "Waiting for health... $i/30"
+            sleep 2
+          done
+
+          echo "❌ Deploy failed — rolling back"
+          journalctl -u amazon-bot -n 80 --no-pager || true
+
+          if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
+            ln -sfn "$PREVIOUS" "$CURRENT_LINK"
+            sudo systemctl restart amazon-bot
+            echo "Rolled back to $PREVIOUS"
+          else
+            echo "No previous release available"
+          fi
+
+          rm -f "$PACKAGE"
+          exit 1
           EOF
-
-      - name: Success summary
-        if: success()
-        run: |
-          echo "## ✅ Deploy Successful" >> $GITHUB_STEP_SUMMARY
-          echo "**Branch:** main | **Time:** $(date -u)" >> $GITHUB_STEP_SUMMARY
-
-      - name: Notify Telegram on failure
-        if: failure()
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d text="❌ Deploy failed. Check: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-      - name: Failure summary
-        if: failure()
-        run: |
-          echo "## ❌ Deploy Failed" >> $GITHUB_STEP_SUMMARY
-          echo "Check logs above for details." >> $GITHUB_STEP_SUMMARY
