@@ -1,71 +1,13 @@
-- name: Deploy zero-downtime
+- name: Fix SSH access
   run: |
-    ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << EOF
+    ssh -i ~/.ssh/id_rsa \
+      -o StrictHostKeyChecking=no \
+      ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
 
-    set -euxo pipefail
+      mkdir -p ~/.ssh
 
-    APP_DIR="/opt/amazon-bot"
-    RELEASES_DIR="\$APP_DIR/releases"
-    CURRENT_LINK="\$APP_DIR/current"
-    VENV_DIR="\$APP_DIR/venv"
+      echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdgtmbnwR38Bqd8IFzqImTAGq4yMDUaDoBQCUWB5MHO github-deploy" >> ~/.ssh/authorized_keys
 
-    NEW_RELEASE="\$RELEASES_DIR/${{ github.sha }}"
-    PACKAGE="/tmp/release-${{ github.sha }}.tar.gz"
-
-    LIVE_PORT=3000
-    NEW_PORT=3001
-
-    mkdir -p "\$RELEASES_DIR"
-    rm -rf "\$NEW_RELEASE"
-    mkdir -p "\$NEW_RELEASE"
-
-    tar -xzf "\$PACKAGE" -C "\$NEW_RELEASE"
-
-    python3 -m py_compile "\$NEW_RELEASE/main.py"
-
-    if [ ! -d "\$VENV_DIR" ]; then
-      python3 -m venv "\$VENV_DIR"
-      source "\$VENV_DIR/bin/activate"
-      pip install -r "\$NEW_RELEASE/requirements.txt"
-      python -m playwright install chromium
-    fi
-
-    # ✅ Start new version
-    echo "🚀 Starting new version on \$NEW_PORT"
-    ln -sfn "\$NEW_RELEASE" "\$CURRENT_LINK"
-    sudo systemctl start amazon-bot@\${NEW_PORT}
-
-    # ✅ Wait for health
-    for i in {1..20}; do
-      if curl -fs http://localhost:\$NEW_PORT/health; then
-        echo "✅ New version healthy"
-        break
-      fi
-      sleep 2
-    done
-
-    # ✅ Switch traffic
-    echo "🔁 Switching traffic"
-    sudo systemctl stop amazon-bot@\${LIVE_PORT}
-    sudo systemctl restart amazon-bot@\${NEW_PORT}
-
-    # ✅ Final verification
-    for i in {1..10}; do
-      if curl -fs http://localhost:\$NEW_PORT/health; then
-        echo "✅ Zero-downtime deploy complete"
-        rm -f "\$PACKAGE"
-        exit 0
-      fi
-      sleep 2
-    done
-
-    # ❌ Rollback
-    echo "❌ Deploy failed — rollback"
-
-    sudo systemctl stop amazon-bot@\${NEW_PORT}
-    sudo systemctl start amazon-bot@\${LIVE_PORT}
-
-    exit 1
-
+      chmod 700 ~/.ssh
+      chmod 600 ~/.ssh/authorized_keys
     EOF
-``
