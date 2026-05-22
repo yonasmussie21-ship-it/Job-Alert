@@ -1,26 +1,28 @@
-name: Fix SSH Access
+name: Deploy
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
-  fix-ssh:
+  deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
       - name: Write SSH key
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-      - name: Add deploy key to authorized_keys
+      - name: Deploy to server
         run: |
           ssh -i ~/.ssh/id_rsa \
             -o StrictHostKeyChecking=no \
             ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-            mkdir -p ~/.ssh
-            grep -qF "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdgtmbnwR38Bqd8IFzqImTAGq4yMDUaDoBQCUWB5MHO" ~/.ssh/authorized_keys \
-              || echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdgtmbnwR38Bqd8IFzqImTAGq4yMDUaDoBQCUWB5MHO github-deploy" >> ~/.ssh/authorized_keys
-            chmod 700 ~/.ssh
-            chmod 600 ~/.ssh/authorized_keys
+            cd /opt/amazon-bot/current
+            git pull
+            sudo systemctl restart amazon-bot
           EOF
