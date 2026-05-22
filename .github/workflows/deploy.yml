@@ -1,12 +1,11 @@
 name: Fix SSH Access
 
 on:
-  workflow_dispatch: # Run manually from GitHub Actions tab
+  workflow_dispatch:
 
 jobs:
   fix-ssh:
     runs-on: ubuntu-latest
-
     steps:
       - name: Write SSH key
         run: |
