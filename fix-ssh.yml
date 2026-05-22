@@ -1,0 +1,26 @@
+name: Fix SSH Access
+
+on:
+  workflow_dispatch: # Run manually from GitHub Actions tab
+
+jobs:
+  fix-ssh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Add deploy key to authorized_keys
+        run: |
+          ssh -i ~/.ssh/id_rsa \
+            -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            mkdir -p ~/.ssh
+            grep -qF "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdgtmbnwR38Bqd8IFzqImTAGq4yMDUaDoBQCUWB5MHO" ~/.ssh/authorized_keys \
+              || echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdgtmbnwR38Bqd8IFzqImTAGq4yMDUaDoBQCUWB5MHO github-deploy" >> ~/.ssh/authorized_keys
+            chmod 700 ~/.ssh
+            chmod 600 ~/.ssh/authorized_keys
+          EOF
