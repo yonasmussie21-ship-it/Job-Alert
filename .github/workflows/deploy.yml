@@ -5,127 +5,34 @@ on:
   push:
     branches: [main]
 
-concurrency:
-  group: production-deploy
-  cancel-in-progress: false
-
 jobs:
   deploy:
-    name: Deploy Amazon Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
       - name: Configure SSH
-        shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-
           ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
 
       - name: Deploy release
-        shell: bash
         run: |
           set -euo pipefail
 
-          ssh -i ~/.ssh/id_rsa \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            "${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}" << 'EOF'
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=yes \
+          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+
           set -euo pipefail
 
           APP_BASE="/opt/amazon-bot"
-          REPO_URL="git@github.com:yonasmussie21-ship-it/Job-Alert.git"
-          BRANCH="main"
-          SERVICE_NAME="amazon-bot"
-
           RELEASES_DIR="$APP_BASE/releases"
-          SHARED_DIR="$APP_BASE/shared"
           CURRENT="$APP_BASE/current"
+          REPO="https://github.com/yonasmussie21-ship-it/Job-Alert.git"
 
-          RELEASE_ID="$(date +%Y%m%d_%H%M%S)"
+          RELEASE_ID=$(date +%Y%m%d_%H%M%S)
           RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
 
-          PREVIOUS_RELEASE=""
-          if [ -L "$CURRENT" ]; then
-            PREVIOUS_RELEASE="$(readlink -f "$CURRENT")"
-          fi
-
-          rollback() {
-            echo "Deployment failed. Rolling back..."
-
-            if [ -n "$PREVIOUS_RELEASE" ] && [ -d "$PREVIOUS_RELEASE" ]; then
-              ln -sfn "$PREVIOUS_RELEASE" "$CURRENT"
-              sudo systemctl restart "$SERVICE_NAME"
-              echo "Rolled back to previous release: $PREVIOUS_RELEASE"
-            else
-              echo "No previous release available for rollback."
-            fi
-
-            exit 1
-          }
-
-          trap rollback ERR
-
-          echo "Creating release directory..."
-          mkdir -p "$RELEASES_DIR" "$SHARED_DIR" "$RELEASE_DIR"
-
-          echo "Cloning repository..."
-          git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$RELEASE_DIR"
-
-          cd "$RELEASE_DIR"
-
-          echo "Linking shared files..."
-          if [ -f "$SHARED_DIR/.env" ]; then
-            ln -sfn "$SHARED_DIR/.env" "$RELEASE_DIR/.env"
-          fi
-
-          if [ -d "$SHARED_DIR/data" ]; then
-            ln -sfn "$SHARED_DIR/data" "$RELEASE_DIR/data"
-          else
-            mkdir -p "$SHARED_DIR/data"
-            ln -sfn "$SHARED_DIR/data" "$RELEASE_DIR/data"
-          fi
-
-          if [ -d "$SHARED_DIR/logs" ]; then
-            ln -sfn "$SHARED_DIR/logs" "$RELEASE_DIR/logs"
-          else
-            mkdir -p "$SHARED_DIR/logs"
-            ln -sfn "$SHARED_DIR/logs" "$RELEASE_DIR/logs"
-          fi
-
-          echo "Creating virtual environment..."
-          python3 -m venv venv
-
-          echo "Installing dependencies..."
-          ./venv/bin/python -m pip install --upgrade pip
-          ./venv/bin/pip install --no-cache-dir -r requirements.txt
-
-          echo "Switching release atomically..."
-          ln -sfn "$RELEASE_DIR" "$APP_BASE/current_tmp"
-          mv -Tf "$APP_BASE/current_tmp" "$CURRENT"
-
-          echo "Restarting service..."
-          sudo systemctl restart "$SERVICE_NAME"
-
-          echo "Checking service health..."
-          sleep 5
-          sudo systemctl is-active --quiet "$SERVICE_NAME"
-
-          echo "Cleaning old releases..."
-          find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d \
-            | sort -r \
-            | tail -n +6 \
-            | xargs -r rm -rf
-
-          trap - ERR
-
-          echo "SUCCESS: $SERVICE_NAME deployed release $RELEASE_ID"
-          EOF
