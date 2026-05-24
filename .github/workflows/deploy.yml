@@ -5,19 +5,28 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Configure SSH
         run: |
           set -euo pipefail
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
+
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
+
           ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
 
       - name: Deploy release
         run: |
@@ -32,7 +41,57 @@ jobs:
           RELEASES_DIR="$APP_BASE/releases"
           CURRENT="$APP_BASE/current"
           REPO="https://github.com/yonasmussie21-ship-it/Job-Alert.git"
+          SERVICE="amazon-bot"
 
           RELEASE_ID=$(date +%Y%m%d_%H%M%S)
           RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
+          PREVIOUS_RELEASE=""
 
+          if [ -L "$CURRENT" ]; then
+            PREVIOUS_RELEASE="$(readlink -f "$CURRENT")"
+          fi
+
+          rollback() {
+            echo "Deployment failed. Rolling back..."
+
+            if [ -n "$PREVIOUS_RELEASE" ] && [ -d "$PREVIOUS_RELEASE" ]; then
+              ln -sfn "$PREVIOUS_RELEASE" "$CURRENT"
+              sudo systemctl restart "$SERVICE"
+              echo "Rolled back to $PREVIOUS_RELEASE"
+            else
+              echo "No previous release found."
+            fi
+
+            exit 1
+          }
+
+          trap rollback ERR
+
+          mkdir -p "$RELEASES_DIR"
+
+          echo "Creating release: $RELEASE_ID"
+          git clone --depth 1 -b main "$REPO" "$RELEASE_DIR"
+
+          cd "$RELEASE_DIR"
+
+          python3 -m venv venv
+          ./venv/bin/python -m pip install --upgrade pip
+          ./venv/bin/pip install --no-cache-dir -r requirements.txt
+
+          ln -sfn "$RELEASE_DIR" "$APP_BASE/current_tmp"
+          mv -Tf "$APP_BASE/current_tmp" "$CURRENT"
+
+          sudo systemctl restart "$SERVICE"
+          sleep 5
+          sudo systemctl is-active --quiet "$SERVICE"
+
+          find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d \
+            | sort -r \
+            | tail -n +6 \
+            | xargs -r rm -rf
+
+          trap - ERR
+
+          echo "SUCCESS: deployed $RELEASE_ID"
+
+          EOF
