@@ -1,26 +1,59 @@
 name: Fix SSH Access
 
 on:
-  workflow_dispatch: # Run manually from GitHub Actions tab
+  workflow_dispatch:
 
 jobs:
   fix-ssh:
     runs-on: ubuntu-latest
-    steps:
-      - name: Write SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+    timeout-minutes: 10
 
-      - name: Add deploy key to authorized_keys
+    steps:
+      - name: Configure SSH
         run: |
-          ssh -i ~/.ssh/id_rsa \
-            -o StrictHostKeyChecking=no \
-            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-            mkdir -p ~/.ssh
-            grep -qF "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdgtmbnwR38Bqd8IFzqImTAGq4yMDUaDoBQCUWB5MHO" ~/.ssh/authorized_keys \
-              || echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdgtmbnwR38Bqd8IFzqImTAGq4yMDUaDoBQCUWB5MHO github-deploy" >> ~/.ssh/authorized_keys
-            chmod 700 ~/.ssh
-            chmod 600 ~/.ssh/authorized_keys
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          printf '%s\n' "${{ secrets.SERVER_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Add deploy public key
+        env:
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          DEPLOY_PUBLIC_KEY: ${{ secrets.DEPLOY_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+
+          test -n "$DEPLOY_PUBLIC_KEY"
+
+          ssh \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=3 \
+            -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST" \
+            "DEPLOY_PUBLIC_KEY='$DEPLOY_PUBLIC_KEY' bash -s" << 'EOF'
+
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          touch ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+          grep -qxF "$DEPLOY_PUBLIC_KEY" ~/.ssh/authorized_keys || \
+            printf '%s\n' "$DEPLOY_PUBLIC_KEY" >> ~/.ssh/authorized_keys
+
+          chmod 600 ~/.ssh/authorized_keys
+
+          echo "SSH deploy key installed successfully"
+
           EOF
