@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ ERROR_LOG_FILE = os.path.join(DATA_DIR, "errors.log")
 MAX_JOB_HISTORY = 1000
 MAX_ERROR_LOG_BYTES = 2_000_000
 MAX_BACKUPS_PER_FILE = 5
+MAX_APPLICATION_HISTORY = 20
 
 _locks: Dict[str, RLock] = {}
 _global_lock = RLock()
@@ -44,7 +46,6 @@ def _file_lock(path: str) -> RLock:
     with _global_lock:
         if real_path not in _locks:
             _locks[real_path] = RLock()
-
         return _locks[real_path]
 
 
@@ -202,7 +203,7 @@ def load_known_jobs() -> Dict[str, Any]:
             data = _read_json_unlocked(KNOWN_JOBS_FILE, {})
             _known_jobs_cache = data if isinstance(data, dict) else {}
 
-        return dict(_known_jobs_cache)
+        return copy.deepcopy(_known_jobs_cache)
 
 
 def save_known_jobs(known_jobs: Dict[str, Any]) -> None:
@@ -213,8 +214,9 @@ def save_known_jobs(known_jobs: Dict[str, Any]) -> None:
         return
 
     with _locked(KNOWN_JOBS_FILE):
-        _known_jobs_cache = dict(known_jobs)
-        _write_json_unlocked(KNOWN_JOBS_FILE, _known_jobs_cache, backup=True)
+        updated = copy.deepcopy(known_jobs)
+        _write_json_unlocked(KNOWN_JOBS_FILE, updated, backup=True)
+        _known_jobs_cache = updated
 
 
 def save_known_job(job: Dict[str, Any]) -> None:
@@ -235,8 +237,12 @@ def save_known_job(job: Dict[str, Any]) -> None:
             data = _read_json_unlocked(KNOWN_JOBS_FILE, {})
             _known_jobs_cache = data if isinstance(data, dict) else {}
 
-        _known_jobs_cache[str(job_id)] = job
-        _write_json_unlocked(KNOWN_JOBS_FILE, _known_jobs_cache, backup=False)
+        updated = copy.deepcopy(_known_jobs_cache)
+        updated[str(job_id)] = copy.deepcopy(job)
+
+        # Avoid creating a backup every few seconds during scans.
+        _write_json_unlocked(KNOWN_JOBS_FILE, updated, backup=False)
+        _known_jobs_cache = updated
 
 
 def is_known_job(job_id: str) -> bool:
@@ -283,14 +289,33 @@ def save_application(job_id: str, app_id: str, status: str) -> None:
         log.warning("[APPLICATION_INVALID] job_id=%s app_id=%s", job_id, app_id)
         return
 
+    now = _now_iso()
+
     def updater(apps: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(apps, dict):
             apps = {}
 
+        existing = apps.get(str(job_id), {})
+        existing_history = existing.get("history", [])
+
+        if not isinstance(existing_history, list):
+            existing_history = []
+
+        history = [
+            *existing_history,
+            {
+                "status": status,
+                "app_id": app_id,
+                "at": now,
+            },
+        ][-MAX_APPLICATION_HISTORY:]
+
         apps[str(job_id)] = {
             "app_id": app_id,
             "status": status,
-            "saved_at": _now_iso(),
+            "saved_at": existing.get("saved_at", now),
+            "updated_at": now,
+            "history": history,
         }
 
         return apps
@@ -310,7 +335,7 @@ def load_application(job_id: str) -> Optional[Dict[str, Any]]:
     apps = load_applications()
     app = apps.get(str(job_id))
 
-    return app if isinstance(app, dict) else None
+    return copy.deepcopy(app) if isinstance(app, dict) else None
 
 
 def _cookie_path(account_id: int) -> str:
@@ -388,20 +413,25 @@ def load_cookie_record(account_id: int) -> Optional[Dict[str, Any]]:
     data = _read_json(_cookie_path(account_id), None)
     decoded = _decode_cookie_payload(data)
 
-    return decoded if isinstance(decoded, dict) else None
+    return copy.deepcopy(decoded) if isinstance(decoded, dict) else None
 
 
 def load_cookies(account_id: int) -> Optional[List[Dict[str, Any]]]:
     data = load_cookie_record(account_id)
 
-    if isinstance(data, dict):
-        cookies = data.get("cookies")
-        return cookies if isinstance(cookies, list) else None
+    if not isinstance(data, dict):
+        return None
 
-    if isinstance(data, list):
-        return data
+    cookies = data.get("cookies")
 
-    return None
+    if not isinstance(cookies, list):
+        return None
+
+    if not all(isinstance(cookie, dict) for cookie in cookies):
+        log.warning("[COOKIES_INVALID] account=%s cookies must contain dict objects", account_id)
+        return None
+
+    return copy.deepcopy(cookies)
 
 
 def save_cookies(
@@ -412,8 +442,11 @@ def save_cookies(
     if not isinstance(cookies, list):
         raise ValueError("cookies must be a list")
 
+    if not all(isinstance(cookie, dict) for cookie in cookies):
+        raise ValueError("cookies must contain dict objects")
+
     payload = {
-        "cookies": cookies,
+        "cookies": copy.deepcopy(cookies),
         "hvhcid": hvhcid,
         "saved_at": _now_iso(),
     }
@@ -482,17 +515,43 @@ def log_error(error_type: str, detail: str) -> None:
         log.warning("[ERROR_LOG_FAILED] %s", e)
 
 
+def _can_write_dir(path: str) -> bool:
+    test_path = os.path.join(path, ".storage_healthcheck")
+
+    try:
+        os.makedirs(path, exist_ok=True)
+
+        with open(test_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.remove(test_path)
+        return True
+
+    except Exception as e:
+        log.warning("[STORAGE_HEALTH_WRITE_FAILED] path=%s error=%s", path, e)
+
+        try:
+            if os.path.exists(test_path):
+                os.remove(test_path)
+        except Exception:
+            pass
+
+        return False
+
+
 def storage_health() -> Dict[str, Any]:
     return {
         "data_dir": {
             "path": DATA_DIR,
             "exists": os.path.isdir(DATA_DIR),
-            "writable": os.access(DATA_DIR, os.W_OK),
+            "writable": _can_write_dir(DATA_DIR),
         },
         "cookies_dir": {
             "path": COOKIES_DIR,
             "exists": os.path.isdir(COOKIES_DIR),
-            "writable": os.access(COOKIES_DIR, os.W_OK),
+            "writable": _can_write_dir(COOKIES_DIR),
         },
         "files": {
             "subscribers": SUBSCRIBERS_FILE,
