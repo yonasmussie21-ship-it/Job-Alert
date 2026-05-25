@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Awaitable, Callable, Optional
@@ -11,7 +12,12 @@ import aiohttp
 
 from config import CHAT_ID
 from job_parser import is_fresh_job, shift_priority
-from storage import load_cookies, log_error, save_application
+from storage import (
+    load_application,
+    load_cookies,
+    log_error,
+    save_application,
+)
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +30,12 @@ GRAPHQL_URL = "https://www.jobsatamazon.co.uk/graphql"
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
+AUTO_SUBMIT_COOLDOWN_SECONDS = int(os.getenv("AUTO_SUBMIT_COOLDOWN_SECONDS", "45"))
+MAX_ACCOUNT_FAILURES = int(os.getenv("MAX_ACCOUNT_FAILURES", "5"))
+
+_ACCOUNT_FAILURES: dict[int, int] = {}
+_LAST_SUBMIT_AT: dict[int, float] = {}
+
 
 @dataclass(frozen=True)
 class RequestContext:
@@ -35,9 +47,9 @@ class RequestContext:
 @dataclass
 class StepResult:
     ok: bool
+    status: str = "ok"
     message: str = ""
     data: Any = None
-    status: str = "ok"
 
 
 @dataclass
@@ -60,9 +72,34 @@ class AuthContext:
 
 def full_submit_enabled() -> bool:
     return (
-        os.environ.get("ENABLE_FULL_SUBMIT", "false").lower() == "true"
-        and os.environ.get("CONFIRM_FULL_SUBMIT", "") == "I_UNDERSTAND"
+        os.getenv("ENABLE_FULL_SUBMIT", "false").lower() == "true"
+        and os.getenv("CONFIRM_FULL_SUBMIT", "") == "I_UNDERSTAND"
     )
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _record_failure(account_id: int) -> None:
+    _ACCOUNT_FAILURES[account_id] = _ACCOUNT_FAILURES.get(account_id, 0) + 1
+
+
+def _reset_failures(account_id: int) -> None:
+    _ACCOUNT_FAILURES[account_id] = 0
+
+
+def _circuit_open(account_id: int) -> bool:
+    return _ACCOUNT_FAILURES.get(account_id, 0) >= MAX_ACCOUNT_FAILURES
+
+
+def _cooldown_active(account_id: int) -> bool:
+    last = _LAST_SUBMIT_AT.get(account_id)
+    return bool(last and (_now() - last) < AUTO_SUBMIT_COOLDOWN_SECONDS)
+
+
+def _mark_submit(account_id: int) -> None:
+    _LAST_SUBMIT_AT[account_id] = _now()
 
 
 def safe_json_loads(raw: str, label: str) -> Optional[Any]:
@@ -75,9 +112,9 @@ def safe_json_loads(raw: str, label: str) -> Optional[Any]:
 
 def build_cookie_header(cookies: list[dict[str, Any]]) -> str:
     return "; ".join(
-        f"{cookie.get('name')}={cookie.get('value')}"
-        for cookie in cookies
-        if cookie.get("name") and cookie.get("value")
+        f"{c.get('name')}={c.get('value')}"
+        for c in cookies
+        if c.get("name") and c.get("value")
     )
 
 
@@ -87,29 +124,35 @@ def load_account_cookies(account: dict[str, Any]) -> StepResult:
     if account.get("cookies"):
         cookies = safe_json_loads(account["cookies"], f"ACCOUNT_{acc_id}_COOKIES")
         if isinstance(cookies, list):
-            log.info("[COOKIES_LOADED] account=%s source=account_env count=%s", acc_id, len(cookies))
             return StepResult(ok=True, data=cookies)
 
     cookies = load_cookies(acc_id)
-
     if cookies:
-        log.info("[COOKIES_LOADED] account=%s source=storage count=%s", acc_id, len(cookies))
         return StepResult(ok=True, data=cookies)
 
     if acc_id == 1:
-        raw = os.environ.get("AMAZON_COOKIES", "")
+        raw = os.getenv("AMAZON_COOKIES", "")
         if raw:
             cookies = safe_json_loads(raw, "GLOBAL_COOKIES")
             if isinstance(cookies, list):
-                log.info("[COOKIES_LOADED] account=%s source=global_env count=%s", acc_id, len(cookies))
                 return StepResult(ok=True, data=cookies)
 
-    log.warning("[COOKIES_NOT_FOUND] account=%s", acc_id)
     log_error("COOKIE_EXPIRED", f"account={acc_id}: no cookies")
     return StepResult(ok=False, status="cookie_expired", message="No cookies found")
 
 
 def extract_auth(cookies: list[dict[str, Any]], acc_id: int) -> StepResult:
+    if not all(isinstance(c, dict) for c in cookies):
+        return StepResult(ok=False, status="cookie_expired", message="Invalid cookie format")
+
+    names = {c.get("name") for c in cookies}
+    required = {"HVH_ACCESS_TOKEN", "hvhcid"}
+    missing = required - names
+
+    if missing:
+        log_error("COOKIE_EXPIRED", f"account={acc_id}: missing {sorted(missing)}")
+        return StepResult(ok=False, status="cookie_expired", message=f"Missing cookies: {sorted(missing)}")
+
     token = ""
     hvhcid = ""
     waf_token = ""
@@ -125,13 +168,8 @@ def extract_auth(cookies: list[dict[str, Any]], acc_id: int) -> StepResult:
         elif name == "aws-waf-token":
             waf_token = value
 
-    if not token:
-        log_error("COOKIE_EXPIRED", f"account={acc_id}: no HVH_ACCESS_TOKEN")
-        return StepResult(ok=False, status="cookie_expired", message="No HVH_ACCESS_TOKEN in cookies")
-
-    if not hvhcid:
-        log_error("COOKIE_EXPIRED", f"account={acc_id}: no hvhcid")
-        return StepResult(ok=False, status="cookie_expired", message="No hvhcid in cookies")
+    if not token or not hvhcid:
+        return StepResult(ok=False, status="cookie_expired", message="Required auth cookie value empty")
 
     return StepResult(
         ok=True,
@@ -142,6 +180,24 @@ def extract_auth(cookies: list[dict[str, Any]], acc_id: int) -> StepResult:
             waf_token=waf_token,
         ),
     )
+
+
+def detect_block(text: str) -> Optional[str]:
+    body = (text or "").lower()
+
+    if "<html" in body and "captcha" in body:
+        return "captcha"
+
+    if "captcha" in body:
+        return "captcha"
+
+    if "aws-waf" in body or "waf" in body:
+        return "waf_block"
+
+    if "access denied" in body or "forbidden" in body:
+        return "access_denied"
+
+    return None
 
 
 class AmazonApplicationClient:
@@ -169,11 +225,11 @@ class AmazonApplicationClient:
 
         if app_id:
             referer = (
-                f"https://www.jobsatamazon.co.uk/application/uk/"
+                "https://www.jobsatamazon.co.uk/application/uk/"
                 f"?applicationId={app_id}&jobId={ctx.job_id}"
             )
 
-        headers = {
+        return {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "cookie": build_cookie_header(auth.cookies),
@@ -188,8 +244,6 @@ class AmazonApplicationClient:
             "referer": referer,
             "x-client-request-id": ctx.request_id if not app_id else f"{ctx.request_id}:{app_id}",
         }
-
-        return headers
 
     async def request_text(
         self,
@@ -208,8 +262,13 @@ class AmazonApplicationClient:
                 async with self.session.request(method, url, **kwargs) as response:
                     text = await response.text()
 
+                    blocked = detect_block(text)
+                    if blocked:
+                        log_error(blocked.upper(), f"step={step} status={response.status} body={text[:300]}")
+                        return StepResult(ok=False, status=blocked, message=f"{blocked} detected")
+
                     if response.status in RETRY_STATUSES and attempt < attempts:
-                        delay = (1.5 * attempt) + random.uniform(0, 0.5)
+                        delay = (1.5 * attempt) + random.uniform(0, 0.75)
                         log.warning(
                             "[RETRY_HTTP] request=%s step=%s attempt=%s status=%s body=%s",
                             ctx.request_id,
@@ -235,7 +294,7 @@ class AmazonApplicationClient:
                 last_error = str(exc)
 
                 if attempt < attempts:
-                    delay = (1.5 * attempt) + random.uniform(0, 0.5)
+                    delay = (1.5 * attempt) + random.uniform(0, 0.75)
                     log.warning(
                         "[RETRY_EXCEPTION] request=%s step=%s attempt=%s error=%s",
                         ctx.request_id,
@@ -258,46 +317,29 @@ class AmazonApplicationClient:
         try:
             return StepResult(ok=True, data=json.loads(text))
         except Exception as exc:
-            log.warning(
-                "[%s_JSON_PARSE_FAILED] request=%s error=%s body=%s",
-                step,
-                ctx.request_id,
-                exc,
-                text[:200],
-            )
+            log.warning("[%s_JSON_PARSE_FAILED] request=%s error=%s body=%s", step, ctx.request_id, exc, text[:200])
             return StepResult(ok=False, status="parse_failed", message=f"{step} JSON parse failed")
 
     async def get_csrf_token(self, headers: dict[str, str], ctx: RequestContext) -> StepResult:
         res = await self.request_text("GET", CSRF_URL, headers=headers, step="CSRF", ctx=ctx)
 
-        if res.status == "401":
-            return StepResult(ok=False, status="cookie_expired", message="Cookies expired (401)")
-
-        if res.status == "403":
-            return StepResult(ok=False, status="cookie_expired", message="Cookies blocked (403) — WAF or IP issue")
+        if res.status in {"401", "403", "cookie_expired", "captcha", "waf_block", "access_denied"}:
+            return StepResult(ok=False, status="cookie_expired", message=res.message or "Cookies blocked/expired")
 
         if not res.ok:
             return StepResult(ok=False, status="csrf_failed", message=f"CSRF failed: {res.message[:160]}")
 
         parsed = self.parse_json(res.data["text"], "CSRF", ctx)
-
         if not parsed.ok:
             return StepResult(ok=False, status="csrf_failed", message=parsed.message)
 
         token = parsed.data.get("token", "")
-
         if not token:
             return StepResult(ok=False, status="csrf_failed", message="CSRF token missing")
 
-        log.info("[CSRF_OK] request=%s", ctx.request_id)
         return StepResult(ok=True, data=token)
 
-    async def resolve_candidate_id(
-        self,
-        headers: dict[str, str],
-        hvhcid: str,
-        ctx: RequestContext,
-    ) -> StepResult:
+    async def resolve_candidate_id(self, headers: dict[str, str], hvhcid: str, ctx: RequestContext) -> StepResult:
         payload = {
             "operationName": "queryCandidate",
             "query": """
@@ -314,20 +356,12 @@ class AmazonApplicationClient:
             "variables": {"bbCandidateId": hvhcid},
         }
 
-        res = await self.request_text(
-            "POST",
-            GRAPHQL_URL,
-            json=payload,
-            headers=headers,
-            step="CANDIDATE",
-            ctx=ctx,
-        )
+        res = await self.request_text("POST", GRAPHQL_URL, json=payload, headers=headers, step="CANDIDATE", ctx=ctx)
 
         if not res.ok:
             return StepResult(ok=False, status="candidate_failed", message="Candidate lookup failed")
 
         parsed = self.parse_json(res.data["text"], "CANDIDATE", ctx)
-
         if not parsed.ok:
             return parsed
 
@@ -335,20 +369,11 @@ class AmazonApplicationClient:
         sf_id = candidate.get("candidateSFId", "")
 
         if not sf_id:
-            return StepResult(
-                ok=False,
-                status="candidate_failed",
-                message="candidateSFId not confirmed",
-            )
+            return StepResult(ok=False, status="candidate_failed", message="candidateSFId not confirmed")
 
-        log.info("[CANDIDATE_ID_OK] request=%s candidate=%s...", ctx.request_id, sf_id[:12])
         return StepResult(ok=True, data=sf_id)
 
-    async def find_existing_application(
-        self,
-        headers: dict[str, str],
-        ctx: RequestContext,
-    ) -> StepResult:
+    async def find_existing_application(self, headers: dict[str, str], ctx: RequestContext) -> StepResult:
         res = await self.request_text(
             "GET",
             f"{BASE_URL}/applications?jobId={ctx.job_id}&locale=en-GB",
@@ -361,12 +386,10 @@ class AmazonApplicationClient:
             return StepResult(ok=False, status="app_check_failed", message="Application check failed")
 
         parsed = self.parse_json(res.data["text"], "APP_CHECK", ctx)
-
         if not parsed.ok:
             return parsed
 
         apps = parsed.data if isinstance(parsed.data, list) else parsed.data.get("applications", [])
-
         if not isinstance(apps, list):
             return StepResult(ok=True, data=None)
 
@@ -374,7 +397,6 @@ class AmazonApplicationClient:
             if app.get("jobId") == ctx.job_id:
                 app_id = app.get("applicationId") or app.get("id")
                 if app_id:
-                    log.info("[APP_EXISTING] request=%s app=%s", ctx.request_id, app_id)
                     return StepResult(ok=True, data=app_id)
 
         return StepResult(ok=True, data=None)
@@ -394,26 +416,18 @@ class AmazonApplicationClient:
             return StepResult(ok=False, status="app_create_failed", message="Application creation failed")
 
         parsed = self.parse_json(res.data["text"], "APP_CREATE", ctx)
-
         if not parsed.ok:
             log_error("APP_CREATE_PARSE_ERROR", res.data["text"][:200])
             return StepResult(ok=False, status="app_create_failed", message="Application creation parse error")
 
         app_id = parsed.data.get("applicationId") or parsed.data.get("id")
-
         if not app_id:
             log_error("APP_ID_MISSING", res.data["text"][:200])
-            return StepResult(ok=False, status="app_create_failed", message="Application ID missing in response")
+            return StepResult(ok=False, status="app_create_failed", message="Application ID missing")
 
-        log.info("[APP_CREATED] request=%s app=%s", ctx.request_id, app_id)
         return StepResult(ok=True, data=app_id)
 
-    async def get_best_schedule(
-        self,
-        headers: dict[str, str],
-        app_id: str,
-        ctx: RequestContext,
-    ) -> StepResult:
+    async def get_best_schedule(self, headers: dict[str, str], app_id: str, ctx: RequestContext) -> StepResult:
         res = await self.request_text(
             "POST",
             f"{BASE_URL}/job/get-all-schedules/{ctx.job_id}",
@@ -428,64 +442,44 @@ class AmazonApplicationClient:
             return StepResult(ok=False, status="no_schedule", message="Failed to fetch schedules")
 
         parsed = self.parse_json(res.data["text"], "SCHEDULE", ctx)
-
         if not parsed.ok:
             log_error("SCHEDULE_PARSE_ERROR", res.data["text"][:200])
             return StepResult(ok=False, status="no_schedule", message="Failed to parse schedules")
 
         schedules = parsed.data.get("availableSchedules", {}).get("schedules", [])
-
         if not schedules:
             return StepResult(ok=False, status="no_schedule", message="No shifts available")
 
         best = sorted(
             schedules,
-            key=lambda item: shift_priority(
-                item.get("scheduleText", "") or item.get("externalJobTitle", "")
-            ),
+            key=lambda item: shift_priority(item.get("scheduleText", "") or item.get("externalJobTitle", "")),
         )[0]
 
         schedule_id = best.get("scheduleId") or best.get("scheduleID") or best.get("id")
         schedule_text = best.get("scheduleText") or best.get("externalJobTitle") or "Shift selected"
 
         if not schedule_id:
-            return StepResult(
-                ok=False,
-                status="no_schedule",
-                message="Schedule ID missing",
-                data={"schedule_text": schedule_text},
-            )
+            return StepResult(ok=False, status="no_schedule", message="Schedule ID missing")
 
-        log.info("[SCHEDULE_SELECTED] request=%s schedule=%s", ctx.request_id, schedule_id)
-
-        return StepResult(
-            ok=True,
-            data={
-                "schedule_id": schedule_id,
-                "schedule_text": schedule_text,
-            },
-        )
+        return StepResult(ok=True, data={"schedule_id": schedule_id, "schedule_text": schedule_text})
 
     async def advance_workflow(self, headers: dict[str, str], app_id: str, ctx: RequestContext) -> StepResult:
         for step_name in ("job-opportunities", "additional-information", "review-submit"):
             res = await self.request_text(
                 "PUT",
                 f"{BASE_URL}/update-workflow-step-name",
-                json={
-                    "applicationId": app_id,
-                    "workflowStepName": step_name,
-                },
+                json={"applicationId": app_id, "workflowStepName": step_name},
                 headers=headers,
                 step=f"WORKFLOW_{step_name}",
                 ctx=ctx,
             )
 
             if res.status not in ("200", "204"):
-                msg = f"Workflow step {step_name} failed with {res.status}"
-                log.warning("[WORKFLOW_FAILED] request=%s %s", ctx.request_id, msg)
-                return StepResult(ok=False, status="workflow_failed", message=msg)
-
-            log.info("[WORKFLOW] request=%s step=%s status=%s", ctx.request_id, step_name, res.status)
+                return StepResult(
+                    ok=False,
+                    status="workflow_failed",
+                    message=f"Workflow step {step_name} failed with {res.status}",
+                )
 
         return StepResult(ok=True)
 
@@ -497,6 +491,9 @@ class AmazonApplicationClient:
         schedule_id: str,
         ctx: RequestContext,
     ) -> StepResult:
+        if not all([ctx.job_id, app_id, candidate_id, schedule_id]):
+            return StepResult(ok=False, status="submit_blocked", message="Missing submit identifiers")
+
         res = await self.request_text(
             "POST",
             f"{BASE_URL}/submit-application",
@@ -512,10 +509,9 @@ class AmazonApplicationClient:
         )
 
         if res.status in ("200", "201", "204"):
-            log.info("[SUBMIT_SUCCESS] request=%s app=%s", ctx.request_id, app_id)
             return StepResult(ok=True)
 
-        log_error("SUBMIT_FAILED", f"job={ctx.job_id} {res.status}: {res.message[:200]}")
+        log_error("SUBMIT_FAILED", f"job={ctx.job_id} app={app_id} {res.status}: {res.message[:200]}")
         return StepResult(ok=False, status="submit_failed", message="Submit failed")
 
 
@@ -538,26 +534,32 @@ class AmazonApplicationService:
             log_error("PREPARE_MISSING_JOB_ID", str(job))
             return asdict(result)
 
-        ctx = RequestContext(
-            request_id=str(uuid.uuid4()),
-            account_id=acc_id,
-            job_id=job_id,
-        )
+        existing = load_application(job_id)
+        if existing and existing.get("status") in {"prepared", "submitted"}:
+            result.status = "already_applied"
+            result.app_id = existing.get("app_id")
+            result.message = f"Already {existing.get('status')}"
+            return asdict(result)
 
-        log.info("[AUTO_PREPARE_STARTED] request=%s job=%s account=%s", ctx.request_id, job_id, acc_id)
+        if _circuit_open(acc_id):
+            result.status = "circuit_open"
+            result.message = "Account circuit breaker open"
+            return asdict(result)
+
+        ctx = RequestContext(request_id=str(uuid.uuid4()), account_id=acc_id, job_id=job_id)
 
         cookies_res = load_account_cookies(account)
-
         if not cookies_res.ok:
             result.status = cookies_res.status
             result.message = cookies_res.message
+            _record_failure(acc_id)
             return asdict(result)
 
         auth_res = extract_auth(cookies_res.data, acc_id)
-
         if not auth_res.ok:
             result.status = auth_res.status
             result.message = auth_res.message
+            _record_failure(acc_id)
             return asdict(result)
 
         auth: AuthContext = auth_res.data
@@ -566,52 +568,46 @@ class AmazonApplicationService:
             headers = client.headers(auth, ctx)
 
             csrf_res = await client.get_csrf_token(headers, ctx)
-
             if not csrf_res.ok:
                 result.status = csrf_res.status
                 result.message = csrf_res.message
-                log_error("CSRF_FAILED", f"account={acc_id}: {csrf_res.message}")
+                _record_failure(acc_id)
                 return asdict(result)
 
             headers["x-csrf-token"] = csrf_res.data
 
             candidate_res = await client.resolve_candidate_id(headers, auth.hvhcid, ctx)
-
             if not candidate_res.ok:
-                result.status = "candidate_failed"
+                result.status = candidate_res.status
                 result.message = candidate_res.message
-                log_error("CANDIDATE_FAILED", f"job={job_id} account={acc_id}: {candidate_res.message}")
+                _record_failure(acc_id)
                 return asdict(result)
 
             candidate_id = candidate_res.data
 
             app_res = await client.find_existing_application(headers, ctx)
-
-            if not app_res.ok:
-                log.warning("[APP_CHECK_PROBLEM] request=%s %s", ctx.request_id, app_res.message)
-
             app_id = app_res.data if app_res.ok else None
 
             if not app_id:
                 create_res = await client.create_application(headers, ctx)
-
                 if not create_res.ok:
                     result.status = create_res.status
                     result.message = create_res.message
+                    _record_failure(acc_id)
                     return asdict(result)
 
                 app_id = create_res.data
 
             result.app_id = app_id
+
             app_headers = client.headers(auth, ctx, app_id=app_id)
             app_headers["x-csrf-token"] = csrf_res.data
 
             schedule_res = await client.get_best_schedule(app_headers, app_id, ctx)
-
             if not schedule_res.ok:
                 result.status = schedule_res.status
                 result.message = schedule_res.message
-                log_error("NO_SCHEDULE", f"job={job_id} app={app_id}")
+                save_application(job_id, app_id, "no_schedule")
                 return asdict(result)
 
             schedule_id = schedule_res.data["schedule_id"]
@@ -621,43 +617,46 @@ class AmazonApplicationService:
             result.message = schedule_text
 
             workflow_res = await client.advance_workflow(app_headers, app_id, ctx)
-
             if not workflow_res.ok:
                 result.status = workflow_res.status
                 result.message = workflow_res.message
-                log_error("WORKFLOW_FAILED", f"job={job_id} app={app_id}: {workflow_res.message}")
+                _record_failure(acc_id)
                 return asdict(result)
 
-            if full_submit_enabled():
-                submit_res = await client.submit_application(
-                    headers=app_headers,
-                    app_id=app_id,
-                    candidate_id=candidate_id,
-                    schedule_id=schedule_id,
-                    ctx=ctx,
+            if not full_submit_enabled():
+                result.status = "prepared"
+                result.apply_url = (
+                    "https://www.jobsatamazon.co.uk/application/uk/"
+                    f"?applicationId={app_id}&jobId={job_id}"
                 )
-
-                if submit_res.ok:
-                    result.status = "submitted"
-                    result.apply_url = f"https://www.jobsatamazon.co.uk/checklist/{job_id}/{app_id}"
-                    save_application(job_id, app_id, "submitted")
-                    log.info("[AUTO_SUBMIT_SUCCESS] request=%s job=%s app=%s", ctx.request_id, job_id, app_id)
-                    return asdict(result)
-
-                result.status = submit_res.status
-                result.message = submit_res.message
+                save_application(job_id, app_id, "prepared")
+                _reset_failures(acc_id)
                 return asdict(result)
 
-            result.status = "prepared"
-            result.apply_url = (
-                f"https://www.jobsatamazon.co.uk/application/uk/"
-                f"?applicationId={app_id}&jobId={job_id}"
+            if _cooldown_active(acc_id):
+                result.status = "cooldown"
+                result.message = "Auto-submit cooldown active"
+                return asdict(result)
+
+            submit_res = await client.submit_application(
+                headers=app_headers,
+                app_id=app_id,
+                candidate_id=candidate_id,
+                schedule_id=schedule_id,
+                ctx=ctx,
             )
-            result.message = schedule_text
 
-            save_application(job_id, app_id, "prepared")
-            log.info("[AUTO_PREPARE_SUCCESS] request=%s job=%s app=%s", ctx.request_id, job_id, app_id)
+            if submit_res.ok:
+                _mark_submit(acc_id)
+                _reset_failures(acc_id)
+                result.status = "submitted"
+                result.apply_url = f"https://www.jobsatamazon.co.uk/checklist/{job_id}/{app_id}"
+                save_application(job_id, app_id, "submitted")
+                return asdict(result)
 
+            result.status = submit_res.status
+            result.message = submit_res.message
+            _record_failure(acc_id)
             return asdict(result)
 
 
@@ -704,25 +703,9 @@ async def run_auto_prepare(
 
     if status == "cookie_expired":
         await alert_fn(job, "cookie_expired", chat_id=chat_id)
-    elif status == "no_schedule":
-        log.warning("[NO_SCHEDULE_ALERT] %s", result.get("message"))
-        await alert_fn(job, "ready", chat_id=chat_id)
     elif status == "submitted":
-        await alert_fn(
-            job,
-            "applied",
-            chat_id=chat_id,
-            account_id=account.get("id"),
-            apply_url=result.get("apply_url"),
-        )
+        await alert_fn(job, "applied", chat_id=chat_id, account_id=account.get("id"), apply_url=result.get("apply_url"))
     elif status == "prepared":
-        await alert_fn(
-            job,
-            "prepared",
-            chat_id=chat_id,
-            account_id=account.get("id"),
-            apply_url=result.get("apply_url"),
-        )
+        await alert_fn(job, "prepared", chat_id=chat_id, account_id=account.get("id"), apply_url=result.get("apply_url"))
     else:
-        log.warning("[PREPARE_FALLBACK] %s", result.get("message"))
         await alert_fn(job, "ready", chat_id=chat_id)
