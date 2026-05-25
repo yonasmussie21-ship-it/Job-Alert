@@ -236,8 +236,6 @@ def save_known_job(job: Dict[str, Any]) -> None:
             _known_jobs_cache = data if isinstance(data, dict) else {}
 
         _known_jobs_cache[str(job_id)] = job
-
-        # Avoid creating a backup every few seconds during scans.
         _write_json_unlocked(KNOWN_JOBS_FILE, _known_jobs_cache, backup=False)
 
 
@@ -316,6 +314,14 @@ def load_application(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _cookie_path(account_id: int) -> str:
+    try:
+        account_id = int(account_id)
+    except (TypeError, ValueError):
+        raise ValueError("account_id must be an integer")
+
+    if account_id <= 0:
+        raise ValueError("account_id must be positive")
+
     return os.path.join(COOKIES_DIR, f"account_{account_id}.json")
 
 
@@ -474,3 +480,28 @@ def log_error(error_type: str, detail: str) -> None:
 
     except Exception as e:
         log.warning("[ERROR_LOG_FAILED] %s", e)
+
+
+def storage_health() -> Dict[str, Any]:
+    return {
+        "data_dir": {
+            "path": DATA_DIR,
+            "exists": os.path.isdir(DATA_DIR),
+            "writable": os.access(DATA_DIR, os.W_OK),
+        },
+        "cookies_dir": {
+            "path": COOKIES_DIR,
+            "exists": os.path.isdir(COOKIES_DIR),
+            "writable": os.access(COOKIES_DIR, os.W_OK),
+        },
+        "files": {
+            "subscribers": SUBSCRIBERS_FILE,
+            "known_jobs": KNOWN_JOBS_FILE,
+            "job_history": JOB_HISTORY_FILE,
+            "applications": APPLICATIONS_FILE,
+            "errors": ERROR_LOG_FILE,
+        },
+        "cookie_encryption": {
+            "enabled": bool(os.environ.get("COOKIE_STORAGE_KEY", "").strip()),
+        },
+    }
