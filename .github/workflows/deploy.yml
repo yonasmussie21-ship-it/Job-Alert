@@ -19,6 +19,7 @@ from storage import load_cookies, log_error, save_cookies
 log = logging.getLogger(__name__)
 
 ASSET_BLOCK_PATTERN = "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webp}"
+BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
 
 DEFAULT_ACCOUNT_ID = 1
 MAX_PAGES = 20
@@ -43,17 +44,10 @@ class CapturedGraphQL:
     body: str
 
 
-@dataclass
-class BrowserStack:
-    playwright: Playwright
-    browser: Browser
-
-
 class AmazonScanner:
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
-
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._browser_lock = asyncio.Lock()
@@ -62,7 +56,6 @@ class AmazonScanner:
         async with self._session_lock:
             if self._session is None or self._session.closed:
                 self._session = aiohttp.ClientSession(timeout=HTTP_TIMEOUT)
-
         return self._session
 
     async def close_session(self) -> None:
@@ -120,6 +113,7 @@ class AmazonScanner:
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
             locale="en-GB",
+            timezone_id="Europe/London",
         )
 
         await context.add_init_script(
@@ -203,12 +197,7 @@ class AmazonScanner:
             page.on("request", on_request)
             page.on("response", on_response)
 
-            await page.goto(
-                SEARCH_URL,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-
+            await page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(3000)
 
             if captured is None:
@@ -230,7 +219,6 @@ class AmazonScanner:
                 await context.close()
 
         source_cards = await self.resolve_source_cards(captured, direct_cards)
-
         jobs_by_id: dict[str, dict[str, Any]] = {}
 
         for card in source_cards[:MAX_CARDS]:
@@ -310,7 +298,12 @@ class AmazonScanner:
                     text = await response.text()
 
                     if response.status != 200:
-                        log.warning("[PROXY_STATUS] page=%s status=%s body=%s", page_num, response.status, text[:300])
+                        log.warning(
+                            "[PROXY_STATUS] page=%s status=%s body=%s",
+                            page_num,
+                            response.status,
+                            text[:300],
+                        )
                         log_error("PROXY_STATUS_ERROR", f"{response.status}: {text[:200]}")
                         break
 
@@ -398,7 +391,6 @@ class AmazonScanner:
 
                     data = await response.json()
                     job_detail = data.get("data", {}).get("getJobDetailByJobId", {})
-
                     shifts = job_detail.get("jobCardDetail", {}).get("scheduleDetails", [])
 
                     if shifts:
@@ -472,7 +464,10 @@ scanner = AmazonScanner()
 
 
 async def block_assets(route: Any) -> None:
-    await route.abort()
+    if route.request.resource_type in BLOCK_RESOURCE_TYPES:
+        await route.abort()
+    else:
+        await route.continue_()
 
 
 def clean_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -624,7 +619,7 @@ def parse_detail_content(
             job["firstDay"] = match.group(1).strip()
             break
 
-    shift_matches = patterns["shifts"]..findall(content)
+    shift_matches = patterns["shifts"].findall(content)
 
     if shift_matches:
         unique_shifts = list(dict.fromkeys(shift_matches))
