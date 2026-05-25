@@ -12,86 +12,137 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Configure SSH
         run: |
           set -euo pipefail
-
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
 
-          ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
+          printf '%s\n' "${{ secrets.SERVER_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
-      - name: Deploy release
+      - name: Deploy production
+        env:
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          set -x
 
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=yes \
-          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+          ssh -o BatchMode=yes \
+              -o StrictHostKeyChecking=yes \
+              -i ~/.ssh/deploy_key \
+              "$SERVER_USER@$SERVER_HOST" \
+              "GITHUB_SHA='$GITHUB_SHA' bash -s" << 'EOF'
 
           set -euo pipefail
 
           APP_BASE="/opt/amazon-bot"
-          RELEASES_DIR="$APP_BASE/releases"
+          RELEASES="$APP_BASE/releases"
           CURRENT="$APP_BASE/current"
+          SHARED="$APP_BASE/shared"
+          LOCK="$APP_BASE/deploy.lock"
+          LOG="$APP_BASE/deploy.log"
+
           REPO="https://github.com/yonasmussie21-ship-it/Job-Alert.git"
           SERVICE="amazon-bot"
+          HEALTH_URL="http://127.0.0.1:8000/health"
 
-          RELEASE_ID=$(date +%Y%m%d_%H%M%S)
-          RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
-          PREVIOUS_RELEASE=""
+          RELEASE_ID="$(date +%Y%m%d_%H%M%S)_${GITHUB_SHA:0:7}"
+          DIR="$RELEASES/$RELEASE_ID"
+          PREV=""
 
-          if [ -L "$CURRENT" ]; then
-            PREVIOUS_RELEASE="$(readlink -f "$CURRENT")"
-          fi
+          log() {
+            echo "[$(date '+%F %T')] [$RELEASE_ID] $*" | tee -a "$LOG"
+          }
+
+          verify() {
+            sudo systemctl is-active --quiet "$SERVICE" || return 1
+            if command -v curl >/dev/null 2>&1; then
+              curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null || return 1
+            fi
+          }
 
           rollback() {
-            echo "Deployment failed. Rolling back..."
+            log "ROLLBACK START"
 
-            if [ -n "$PREVIOUS_RELEASE" ] && [ -d "$PREVIOUS_RELEASE" ]; then
-              ln -sfn "$PREVIOUS_RELEASE" "$CURRENT"
-              sudo systemctl restart "$SERVICE"
-              echo "Rolled back to $PREVIOUS_RELEASE"
-            else
-              echo "No previous release found."
+            if [ -n "$PREV" ] && [ -d "$PREV" ]; then
+              ln -sfn "$PREV" "$APP_BASE/current_tmp"
+              mv -Tf "$APP_BASE/current_tmp" "$CURRENT"
+
+              sudo systemctl try-restart "$SERVICE" || true
             fi
+
+            sudo systemctl status "$SERVICE" --no-pager || true
+            sudo journalctl -u "$SERVICE" -n 120 --no-pager || true
 
             exit 1
           }
 
           trap rollback ERR
 
-          mkdir -p "$RELEASES_DIR"
+          mkdir -p "$RELEASES" "$SHARED"
 
-          echo "Creating release: $RELEASE_ID"
-          git clone --depth 1 -b main "$REPO" "$RELEASE_DIR"
+          exec 9>"$LOCK"
+          flock -n 9 || { log "Deploy already running"; exit 1; }
 
-          cd "$RELEASE_DIR"
+          if [ -L "$CURRENT" ]; then
+            PREV="$(readlink -f "$CURRENT")"
+          fi
+
+          log "Deploying $GITHUB_SHA"
+
+          mkdir -p "$DIR"
+          cd "$DIR"
+
+          git init
+          git remote add origin "$REPO"
+          git fetch --depth 1 origin "$GITHUB_SHA"
+          git checkout --detach "$GITHUB_SHA"
+
+          [ -f requirements.txt ]
+
+          [ -f "$SHARED/.env" ] && ln -sfn "$SHARED/.env" .env
 
           python3 -m venv venv
-          ./venv/bin/python -m pip install --upgrade pip
-          ./venv/bin/pip install --no-cache-dir -r requirements.txt
+          ./venv/bin/pip install --upgrade pip
+          ./venv/bin/pip install -r requirements.txt
 
-          ln -sfn "$RELEASE_DIR" "$APP_BASE/current_tmp"
+          ./venv/bin/python -m compileall . >/dev/null
+
+          # ✅ PRE-FLIGHT CHECK
+          log "Pre-flight"
+          timeout 5 ./venv/bin/python main.py || true
+
+          # ✅ SWITCH
+          ln -sfn "$DIR" "$APP_BASE/current_tmp"
           mv -Tf "$APP_BASE/current_tmp" "$CURRENT"
 
-          sudo systemctl restart "$SERVICE"
-          sleep 5
-          sudo systemctl is-active --quiet "$SERVICE"
+          # ✅ RELOAD SAFE
+          sudo systemctl daemon-reload
+          sudo systemctl try-reload-or-restart "$SERVICE"
 
-          find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d \
-            | sort -r \
-            | tail -n +6 \
-            | xargs -r rm -rf
+          sleep 5
+
+          verify || { log "Health failed"; exit 1; }
+
+          log "Cleaning old releases"
+          CUR="$(readlink -f "$CURRENT")"
+
+          find "$RELEASES" -mindepth 1 -maxdepth 1 -type d \
+            ! -path "$CUR" \
+            ! -path "$PREV" \
+            | sort -r | tail -n +6 | xargs -r rm -rf
 
           trap - ERR
 
-          echo "SUCCESS: deployed $RELEASE_ID"
+          log "SUCCESS $RELEASE_ID"
 
           EOF
