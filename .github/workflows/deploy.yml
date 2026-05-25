@@ -18,6 +18,7 @@ jobs:
       - name: Configure SSH
         run: |
           set -euo pipefail
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
@@ -34,13 +35,15 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          set -x
 
-          ssh -o BatchMode=yes \
-              -o StrictHostKeyChecking=yes \
-              -i ~/.ssh/deploy_key \
-              "$SERVER_USER@$SERVER_HOST" \
-              "GITHUB_SHA='$GITHUB_SHA' bash -s" << 'EOF'
+          ssh \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=3 \
+            -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST" \
+            "GITHUB_SHA='$GITHUB_SHA' bash -s" << 'EOF'
 
           set -euo pipefail
 
@@ -63,11 +66,37 @@ jobs:
             echo "[$(date '+%F %T')] [$RELEASE_ID] $*" | tee -a "$LOG"
           }
 
+          diagnostics() {
+            sudo systemctl status "$SERVICE" --no-pager || true
+            sudo journalctl -u "$SERVICE" -n 120 --no-pager || true
+            df -h || true
+            free -m || true
+          }
+
           verify() {
-            sudo systemctl is-active --quiet "$SERVICE" || return 1
-            if command -v curl >/dev/null 2>&1; then
-              curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null || return 1
+            if ! sudo systemctl is-active --quiet "$SERVICE"; then
+              log "systemd reports service NOT active"
+              return 1
             fi
+
+            if command -v curl >/dev/null 2>&1; then
+              for i in 1 2 3 4 5; do
+                if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+                  log "Health check passed"
+                  return 0
+                fi
+
+                log "Health check attempt $i failed"
+                sleep 3
+              done
+
+              log "Health endpoint check FAILED: $HEALTH_URL"
+              return 1
+            else
+              log "curl not installed; skipped HTTP health check"
+            fi
+
+            return 0
           }
 
           rollback() {
@@ -77,27 +106,39 @@ jobs:
               ln -sfn "$PREV" "$APP_BASE/current_tmp"
               mv -Tf "$APP_BASE/current_tmp" "$CURRENT"
 
-              sudo systemctl try-restart "$SERVICE" || true
-            fi
+              sudo systemctl restart "$SERVICE" || true
+              sleep 5
 
-            sudo systemctl status "$SERVICE" --no-pager || true
-            sudo journalctl -u "$SERVICE" -n 120 --no-pager || true
+              if verify; then
+                log "ROLLBACK SUCCESS: $PREV"
+              else
+                log "ROLLBACK FAILED VERIFICATION"
+                diagnostics
+              fi
+            else
+              log "No previous release available for rollback"
+              diagnostics
+            fi
 
             exit 1
           }
 
           trap rollback ERR
 
-          mkdir -p "$RELEASES" "$SHARED"
+          mkdir -p "$APP_BASE" "$RELEASES" "$SHARED"
 
           exec 9>"$LOCK"
-          flock -n 9 || { log "Deploy already running"; exit 1; }
+          flock -n 9 || {
+            log "Deploy already running"
+            exit 1
+          }
 
           if [ -L "$CURRENT" ]; then
             PREV="$(readlink -f "$CURRENT")"
+            log "Previous release: $PREV"
           fi
 
-          log "Deploying $GITHUB_SHA"
+          log "Deploying commit: $GITHUB_SHA"
 
           mkdir -p "$DIR"
           cd "$DIR"
@@ -107,31 +148,38 @@ jobs:
           git fetch --depth 1 origin "$GITHUB_SHA"
           git checkout --detach "$GITHUB_SHA"
 
-          [ -f requirements.txt ]
+          if [ ! -f requirements.txt ]; then
+            log "requirements.txt missing"
+            exit 1
+          fi
 
-          [ -f "$SHARED/.env" ] && ln -sfn "$SHARED/.env" .env
+          if [ -f "$SHARED/.env" ]; then
+            ln -sfn "$SHARED/.env" .env
+            log "Linked shared .env"
+          else
+            log "WARNING: shared .env missing"
+          fi
 
           python3 -m venv venv
-          ./venv/bin/pip install --upgrade pip
-          ./venv/bin/pip install -r requirements.txt
+          ./venv/bin/python -m pip install --upgrade pip
+          ./venv/bin/pip install --no-cache-dir -r requirements.txt
 
+          log "Running compile check"
           ./venv/bin/python -m compileall . >/dev/null
 
-          # ✅ PRE-FLIGHT CHECK
-          log "Pre-flight"
-          timeout 5 ./venv/bin/python main.py || true
-
-          # ✅ SWITCH
+          log "Switching release"
           ln -sfn "$DIR" "$APP_BASE/current_tmp"
           mv -Tf "$APP_BASE/current_tmp" "$CURRENT"
 
-          # ✅ RELOAD SAFE
           sudo systemctl daemon-reload
-          sudo systemctl try-reload-or-restart "$SERVICE"
+          sudo systemctl restart "$SERVICE"
 
           sleep 5
 
-          verify || { log "Health failed"; exit 1; }
+          verify || {
+            log "Health failed after deploy"
+            exit 1
+          }
 
           log "Cleaning old releases"
           CUR="$(readlink -f "$CURRENT")"
@@ -139,10 +187,12 @@ jobs:
           find "$RELEASES" -mindepth 1 -maxdepth 1 -type d \
             ! -path "$CUR" \
             ! -path "$PREV" \
-            | sort -r | tail -n +6 | xargs -r rm -rf
+            | sort -r \
+            | tail -n +6 \
+            | xargs -r rm -rf
 
           trap - ERR
 
-          log "SUCCESS $RELEASE_ID"
+          log "SUCCESS: deployed $RELEASE_ID"
 
           EOF
