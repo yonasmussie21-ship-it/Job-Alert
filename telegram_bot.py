@@ -2,12 +2,12 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import aiohttp
 
-from config import BOT_TOKEN, CHAT_ID, TELEGRAM_API, get_tier
+from config import CHAT_ID, TELEGRAM_API, get_tier
 from job_parser import is_fresh_job, is_night_shift
 from storage import save_subscribers
 
@@ -18,10 +18,14 @@ otp_codes: Dict[str, str] = {}
 onboarding: Dict[str, Dict[str, Any]] = {}
 
 
-async def tg_send(text: str, reply_markup: Optional[dict] = None, chat_id: Optional[str] = None) -> None:
-    cid = chat_id or CHAT_ID
-
-    payload = {
+async def tg_send(
+    text: str,
+    reply_markup: Optional[dict] = None,
+    chat_id: Optional[str] = None,
+) -> None:
+    """Send a Telegram message safely."""
+    cid = str(chat_id or CHAT_ID)
+    payload: Dict[str, Any] = {
         "chat_id": cid,
         "text": text,
         "parse_mode": "HTML",
@@ -33,10 +37,20 @@ async def tg_send(text: str, reply_markup: Optional[dict] = None, chat_id: Optio
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=20) as response:
+            async with session.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as response:
                 if response.status >= 400:
                     body = await response.text()
-                    log.warning("[TELEGRAM_SEND_FAILED] status=%s body=%s", response.status, body[:300])
+                    log.warning(
+                        "[TELEGRAM_SEND_FAILED] status=%s body=%s",
+                        response.status,
+                        body[:500],
+                    )
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         log.warning("[TELEGRAM_ERROR] %s", exc)
 
@@ -45,12 +59,11 @@ def _job_link(job: Dict[str, Any], apply_url: Optional[str] = None) -> str:
     if apply_url:
         return apply_url
 
-    job_id = job.get("id", "")
-
+    job_id = str(job.get("id") or "")
     if job_id and job_id != "TEST-001":
         return f"https://www.jobsatamazon.co.uk/app#/jobDetail?jobId={job_id}"
 
-    return job.get("link", "https://www.jobsatamazon.co.uk")
+    return job.get("link") or "https://www.jobsatamazon.co.uk"
 
 
 async def tg_alert(
@@ -64,53 +77,45 @@ async def tg_alert(
     score: Optional[int] = None,
     apply_url: Optional[str] = None,
 ) -> None:
-    cid = chat_id or CHAT_ID
+    """Send a job alert/update to Telegram."""
+    cid = str(chat_id or CHAT_ID)
 
+    account_suffix = f" — Account {account_id}" if account_id else ""
     headers_map = {
         "new": "🚨 <b>NEW AMAZON JOB — ACT NOW!</b>",
-        "applying": f"🤖 <b>PREPARING APPLICATION{' — Account ' + str(account_id) if account_id else ''}</b>",
-        "prepared": f"✅ <b>APPLICATION PREPARED{' — Account ' + str(account_id) if account_id else ''}</b>",
-        "applied": f"✅ <b>APPLICATION SUBMITTED{' — Account ' + str(account_id) if account_id else ''}</b>",
+        "applying": f"🤖 <b>PREPARING APPLICATION{account_suffix}</b>",
+        "prepared": f"✅ <b>APPLICATION PREPARED{account_suffix}</b>",
+        "applied": f"✅ <b>APPLICATION SUBMITTED{account_suffix}</b>",
         "ready": "👆 <b>APPLICATION READY — OPEN MANUALLY</b>",
         "fresh_alert": "🌿 <b>AMAZON FRESH — MANUAL APPLY ONLY</b>",
-        "cookie_expired": f"⚠️ <b>COOKIE EXPIRED{' — Account ' + str(account_id) if account_id else ''}</b>",
+        "cookie_expired": f"⚠️ <b>COOKIE EXPIRED{account_suffix}</b>",
     }
-
     header = headers_map.get(status, "⚠️ <b>JOB UPDATE</b>")
 
-    shifts = job.get("shifts", []) or []
+    shifts = job.get("shifts") or []
     schedule = job.get("schedule")
-
-    if shift_index is not None and shifts and shift_index < len(shifts):
+    if shift_index is not None and 0 <= shift_index < len(shifts):
         schedule = shifts[shift_index]
 
     pay = job.get("pay")
     pay_display = job.get("pay_display")
-
     if pay_display:
-        pay_str = pay_display
+        pay_str = str(pay_display)
     elif isinstance(pay, (int, float)):
         pay_str = f"{pay:.2f}"
     else:
         pay_str = str(pay or "?")
 
-    night = " 🌙 NIGHT SHIFT" if is_night_shift(schedule or "") else ""
-    fresh = " 🌿 FRESH" if is_fresh_job(job) else ""
-    permanent = " ⭐ PERMANENT" if "permanent" in str(job.get("contract", "")).lower() else ""
-
-    distance_str = f"\n📏 Distance: <b>{distance} miles</b>" if distance is not None else ""
-    score_str = f"\n⭐ Score: <b>{score}</b>" if score else ""
-
     shift_str = ""
     if total_shifts and total_shifts > 1 and shift_index is not None:
         shift_str = f"\n🔄 <b>Shift {shift_index + 1} of {total_shifts}</b>"
 
-    description = job.get("description")
-    desc_str = f"\n📝 {description}" if description else ""
-
-    first_day = job.get("firstDay") or "See listing"
-    schedule_text = schedule or "See listing"
-    hours = job.get("hours") or "See listing"
+    night = " 🌙 NIGHT SHIFT" if is_night_shift(schedule or "") else ""
+    fresh = " 🌿 FRESH" if is_fresh_job(job) else ""
+    permanent = " ⭐ PERMANENT" if "permanent" in str(job.get("contract", "")).lower() else ""
+    distance_str = f"\n📏 Distance: <b>{distance} miles</b>" if distance is not None else ""
+    score_str = f"\n⭐ Score: <b>{score}</b>" if score is not None else ""
+    desc_str = f"\n📝 {job.get('description')}" if job.get("description") else ""
 
     text = f"""{header}{shift_str}{permanent}
 ━━━━━━━━━━━━━━━━━━━━━
@@ -118,9 +123,9 @@ async def tg_alert(
 📦 {job.get('title', 'Warehouse Operative')}{night}{fresh}
 💰 <b>£{pay_str}/hr</b>
 📋 {job.get('contract', 'Unknown')}
-📅 First Day: <b>{first_day}</b>
-🕘 Schedule: <b>{schedule_text}</b>
-🕐 Hours/Week: <b>{hours}</b>{distance_str}{score_str}{desc_str}
+📅 First Day: <b>{job.get('firstDay') or 'See listing'}</b>
+🕘 Schedule: <b>{schedule or 'See listing'}</b>
+🕐 Hours/Week: <b>{job.get('hours') or 'See listing'}</b>{distance_str}{score_str}{desc_str}
 ━━━━━━━━━━━━━━━━━━━━━"""
 
     if status == "applied":
@@ -134,16 +139,15 @@ async def tg_alert(
     elif status == "cookie_expired":
         text += "\n🔐 <b>Refresh cookies before the bot can prepare/apply.</b>"
 
-    link = _job_link(job, apply_url=apply_url)
-
     markup = None
     if status in {"new", "ready", "prepared", "fresh_alert", "cookie_expired"}:
+        job_id = str(job.get("id") or "")
         markup = {
             "inline_keyboard": [
-                [{"text": "🚀 OPEN APPLICATION", "url": link}],
+                [{"text": "🚀 OPEN APPLICATION", "url": _job_link(job, apply_url)}],
                 [
-                    {"text": "✅ MARK SUBMITTED", "callback_data": f"applied_{job.get('id', '')}"},
-                    {"text": "❌ IGNORE", "callback_data": f"skip_{job.get('id', '')}"},
+                    {"text": "✅ MARK SUBMITTED", "callback_data": f"applied_{job_id}"},
+                    {"text": "❌ IGNORE", "callback_data": f"skip_{job_id}"},
                 ],
             ]
         }
@@ -158,8 +162,7 @@ async def send_all_shifts(
     distance: Optional[float] = None,
     score: Optional[int] = None,
 ) -> None:
-    shifts = job.get("shifts", []) or []
-
+    shifts = job.get("shifts") or []
     if len(shifts) <= 1:
         await tg_alert(job, status, chat_id=chat_id, distance=distance, score=score)
         return
@@ -178,16 +181,14 @@ async def send_all_shifts(
 
 
 async def start_onboarding(cid: str, name: str = "there") -> None:
-    onboarding[cid] = {
-        "step": "job_type",
-        "locations": [],
-        "name": name,
-    }
+    cid = str(cid)
+    onboarding[cid] = {"step": "job_type", "locations": [], "name": name}
 
     await tg_send(
         f"""👑 <b>Welcome {name}!</b>
 
 I'm the Amazon Warehouse Job Alert Bot.
+I find UK warehouse jobs and alert you instantly.
 
 <b>Step 1 of 4 — Job Type</b>
 1️⃣ Full-time only
@@ -198,8 +199,10 @@ I'm the Amazon Warehouse Job Alert Bot.
 
 
 async def handle_onboarding(cid: str, text: str, subscribers: Dict[str, Any]) -> None:
+    cid = str(cid)
     state = onboarding.get(cid, {})
     step = state.get("step", "")
+    value = text.strip()
 
     if step == "job_type":
         mapping = {
@@ -210,9 +213,7 @@ async def handle_onboarding(cid: str, text: str, subscribers: Dict[str, Any]) ->
             "2️⃣": "parttime",
             "3️⃣": "both",
         }
-
-        job_type = mapping.get(text.strip())
-
+        job_type = mapping.get(value)
         if not job_type:
             await tg_send("Please reply 1, 2 or 3.", chat_id=cid)
             return
@@ -222,7 +223,6 @@ async def handle_onboarding(cid: str, text: str, subscribers: Dict[str, Any]) ->
             "parttime": "Part-time only",
             "both": "Both",
         }
-
         state["job_type"] = job_type
         state["step"] = "location_1"
         onboarding[cid] = state
@@ -235,29 +235,27 @@ Enter your city or postcode:
 Examples: <b>Birmingham</b>, <b>Leeds</b>, <b>B1 1BB</b>""",
             chat_id=cid,
         )
+        return
 
-    elif step == "location_1":
-        location = text.strip()
-
-        if not location:
+    if step == "location_1":
+        if not value:
             await tg_send("Please enter a valid city or postcode.", chat_id=cid)
             return
 
-        state["locations"] = [location]
+        state["locations"] = [value]
         state["step"] = "location_2"
         onboarding[cid] = state
 
         await tg_send(
-            f"""✅ Location: <b>{location}</b>
+            f"""✅ Location: <b>{value}</b>
 
 <b>Step 3 of 4 — Second Location Optional</b>
 Add another location or type <b>DONE</b> to skip.""",
             chat_id=cid,
         )
+        return
 
-    elif step == "location_2":
-        value = text.strip()
-
+    if step == "location_2":
         if value.upper() not in {"DONE", "SKIP", "NO", "N"}:
             state.setdefault("locations", []).append(value)
 
@@ -272,29 +270,26 @@ How far can you travel?
 🚗 <b>50</b> — Wide search""",
             chat_id=cid,
         )
+        return
 
-    elif step == "radius":
-        match = re.search(r"\d+", text)
-
+    if step == "radius":
+        match = re.search(r"\d+", value)
         if not match:
             await tg_send("Please enter a number, for example <b>25</b>.", chat_id=cid)
             return
 
         radius = int(match.group())
-
         state["radius"] = radius
         state["step"] = "confirm"
         onboarding[cid] = state
 
         locations = state.get("locations", [])
         job_type = state.get("job_type", "both")
-
         job_label = {
             "fulltime": "Full-time only",
             "parttime": "Part-time only",
             "both": "Full-time & Part-time",
         }.get(job_type, "Both")
-
         location_text = "\n".join(
             f"📍 {'⭐ ' if index == 0 else ''}{location}"
             for index, location in enumerate(locations)
@@ -310,11 +305,11 @@ How far can you travel?
 Reply <b>CONFIRM</b> or <b>RESTART</b>""",
             chat_id=cid,
         )
+        return
 
-    elif step == "confirm":
-        value = text.strip().upper()
-
-        if value == "CONFIRM":
+    if step == "confirm":
+        upper_value = value.upper()
+        if upper_value == "CONFIRM":
             subscribers[cid] = {
                 "name": state.get("name", "Friend"),
                 "locations": state.get("locations", []),
@@ -323,9 +318,8 @@ Reply <b>CONFIRM</b> or <b>RESTART</b>""",
                 "setup_complete": True,
                 "auto_apply": False,
                 "tier": "free",
-                "joined": datetime.utcnow().isoformat(),
+                "joined": datetime.now(timezone.utc).isoformat(),
             }
-
             save_subscribers(subscribers)
             onboarding.pop(cid, None)
 
@@ -337,11 +331,16 @@ You'll get alerts when Amazon warehouse jobs drop near you.
 Use /help for commands.""",
                 chat_id=cid,
             )
+            return
 
-        elif value == "RESTART":
+        if upper_value == "RESTART":
             await start_onboarding(cid, state.get("name", "there"))
-        else:
-            await tg_send("Reply <b>CONFIRM</b> or <b>RESTART</b>.", chat_id=cid)
+            return
+
+        await tg_send("Reply <b>CONFIRM</b> or <b>RESTART</b>.", chat_id=cid)
+        return
+
+    await start_onboarding(cid, state.get("name", "there"))
 
 
 async def handle_updates(state: Dict[str, Any]) -> None:
@@ -354,19 +353,20 @@ async def handle_updates(state: Dict[str, Any]) -> None:
                 async with session.get(
                     f"{TELEGRAM_API}/getUpdates",
                     params={"offset": offset, "timeout": 10},
-                    timeout=20,
+                    timeout=aiohttp.ClientTimeout(total=20),
                 ) as response:
                     data = await response.json()
 
             for update in data.get("result", []):
-                update_id = update["update_id"]
-                offset = update_id + 1
+                update_id = update.get("update_id")
+                if update_id is None:
+                    continue
 
+                offset = update_id + 1
                 if update_id in processed:
                     continue
 
                 processed.add(update_id)
-
                 if len(processed) > 1000:
                     processed.clear()
 
@@ -388,22 +388,27 @@ async def _process_update(update: Dict[str, Any], state: Dict[str, Any]) -> None
     if "callback_query" in update:
         callback = update["callback_query"]
         data = callback.get("data", "")
+        callback_chat_id = str(
+            callback.get("message", {}).get("chat", {}).get("id", CHAT_ID)
+        )
 
         if data.startswith("applied_"):
-            await tg_send("✅ Marked as submitted. Good luck.")
+            await tg_send("✅ Marked as submitted. Good luck.", chat_id=callback_chat_id)
         elif data.startswith("skip_"):
-            await tg_send("❌ Job ignored.")
-
+            await tg_send("❌ Job ignored.", chat_id=callback_chat_id)
         return
 
-    message = update.get("message", {})
-    text = message.get("text", "").strip()
-    chat = message.get("chat", {})
-    cid = str(chat.get("id", CHAT_ID))
-    name = chat.get("first_name", "Friend")
+    message = update.get("message") or {}
+    text = (message.get("text") or "").strip()
+    chat = message.get("chat") or {}
+    cid = str(chat.get("id") or CHAT_ID)
+    name = chat.get("first_name") or "Friend"
     text_lw = text.lower()
 
-    if cid in otp_waiting and text and text.isdigit():
+    if not text:
+        return
+
+    if cid in otp_waiting and text.isdigit():
         otp_codes[cid] = text
         otp_waiting[cid].set()
         await tg_send("✅ OTP received.", chat_id=cid)
@@ -416,9 +421,8 @@ async def _process_update(update: Dict[str, Any], state: Dict[str, Any]) -> None
     if text_lw == "/start":
         if cid in subscribers and subscribers[cid].get("setup_complete"):
             sub = subscribers[cid]
-            locations = ", ".join(sub.get("locations", []))
+            locations = ", ".join(sub.get("locations", [])) or "Not set"
             tier = get_tier(cid, sub)
-
             mode = (
                 "✅ Full auto-submit"
                 if tier in {"owner", "premium"}
@@ -440,11 +444,13 @@ Use /help for commands.""",
             )
         else:
             await start_onboarding(cid, name)
+        return
 
-    elif text_lw == "/setup":
+    if text_lw == "/setup":
         await start_onboarding(cid, name)
+        return
 
-    elif text_lw == "/status":
+    if text_lw == "/status":
         from config import get_proxy_url, is_peak_time
 
         peak = is_peak_time()
@@ -464,41 +470,40 @@ History: {len(job_history)}
 ━━━━━━━━━━━━━━━━━""",
             chat_id=cid,
         )
+        return
 
-    elif text_lw == "/scrape":
+    if text_lw == "/scrape":
         await tg_send("🔍 <b>Scanning Amazon jobs...</b>", chat_id=cid)
-
         from scheduler import check_jobs
 
         count = await check_jobs(state)
-
         await tg_send(
             f"✅ New: {count} | Tracked: {len(known_jobs)}\n"
             f"{'🎉 New jobs found.' if count > 0 else '⏳ No new jobs this scan.'}",
             chat_id=cid,
         )
+        return
 
-    elif text_lw == "/jobs":
+    if text_lw == "/jobs":
         if not known_jobs:
             await tg_send("📭 No jobs yet — send /scrape to scan.", chat_id=cid)
             return
 
         text_out = f"📋 <b>Last {min(5, len(known_jobs))} Jobs:</b>\n━━━━━━━━━━━\n"
-
         for job in list(known_jobs.values())[-5:]:
             night = "🌙" if is_night_shift(job.get("schedule", "")) else "☀️"
             schedule = job.get("schedule") or "See listing"
             first_day = job.get("firstDay") or "See listing"
-
             text_out += (
-                f"{night} {job.get('location')}\n"
-                f"💰 £{job.get('pay')}/hr | {job.get('contract')}\n"
+                f"{night} {job.get('location', 'Unknown')}\n"
+                f"💰 £{job.get('pay', '?')}/hr | {job.get('contract', 'Unknown')}\n"
                 f"📅 {first_day} | {schedule[:30]}\n\n"
             )
 
         await tg_send(text_out, chat_id=cid)
+        return
 
-    elif text_lw == "/test":
+    if text_lw == "/test":
         test_job = {
             "id": "TEST-001",
             "title": "Warehouse Operative",
@@ -508,32 +513,34 @@ History: {len(job_history)}
             "pay_display": "15.30",
             "contract": "Seasonal | Full-time",
             "firstDay": "2026-05-10",
+            "hours": "40",
             "shifts": [
                 "Sat, Sun, Mon, Tue 23:45 - 10:15",
-                "Fri, Sat, Sun, Mon, Tue 6:30 - 13:00",
-                "Fri, Sat, Sun, Mon 23:45 - 10:15",
+                "Fri, Sat, Sun, Mon, Tue 06:30 - 13:00",
             ],
-            "schedule": "Sat, Sun, Mon, Tue 23:45 - 10:15",
-            "hours": "40",
             "description": "Pick, pack and ship parcels at our fulfilment centre.",
             "link": "https://www.jobsatamazon.co.uk",
         }
-
         await send_all_shifts(test_job, "new", chat_id=cid, distance=47.0, score=15)
+        return
 
-    elif text_lw == "/pause" and cid == str(CHAT_ID):
+    admin_id = str(CHAT_ID)
+    if text_lw == "/pause" and cid == admin_id:
         state["bot_paused"] = True
         await tg_send("⏸️ Bot paused.", chat_id=cid)
+        return
 
-    elif text_lw == "/resume" and cid == str(CHAT_ID):
+    if text_lw == "/resume" and cid == admin_id:
         state["bot_paused"] = False
         await tg_send("▶️ Bot resumed.", chat_id=cid)
+        return
 
-    elif text_lw == "/clearcache" and cid == str(CHAT_ID):
+    if text_lw == "/clearcache" and cid == admin_id:
         known_jobs.clear()
         await tg_send("🗑️ Cache cleared.", chat_id=cid)
+        return
 
-    elif text_lw == "/help":
+    if text_lw == "/help":
         await tg_send(
             """👑 <b>Amazon Bot Commands</b>
 ━━━━━━━━━━━━━━━━━
@@ -549,3 +556,6 @@ History: {len(job_history)}
 ━━━━━━━━━━━━━━━━━""",
             chat_id=cid,
         )
+        return
+
+    await tg_send("Unknown command. Send /help for commands.", chat_id=cid)
