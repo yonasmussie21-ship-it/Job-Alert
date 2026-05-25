@@ -1,211 +1,219 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
+"""
+bot.py
 
-APP_NAME="amazon-bot"
-APP_USER="amazonbot"
+Safe Python restore for the Amazon Jobs bot entrypoint.
 
-APP_ROOT="/home/ubuntu/Job-Alert"
-REPO_DIR="$APP_ROOT/repo"
-RELEASES_DIR="$APP_ROOT/releases"
-SHARED_DIR="$APP_ROOT/shared"
-CURRENT_LINK="$APP_ROOT/current"
-LOCK_FILE="$APP_ROOT/deploy.lock"
+Use this to replace the accidental Bash deployment script that was saved as bot.py.
+This file is intentionally defensive: it first tries to run main.py, and if your
+main module does not expose a runnable entrypoint, it falls back to starting the
+Telegram update loop and scheduler directly.
+"""
 
-HEALTH_URL="${HEALTH_URL:-http://localhost:3000/health}"
-KEEP_RELEASES=5
-MIN_FREE_KB=1048576
+from __future__ import annotations
 
-START_TIME="$(date +%s)"
+import asyncio
+import inspect
+import logging
+import os
+import signal
+from typing import Any, Awaitable, Callable, Optional
 
-log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
-}
+log = logging.getLogger(__name__)
 
-show_logs() {
-  sudo journalctl -u "$APP_NAME" -n 120 --no-pager || true
-}
 
-fail() {
-  log "ERROR: $*"
-  show_logs
-  exit 2
-}
+DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-atomic_switch() {
-  local target="$1"
-  local tmp_link="$APP_ROOT/current_tmp"
 
-  [ -d "$target" ] || fail "Cannot switch to missing release: $target"
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=getattr(logging, DEFAULT_LOG_LEVEL, logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
-  ln -sfn "$target" "$tmp_link"
-  mv -Tf "$tmp_link" "$CURRENT_LINK"
-  sudo chown -h "$APP_USER:$APP_USER" "$CURRENT_LINK"
-}
 
-health_check() {
-  for i in {1..30}; do
-    if sudo systemctl is-active --quiet "$APP_NAME" && \
-       curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null; then
-      return 0
-    fi
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
-    log "Waiting for health... $i/30"
-    sleep 2
-  done
 
-  return 1
-}
+def _get_callable(module: Any, names: tuple[str, ...]) -> Optional[Callable[..., Any]]:
+    for name in names:
+        fn = getattr(module, name, None)
+        if callable(fn):
+            return fn
+    return None
 
-safe_rm_rf() {
-  local target="$1"
-  local target_real
-  local releases_real
 
-  [ -n "$target" ] || fail "Refusing empty delete"
+async def run_main_module() -> bool:
+    """Prefer your existing main.py if it has a runnable entrypoint."""
+    try:
+        import main as main_module
+    except Exception as exc:
+        log.warning("[BOT_RESTORE] Could not import main.py: %s", exc)
+        return False
 
-  target_real="$(readlink -f "$target")"
-  releases_real="$(readlink -f "$RELEASES_DIR")"
+    entrypoint = _get_callable(
+        main_module,
+        (
+            "main",
+            "run",
+            "start",
+            "serve",
+        ),
+    )
 
-  case "$target_real" in
-    "$releases_real"/*) ;;
-    *) fail "Unsafe delete: $target_real" ;;
-  esac
+    if not entrypoint:
+        log.warning("[BOT_RESTORE] main.py imported but no main/run/start/serve function found")
+        return False
 
-  [ "$target_real" != "$releases_real" ] || fail "Refusing to delete releases dir"
+    log.info("[BOT_RESTORE] Starting main.py entrypoint: %s", entrypoint.__name__)
+    await _maybe_await(entrypoint())
+    return True
 
-  rm -rf "$target_real"
-}
 
-rollback() {
-  trap - ERR
+async def load_state() -> dict[str, Any]:
+    """Load bot state using storage.py when available."""
+    state: dict[str, Any] = {
+        "subscribers": {},
+        "known_jobs": {},
+        "job_history": [],
+        "accounts": [],
+        "bot_paused": False,
+    }
 
-  local previous_release="$1"
+    try:
+        import storage
 
-  if [ -z "$previous_release" ] || [ ! -d "$previous_release" ]; then
-    log "No valid previous release for rollback"
-    show_logs
-    exit 1
-  fi
+        loaders = {
+            "subscribers": ("load_subscribers", "get_subscribers"),
+            "known_jobs": ("load_known_jobs", "get_known_jobs"),
+            "job_history": ("load_job_history", "get_job_history"),
+            "accounts": ("load_accounts", "get_accounts"),
+        }
 
-  log "Rolling back to: $previous_release"
-  atomic_switch "$previous_release"
+        for key, names in loaders.items():
+            fn = _get_callable(storage, names)
+            if fn:
+                try:
+                    value = await _maybe_await(fn())
+                    if value is not None:
+                        state[key] = value
+                except Exception as exc:
+                    log.warning("[BOT_RESTORE] Failed loading %s: %s", key, exc)
 
-  timeout 30 sudo systemctl restart "$APP_NAME" || fail "Rollback restart failed"
+    except Exception as exc:
+        log.warning("[BOT_RESTORE] Could not import storage.py: %s", exc)
 
-  if health_check; then
-    log "Rollback successful"
-    exit 1
-  fi
+    return state
 
-  fail "Rollback health check failed"
-}
 
-cleanup_old_releases() {
-  local previous_real="${1:-}"
-  local current_real=""
+async def fallback_scheduler_loop(state: dict[str, Any], stop_event: asyncio.Event) -> None:
+    """Run scheduler.check_jobs repeatedly if no main.py entrypoint exists."""
+    try:
+        import scheduler
+    except Exception as exc:
+        log.error("[BOT_RESTORE] Could not import scheduler.py: %s", exc)
+        return
 
-  [ -L "$CURRENT_LINK" ] && current_real="$(readlink -f "$CURRENT_LINK")"
-  [ -n "$previous_real" ] && previous_real="$(readlink -f "$previous_real")"
+    check_jobs = _get_callable(scheduler, ("check_jobs", "scan_jobs", "run_once"))
+    if not check_jobs:
+        log.error("[BOT_RESTORE] scheduler.py has no check_jobs/scan_jobs/run_once function")
+        return
 
-  find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d \
-    | sort -r \
-    | while read -r release; do
-        release_real="$(readlink -f "$release")"
+    interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "10"))
+    log.info("[BOT_RESTORE] Fallback scheduler loop started interval=%ss", interval)
 
-        [ "$release_real" = "$current_real" ] && continue
-        [ "$release_real" = "$previous_real" ] && continue
+    while not stop_event.is_set():
+        try:
+            await _maybe_await(check_jobs(state))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("[BOT_RESTORE] Scheduler loop error: %s", exc)
 
-        echo "$release"
-      done \
-    | tail -n +"$((KEEP_RELEASES + 1))" \
-    | while read -r old_release; do
-        log "Removing old release: $old_release"
-        safe_rm_rf "$old_release"
-      done
-}
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
 
-main() {
-  mkdir -p "$APP_ROOT" "$RELEASES_DIR" "$SHARED_DIR"
 
-  exec 9>"$LOCK_FILE"
-  flock -n 9 || fail "Another deployment is already running"
+async def fallback_telegram_loop(state: dict[str, Any]) -> None:
+    """Run telegram_bot.handle_updates(state) if available."""
+    try:
+        import telegram_bot
+    except Exception as exc:
+        log.error("[BOT_RESTORE] Could not import telegram_bot.py: %s", exc)
+        return
 
-  trap 'log "Unexpected deployment failure"; show_logs' ERR
+    handle_updates = _get_callable(telegram_bot, ("handle_updates", "start_bot", "run_bot"))
+    if not handle_updates:
+        log.error("[BOT_RESTORE] telegram_bot.py has no handle_updates/start_bot/run_bot function")
+        return
 
-  command -v curl >/dev/null || fail "curl is required"
-  command -v git >/dev/null || fail "git is required"
-  command -v python3 >/dev/null || fail "python3 is required"
+    log.info("[BOT_RESTORE] Fallback Telegram loop started: %s", handle_updates.__name__)
 
-  [ -d "$REPO_DIR/.git" ] || fail "Invalid repo directory: $REPO_DIR"
-  [ -f "$SHARED_DIR/.env" ] || fail "Missing shared env: $SHARED_DIR/.env"
-  id "$APP_USER" >/dev/null 2>&1 || fail "Missing app user: $APP_USER"
+    try:
+        await _maybe_await(handle_updates(state))
+    except TypeError:
+        # Some bot starters may not accept state.
+        await _maybe_await(handle_updates())
 
-  systemctl cat "$APP_NAME" >/dev/null || fail "Missing systemd service: $APP_NAME"
 
-  AVAILABLE_KB="$(df --output=avail "$APP_ROOT" | tail -1 | tr -d ' ')"
-  [ "$AVAILABLE_KB" -ge "$MIN_FREE_KB" ] || fail "Low disk space"
+async def run_fallback() -> None:
+    """Fallback runner when main.py cannot be used."""
+    state = await load_state()
+    stop_event = asyncio.Event()
 
-  cd "$REPO_DIR"
+    loop = asyncio.get_running_loop()
 
-  git fetch origin main
-  git reset --hard origin/main
-  git clean -fdx
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
 
-  COMMIT_SHA="$(git rev-parse HEAD)"
-  NEW_RELEASE="$RELEASES_DIR/$COMMIT_SHA"
-  PREVIOUS_RELEASE=""
+    scheduler_task = asyncio.create_task(
+        fallback_scheduler_loop(state, stop_event),
+        name="scheduler-loop",
+    )
+    telegram_task = asyncio.create_task(
+        fallback_telegram_loop(state),
+        name="telegram-loop",
+    )
 
-  [ -L "$CURRENT_LINK" ] && PREVIOUS_RELEASE="$(readlink -f "$CURRENT_LINK")"
+    done, pending = await asyncio.wait(
+        {scheduler_task, telegram_task},
+        return_when=asyncio.FIRST_EXCEPTION,
+    )
 
-  log "Deploying commit: $COMMIT_SHA"
+    stop_event.set()
 
-  if [ -d "$NEW_RELEASE" ]; then
-    safe_rm_rf "$NEW_RELEASE"
-  fi
+    for task in pending:
+        task.cancel()
 
-  mkdir -p "$NEW_RELEASE"
+    await asyncio.gather(*pending, return_exceptions=True)
 
-  git archive "$COMMIT_SHA" | tar -x -C "$NEW_RELEASE"
+    for task in done:
+        exc = task.exception()
+        if exc:
+            raise exc
 
-  echo "$COMMIT_SHA" > "$NEW_RELEASE/.commit"
-  ln -sfn "$SHARED_DIR/.env" "$NEW_RELEASE/.env"
 
-  cd "$NEW_RELEASE"
+async def app() -> None:
+    setup_logging()
+    log.info("[BOT_RESTORE] bot.py started")
 
-  [ -f requirements.txt ] || fail "requirements.txt missing"
-  [ -f main.py ] || fail "main.py missing"
+    used_main = await run_main_module()
+    if used_main:
+        return
 
-  python3 -m venv venv
-  source venv/bin/activate
+    log.warning("[BOT_RESTORE] Falling back to direct telegram/scheduler runner")
+    await run_fallback()
 
-  timeout 300 pip install --upgrade pip
-  timeout 300 pip install --no-cache-dir -r requirements.txt
 
-  python -m compileall . >/dev/null
-
-  if [ -d tests/smoke ]; then
-    python -m pytest tests/smoke -q
-  fi
-
-  sudo chown -R "$APP_USER:$APP_USER" "$NEW_RELEASE"
-
-  atomic_switch "$NEW_RELEASE"
-
-  if ! timeout 30 sudo systemctl restart "$APP_NAME"; then
-    rollback "$PREVIOUS_RELEASE"
-  fi
-
-  if ! health_check; then
-    rollback "$PREVIOUS_RELEASE"
-  fi
-
-  cleanup_old_releases "$PREVIOUS_RELEASE"
-
-  END_TIME="$(date +%s)"
-  trap - ERR
-
-  log "Deployment successful: $COMMIT_SHA"
-  log "Deploy time: $((END_TIME - START_TIME)) seconds"
-}
-
-main "$@"
+if __name__ == "__main__":
+    try:
+        asyncio.run(app())
+    except KeyboardInterrupt:
+        pass
