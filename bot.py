@@ -1,183 +1,211 @@
-import asyncio
-import logging
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-from config import CHAT_ID, load_accounts, is_peak_time, now_london
-from storage import (
-    load_subscribers,
-    save_subscribers,
-    load_known_jobs,
-    save_known_job,
-    load_job_history,
-    save_job_history,
-)
-from job_scraper import fetch_jobs, fetch_job_details_batch
-from job_parser import is_fresh_job, score_job
-from application_preparer import run_auto_prepare
-from telegram_bot import (
-    tg_send,
-    tg_alert,
-    send_all_shifts,
-    handle_updates,
-)
+APP_NAME="amazon-bot"
+APP_USER="amazonbot"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+APP_ROOT="/home/ubuntu/Job-Alert"
+REPO_DIR="$APP_ROOT/repo"
+RELEASES_DIR="$APP_ROOT/releases"
+SHARED_DIR="$APP_ROOT/shared"
+CURRENT_LINK="$APP_ROOT/current"
+LOCK_FILE="$APP_ROOT/deploy.lock"
 
-log = logging.getLogger(__name__)
+HEALTH_URL="${HEALTH_URL:-http://localhost:3000/health}"
+KEEP_RELEASES=5
+MIN_FREE_KB=1048576
 
-bot_paused = False
+START_TIME="$(date +%s)"
 
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
 
-async def check_jobs() -> int:
-    global bot_paused
+show_logs() {
+  sudo journalctl -u "$APP_NAME" -n 120 --no-pager || true
+}
 
-    if bot_paused:
-        return 0
+fail() {
+  log "ERROR: $*"
+  show_logs
+  exit 2
+}
 
-    subscribers = load_subscribers()
-    known_jobs = load_known_jobs()
-    job_history = load_job_history()
-    accounts = load_accounts()
+atomic_switch() {
+  local target="$1"
+  local tmp_link="$APP_ROOT/current_tmp"
 
-    jobs = await fetch_jobs()
-    new_jobs = []
+  [ -d "$target" ] || fail "Cannot switch to missing release: $target"
 
-    for job in jobs:
-        job_id = job.get("id")
+  ln -sfn "$target" "$tmp_link"
+  mv -Tf "$tmp_link" "$CURRENT_LINK"
+  sudo chown -h "$APP_USER:$APP_USER" "$CURRENT_LINK"
+}
 
-        if not job_id:
-            continue
+health_check() {
+  for i in {1..30}; do
+    if sudo systemctl is-active --quiet "$APP_NAME" && \
+       curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null; then
+      return 0
+    fi
 
-        if job_id in known_jobs:
-            continue
+    log "Waiting for health... $i/30"
+    sleep 2
+  done
 
-        new_jobs.append(job)
+  return 1
+}
 
-    if not new_jobs:
-        log.info("[SCAN] No new jobs")
-        return 0
+safe_rm_rf() {
+  local target="$1"
+  local target_real
+  local releases_real
 
-    log.info("[SCAN] New jobs found: %s", len(new_jobs))
+  [ -n "$target" ] || fail "Refusing empty delete"
 
-    detailed_jobs = await fetch_job_details_batch(new_jobs)
+  target_real="$(readlink -f "$target")"
+  releases_real="$(readlink -f "$RELEASES_DIR")"
 
-    for job in detailed_jobs:
-        job_id = job.get("id")
+  case "$target_real" in
+    "$releases_real"/*) ;;
+    *) fail "Unsafe delete: $target_real" ;;
+  esac
 
-        if not job_id:
-            continue
+  [ "$target_real" != "$releases_real" ] || fail "Refusing to delete releases dir"
 
-        job_score, should_skip = score_job(job)
+  rm -rf "$target_real"
+}
 
-        if should_skip:
-            log.info("[SKIPPED] job=%s reason=score_filter", job_id)
-            continue
+rollback() {
+  trap - ERR
 
-        known_jobs[job_id] = job
-        job_history.append(job)
+  local previous_release="$1"
 
-        save_known_job(job)
-        save_job_history(job_history)
+  if [ -z "$previous_release" ] || [ ! -d "$previous_release" ]; then
+    log "No valid previous release for rollback"
+    show_logs
+    exit 1
+  fi
 
-        await send_all_shifts(
-            job,
-            status="new",
-            chat_id=CHAT_ID,
-            score=job_score if job_score > 0 else None,
-        )
+  log "Rolling back to: $previous_release"
+  atomic_switch "$previous_release"
 
-        if is_fresh_job(job):
-            await tg_alert(job, "fresh_alert", chat_id=CHAT_ID)
-            continue
+  timeout 30 sudo systemctl restart "$APP_NAME" || fail "Rollback restart failed"
 
-        if accounts:
-            asyncio.create_task(
-                run_auto_prepare(
-                    job=job,
-                    account=accounts[0],
-                    alert_fn=tg_alert,
-                    chat_id=CHAT_ID,
-                )
-            )
+  if health_check; then
+    log "Rollback successful"
+    exit 1
+  fi
 
-    return len(detailed_jobs)
+  fail "Rollback health check failed"
+}
 
+cleanup_old_releases() {
+  local previous_real="${1:-}"
+  local current_real=""
 
-async def send_daily_summary():
-    while True:
-        now = now_london()
+  [ -L "$CURRENT_LINK" ] && current_real="$(readlink -f "$CURRENT_LINK")"
+  [ -n "$previous_real" ] && previous_real="$(readlink -f "$previous_real")"
 
-        if now.hour == 7 and now.minute == 0:
-            job_history = load_job_history()
-            today_str = now.strftime("%Y-%m-%d")
+  find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d \
+    | sort -r \
+    | while read -r release; do
+        release_real="$(readlink -f "$release")"
 
-            today_jobs = [
-                job for job in job_history
-                if job.get("found_at", "").startswith(today_str)
-            ]
+        [ "$release_real" = "$current_real" ] && continue
+        [ "$release_real" = "$previous_real" ] && continue
 
-            if today_jobs:
-                best = max(today_jobs, key=lambda x: x.get("pay", 0))
-                avg_pay = sum(j.get("pay", 0) for j in today_jobs) / len(today_jobs)
+        echo "$release"
+      done \
+    | tail -n +"$((KEEP_RELEASES + 1))" \
+    | while read -r old_release; do
+        log "Removing old release: $old_release"
+        safe_rm_rf "$old_release"
+      done
+}
 
-                await tg_send(
-                    f"""📊 <b>Daily Summary</b>
-━━━━━━━━━━━━━━━━━
-📅 {today_str}
-🆕 Jobs: {len(today_jobs)}
-💰 Avg: £{avg_pay:.2f}/hr
-⭐ Best: {best.get('location', '?')} £{best.get('pay', '?')}/hr
-━━━━━━━━━━━━━━━━━"""
-                )
+main() {
+  mkdir -p "$APP_ROOT" "$RELEASES_DIR" "$SHARED_DIR"
 
-            await asyncio.sleep(60)
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || fail "Another deployment is already running"
 
-        await asyncio.sleep(30)
+  trap 'log "Unexpected deployment failure"; show_logs' ERR
 
+  command -v curl >/dev/null || fail "curl is required"
+  command -v git >/dev/null || fail "git is required"
+  command -v python3 >/dev/null || fail "python3 is required"
 
-async def main():
-    log.info("[STARTUP] Amazon bot starting")
+  [ -d "$REPO_DIR/.git" ] || fail "Invalid repo directory: $REPO_DIR"
+  [ -f "$SHARED_DIR/.env" ] || fail "Missing shared env: $SHARED_DIR/.env"
+  id "$APP_USER" >/dev/null 2>&1 || fail "Missing app user: $APP_USER"
 
-    subscribers = load_subscribers()
+  systemctl cat "$APP_NAME" >/dev/null || fail "Missing systemd service: $APP_NAME"
 
-    if CHAT_ID not in subscribers:
-        subscribers[CHAT_ID] = {
-            "name": "Owner",
-            "locations": ["Birmingham"],
-            "radius": 50,
-            "job_type": "both",
-            "setup_complete": True,
-            "auto_apply": True,
-            "tier": "owner",
-            "joined": now_london().isoformat(),
-        }
-        save_subscribers(subscribers)
+  AVAILABLE_KB="$(df --output=avail "$APP_ROOT" | tail -1 | tr -d ' ')"
+  [ "$AVAILABLE_KB" -ge "$MIN_FREE_KB" ] || fail "Low disk space"
 
-    accounts = load_accounts()
+  cd "$REPO_DIR"
 
-    await tg_send(
-        f"""👑 <b>Amazon Bot Online</b>
-━━━━━━━━━━━━━━━━━
-✅ Safe prepare-only mode enabled
-✅ GraphQL scraper enabled
-✅ Detail batch fetch enabled
-✅ Application preparer enabled
-👥 Subscribers: {len(subscribers)}
-🤖 Accounts: {len(accounts)}
-━━━━━━━━━━━━━━━━━"""
-    )
+  git fetch origin main
+  git reset --hard origin/main
+  git clean -fdx
 
-    asyncio.create_task(handle_updates())
-    asyncio.create_task(send_daily_summary())
+  COMMIT_SHA="$(git rev-parse HEAD)"
+  NEW_RELEASE="$RELEASES_DIR/$COMMIT_SHA"
+  PREVIOUS_RELEASE=""
 
-    await check_jobs()
+  [ -L "$CURRENT_LINK" ] && PREVIOUS_RELEASE="$(readlink -f "$CURRENT_LINK")"
 
-    while True:
-        await asyncio.sleep(3 if is_peak_time() else 10)
-        await check_jobs()
+  log "Deploying commit: $COMMIT_SHA"
 
+  if [ -d "$NEW_RELEASE" ]; then
+    safe_rm_rf "$NEW_RELEASE"
+  fi
 
-if __name__ == "__main__":
-    asyncio.run(main())
+  mkdir -p "$NEW_RELEASE"
+
+  git archive "$COMMIT_SHA" | tar -x -C "$NEW_RELEASE"
+
+  echo "$COMMIT_SHA" > "$NEW_RELEASE/.commit"
+  ln -sfn "$SHARED_DIR/.env" "$NEW_RELEASE/.env"
+
+  cd "$NEW_RELEASE"
+
+  [ -f requirements.txt ] || fail "requirements.txt missing"
+  [ -f main.py ] || fail "main.py missing"
+
+  python3 -m venv venv
+  source venv/bin/activate
+
+  timeout 300 pip install --upgrade pip
+  timeout 300 pip install --no-cache-dir -r requirements.txt
+
+  python -m compileall . >/dev/null
+
+  if [ -d tests/smoke ]; then
+    python -m pytest tests/smoke -q
+  fi
+
+  sudo chown -R "$APP_USER:$APP_USER" "$NEW_RELEASE"
+
+  atomic_switch "$NEW_RELEASE"
+
+  if ! timeout 30 sudo systemctl restart "$APP_NAME"; then
+    rollback "$PREVIOUS_RELEASE"
+  fi
+
+  if ! health_check; then
+    rollback "$PREVIOUS_RELEASE"
+  fi
+
+  cleanup_old_releases "$PREVIOUS_RELEASE"
+
+  END_TIME="$(date +%s)"
+  trap - ERR
+
+  log "Deployment successful: $COMMIT_SHA"
+  log "Deploy time: $((END_TIME - START_TIME)) seconds"
+}
+
+main "$@"
