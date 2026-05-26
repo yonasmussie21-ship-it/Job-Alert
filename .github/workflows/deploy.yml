@@ -1,52 +1,37 @@
-name: Deploy to Oracle
+- name: Deploy to server
+  run: |
+    ssh -i ~/.ssh/id_rsa \
+      -o StrictHostKeyChecking=no \
+      ubuntu@${{ secrets.ORACLE_IP }} << 'EOF'
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+      set -euxo pipefail
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
+      mkdir -p ~/.ssh
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdgtmbnwR38Bqd8IFzqImTAGq4yMDUaDoBQCUWB5MHO github-deploy" >> ~/.ssh/authorized_keys
 
-      - name: Setup SSH
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H "${{ secrets.ORACLE_IP }}" >> ~/.ssh/known_hosts
+      chmod 700 ~/.ssh
+      chmod 600 ~/.ssh/authorized_keys
 
-      - name: Deploy to server
-        run: |
-          ssh -o StrictHostKeyChecking=no ubuntu@${{ secrets.ORACLE_IP }} << EOF
-            set -e
+      echo "✅ SSH repaired"
 
-            APP_DIR="\$HOME/Job-Alert-main"
+      if [ ! -d "$HOME/Job-Alert-main/.git" ]; then
+        git clone https://github.com/yonasmussie21-ship-it/Job-Alert.git "$HOME/Job-Alert-main"
+      fi
 
-            if [ ! -d "\$APP_DIR/.git" ]; then
-              git clone https://github.com/yonasmussie21-ship-it/Job-Alert.git "\$APP_DIR"
-            fi
+      cd "$HOME/Job-Alert-main"
 
-            cd "\$APP_DIR"
-            git pull origin main
+      git pull origin main
 
-            if [ ! -d "venv" ]; then
-              python3 -m venv venv
-            fi
+      if [ ! -d "venv" ]; then
+        python3 -m venv venv
+      fi
 
-            source venv/bin/activate
-            pip install --upgrade pip
-            pip install -r requirements.txt
+      source venv/bin/activate
 
-            echo "Restarting service..."
-            sudo systemctl restart amazon-bot
+      pip install --upgrade pip
+      pip install -r requirements.txt
 
-            echo "Checking status..."
-            sudo systemctl status amazon-bot --no-pager
+      sudo systemctl restart amazon-bot || true
 
-          EOF
-``
+    EOF
