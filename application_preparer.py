@@ -1,310 +1,352 @@
 """
-EXACT REPLACEMENTS for application_preparer.py
-================================================
-Implements your colleague's spec:
-  1. assessment-eligibility check
-  2. _advance_workflow("review-submit")
-  3. _advance_workflow("thank-you")   ← actual submit
-  4. verify checklist state == EVALUATION_PENDING
-
-Drop these functions in to replace the existing ones.
-One call-site change also required — see bottom of file.
+application_preparer.py — SAFE PREPARE-ONLY mode for OWNER v1
+Flow: fetch CSRF → get candidateId → create/find app → get schedules
+      → advance workflow → STOP → send Telegram button → owner submits manually
+Full submit only enabled if ENABLE_FULL_SUBMIT=true env var is set.
 """
+import json
+import os
+import logging
+import aiohttp
+from html import escape
+from config import CHAT_ID, now_london
+from storage import load_cookies, save_cookies, save_application, log_error
+from job_parser import shift_priority, is_fresh_job
 
+log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-# NEW: _check_assessment_eligibility  (add before _submit_application)
-# ─────────────────────────────────────────────────────────────
+BASE_URL        = "https://www.jobsatamazon.co.uk/application/api/candidate-application"
+ENABLE_FULL_SUBMIT = os.environ.get("ENABLE_FULL_SUBMIT","false").lower() == "true"
 
-async def _check_assessment_eligibility(
-    session,
-    headers: dict,
-    app_id: str,
-    candidate_id: str,
-    job_id: str,
-) -> "StepResult":
-    """
-    POST /candidate-application/assessment-eligibility
-    Confirmed payload from HAR:
-      {"applicationId": "...", "candidateId": "...", "jobId": "..."}
-    Response: {"data": {"assessmentEligibility": false}, ...}
-    Not blocking — we log and continue regardless of result.
-    """
-    import json
-    res = await _request_text_with_retry(
-        session,
-        "POST",
-        f"{BASE_URL}/candidate-application/assessment-eligibility",
-        json={
-            "applicationId": app_id,
-            "candidateId": candidate_id,
-            "jobId": job_id,
-        },
-        headers=headers,
-        step="ASSESSMENT_ELIGIBILITY",
-        timeout=10,
-    )
-    status_code = int(res.status) if res.status and res.status.isdigit() else None
-    if status_code == 200:
-        try:
-            data = json.loads(res.message)
-            eligible = data.get("data", {}).get("assessmentEligibility", False)
-            log.info(f"[ASSESSMENT_ELIGIBILITY] eligible={eligible}")
-        except Exception:
-            log.info(f"[ASSESSMENT_ELIGIBILITY] status=200 (parse skipped)")
-    else:
-        log.warning(f"[ASSESSMENT_ELIGIBILITY] status={res.status} — continuing anyway")
-    return StepResult(ok=True)  # never blocks the flow
+# ─── AUTH ─────────────────────────────────────────────────────────────────────
+async def extract_auth(cookies: list) -> dict:
+    auth = {}
+    for c in cookies:
+        name = c.get("name","")
+        if name == "HVH_ACCESS_TOKEN": auth["token"]      = c.get("value","")
+        elif name == "hvhcid":         auth["hvhcid"]     = c.get("value","")
+        elif name == "aws-waf-token":  auth["waf_token"]  = c.get("value","")
+    return auth
 
+def _headers(cookies: list, auth: dict, job_id: str = "") -> dict:
+    cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+    return {
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+        "cookie":        cookie_str,
+        "authorization": auth.get("token",""),
+        "bb-ui-version": "bb-ui-v2",
+        "user-agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "origin":        "https://www.jobsatamazon.co.uk",
+        "referer":       f"https://www.jobsatamazon.co.uk/application/uk/?jobId={job_id}",
+    }
 
-# ─────────────────────────────────────────────────────────────
-# NEW: _verify_submission  (add after _submit_application)
-# ─────────────────────────────────────────────────────────────
+# ─── COOKIE VALIDATION ────────────────────────────────────────────────────────
+async def validate_cookies(cookies: list) -> tuple[bool, str]:
+    """Check cookies are valid and not expired. Returns (ok, reason)."""
+    if not cookies:
+        return False, "No cookies found"
+    auth = await extract_auth(cookies)
+    if not auth.get("token"):
+        return False, "No HVH_ACCESS_TOKEN in cookies"
+    if not auth.get("hvhcid"):
+        return False, "No hvhcid in cookies"
 
-async def _verify_submission(
-    session,
-    headers: dict,
-    app_id: str,
-) -> "StepResult":
-    """
-    GET /checklist/api/application/application-manage-data/{app_id}/en-GB
-    Confirms applicationState == "EVALUATION_PENDING" after submit.
-    Confirmed from HAR — this is what the browser hits after thank-you step.
-    """
-    import json
-    CHECKLIST_URL = "https://www.jobsatamazon.co.uk/checklist/api"
-    res = await _request_text_with_retry(
-        session,
-        "GET",
-        f"{CHECKLIST_URL}/application/application-manage-data/{app_id}/en-GB",
-        headers=headers,
-        step="VERIFY_SUBMISSION",
-        timeout=10,
-    )
-    status_code = int(res.status) if res.status and res.status.isdigit() else None
-    if status_code != 200:
-        log.warning(f"[VERIFY_SUBMISSION] unexpected status {res.status}")
-        return StepResult(ok=False, message=f"Verification request failed: {res.status}")
-
+    # Quick API check
+    headers = _headers(cookies, auth)
     try:
-        data = json.loads(res.message)
-        state = data.get("applicationState", "")
-        log.info(f"[VERIFY_SUBMISSION] applicationState={state}")
-        if state == "EVALUATION_PENDING":
-            return StepResult(ok=True)
-        else:
-            return StepResult(ok=False, message=f"Unexpected state after submit: {state}")
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                "https://www.jobsatamazon.co.uk/authorize/api/csrf?countryCode=UK",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                if r.status == 401:
+                    return False, "Cookies expired (401)"
+                if r.status == 403:
+                    return False, "Cookies blocked (403) — WAF or IP issue"
+                if r.status != 200:
+                    return False, f"Unexpected status {r.status}"
     except Exception as e:
-        return StepResult(ok=False, message=f"Failed to parse verification response: {e}")
+        return False, f"Validation request failed: {e}"
 
+    return True, "OK"
 
-# ─────────────────────────────────────────────────────────────
-# REPLACE: _submit_application  (lines ~470-504)
-# ─────────────────────────────────────────────────────────────
-# Implements exactly: assessment-eligibility → review-submit → thank-you → verify
-
-async def _submit_application(
-    session,
-    headers: dict,
-    job_id: str,
-    app_id: str,
-    candidate_id: str,
-    schedule_id: str,
-) -> "StepResult":
+# ─── LOAD ACCOUNT COOKIES ────────────────────────────────────────────────────
+def load_account_cookies(account: dict) -> list:
     """
-    Full submit sequence per confirmed HAR flow:
-      1. POST assessment-eligibility   (non-blocking check)
-      2. PUT  update-workflow-step-name → "review-submit"
-      3. PUT  update-workflow-step-name → "thank-you"    ← actual submit
-      4. GET  checklist application-manage-data          ← verify EVALUATION_PENDING
+    Load cookies in priority order:
+    1. account["cookies"] env var (per-account)
+    2. SQLite saved cookies for this account_id
+    3. Global AMAZON_COOKIES env (fallback for account 1 only)
     """
+    acc_id = account.get("id", 1)
 
-    # Step 1: assessment-eligibility check
-    await _check_assessment_eligibility(
-        session, headers, app_id, candidate_id, job_id
-    )
+    # 1. Per-account cookies from env
+    if account.get("cookies"):
+        try:
+            cookies = json.loads(account["cookies"])
+            log.info(f"[COOKIES] Loaded {len(cookies)} from account {acc_id} env")
+            return cookies
+        except Exception as e:
+            log.warning(f"[COOKIES] Parse error for account {acc_id}: {e}")
 
-    # Step 2: navigate to review-submit
-    res = await _request_text_with_retry(
-        session,
-        "PUT",
-        f"{BASE_URL}/candidate-application/update-workflow-step-name",
-        json={
-            "applicationId": app_id,
-            "workflowStepName": "review-submit",
-        },
-        headers=headers,
-        step="WORKFLOW_review-submit",
-        timeout=10,
-    )
-    status_code = int(res.status) if res.status and res.status.isdigit() else None
-    log.info(f"[WORKFLOW] → review-submit ({res.status})")
-    if status_code not in [200, 204]:
-        msg = f"review-submit step failed: {res.status}"
-        log_error("SUBMIT_FAILED", f"app={app_id}: {msg}")
-        return StepResult(ok=False, message=msg)
+    # 2. SQLite
+    cookies = load_cookies(acc_id)
+    if cookies:
+        log.info(f"[COOKIES] Loaded {len(cookies)} from DB for account {acc_id}")
+        return cookies
 
-    # Step 3: thank-you = the actual submit
-    res = await _request_text_with_retry(
-        session,
-        "PUT",
-        f"{BASE_URL}/candidate-application/update-workflow-step-name",
-        json={
-            "applicationId": app_id,
-            "workflowStepName": "thank-you",
-        },
-        headers=headers,
-        step="WORKFLOW_thank-you",
-        timeout=15,
-    )
-    status_code = int(res.status) if res.status and res.status.isdigit() else None
-    log.info(f"[WORKFLOW] → thank-you ({res.status})")
-    if status_code not in [200, 204]:
-        msg = f"thank-you (submit) step failed: {res.status}"
-        log_error("SUBMIT_FAILED", f"app={app_id}: {msg}")
-        return StepResult(ok=False, message=msg)
-
-    # Step 4: verify EVALUATION_PENDING
-    verify_res = await _verify_submission(session, headers, app_id)
-    if not verify_res.ok:
-        # Non-fatal — the submit likely succeeded even if verify is flaky
-        log.warning(f"[SUBMIT_VERIFY_FAILED] {verify_res.message} — treating as success")
-
-    log.info(f"[SUBMIT_SUCCESS] app_id={app_id}")
-    return StepResult(ok=True)
-
-
-# ─────────────────────────────────────────────────────────────
-# REPLACE: _advance_workflow  (lines ~422-444)
-# ─────────────────────────────────────────────────────────────
-# Remove "review-submit" from here — it's now handled inside _submit_application.
-# Keep only the pre-submit steps: additional-information and nhe (with booking).
-
-async def _advance_workflow(
-    session,
-    headers: dict,
-    app_id: str,
-    schedule_id: str = "",      # needed for NHE site lookup
-) -> "StepResult":
-    """
-    Pre-submit workflow steps only:
-      additional-information  (personal details were saved just before this)
-      nhe                     (fetch slots + book appointment)
-    review-submit and thank-you are now handled in _submit_application.
-    """
-    import json
-    from datetime import datetime, timedelta
-
-    # Step: additional-information
-    res = await _request_text_with_retry(
-        session,
-        "PUT",
-        f"{BASE_URL}/candidate-application/update-workflow-step-name",
-        json={"applicationId": app_id, "workflowStepName": "additional-information"},
-        headers=headers,
-        step="WORKFLOW_additional-information",
-        timeout=10,
-    )
-    status_code = int(res.status) if res.status and res.status.isdigit() else None
-    log.info(f"[WORKFLOW] → additional-information ({res.status})")
-    if status_code not in [200, 204]:
-        return StepResult(ok=False, message=f"additional-information step failed: {res.status}")
-
-    # Step: nhe (with slot booking)
-    res = await _request_text_with_retry(
-        session,
-        "PUT",
-        f"{BASE_URL}/candidate-application/update-workflow-step-name",
-        json={"applicationId": app_id, "workflowStepName": "nhe"},
-        headers=headers,
-        step="WORKFLOW_nhe",
-        timeout=10,
-    )
-    status_code = int(res.status) if res.status and res.status.isdigit() else None
-    log.info(f"[WORKFLOW] → nhe ({res.status})")
-    if status_code not in [200, 204]:
-        return StepResult(ok=False, message=f"nhe step failed: {res.status}")
-
-    # Get siteId for NHE slot fetch
-    if schedule_id:
-        site_res = await _request_text_with_retry(
-            session,
-            "GET",
-            f"{BASE_URL}/job/get-schedule-details/{schedule_id}?locale=en-GB",
-            headers=headers,
-            step="GET_SCHEDULE_DETAILS",
-            timeout=10,
-        )
-        site_code = int(site_res.status) if site_res.status and site_res.status.isdigit() else None
-        site_id = None
-        if site_code == 200:
+    # 3. Global fallback — only for account 1
+    if acc_id == 1:
+        global_cookies = os.environ.get("AMAZON_COOKIES","")
+        if global_cookies:
             try:
-                site_id = json.loads(site_res.message)["data"]["siteId"]
-                log.info(f"[NHE] siteId={site_id}")
+                cookies = json.loads(global_cookies)
+                log.info(f"[COOKIES] Loaded {len(cookies)} from global env (account 1 fallback)")
+                return cookies
             except Exception as e:
-                log.warning(f"[NHE] Could not parse siteId: {e}")
+                log.warning(f"[COOKIES] Global parse error: {e}")
 
-        if site_id:
-            today = datetime.now()
-            slots_res = await _request_text_with_retry(
-                session,
-                "POST",
-                f"{BASE_URL}/nhe/available-time-slots",
+    log.warning(f"[COOKIES] No cookies found for account {acc_id}")
+    return []
+
+# ─── PREPARE APPLICATION (SAFE MODE) ─────────────────────────────────────────
+async def prepare_application(job: dict, account: dict) -> dict:
+    """
+    Prepare an application up to shift selection.
+    Returns result dict with status, app_id, schedule info, apply_url.
+    Does NOT submit unless ENABLE_FULL_SUBMIT=true.
+    """
+    job_id = job.get("id","")
+    acc_id = account.get("id", 1)
+
+    log.info(f"[AUTO_PREPARE_STARTED] job={job_id} account={acc_id}")
+
+    result = {
+        "status":     "failed",
+        "job_id":     job_id,
+        "app_id":     None,
+        "schedule_id": None,
+        "apply_url":  job.get("link",""),
+        "message":    "",
+    }
+
+    # Load + validate cookies
+    cookies = load_account_cookies(account)
+    ok, reason = await validate_cookies(cookies)
+    if not ok:
+        log.warning(f"[COOKIE_EXPIRED] account={acc_id} reason={reason}")
+        log_error("COOKIE_EXPIRED", f"Account {acc_id}: {reason}")
+        result["status"]  = "cookie_expired"
+        result["message"] = reason
+        return result
+
+    auth    = await extract_auth(cookies)
+    headers = _headers(cookies, auth, job_id)
+
+    log.info(f"[COOKIES_OK] hvhcid={auth.get('hvhcid','?')[:8]}...")
+
+    async with aiohttp.ClientSession() as session:
+
+        # Step 1: CSRF token
+        try:
+            async with session.get(
+                "https://www.jobsatamazon.co.uk/authorize/api/csrf?countryCode=UK",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                csrf_data  = await r.json() if r.status == 200 else {}
+                csrf_token = csrf_data.get("token","")
+                if csrf_token:
+                    headers["x-csrf-token"] = csrf_token
+                    log.info("[CSRF_OK]")
+        except Exception as e:
+            log.warning(f"[CSRF_FAILED] {e}")
+
+        # Step 2: Resolve candidateSFId
+        candidate_id = auth.get("hvhcid","")
+        try:
+            async with session.post(
+                "https://www.jobsatamazon.co.uk/graphql",
                 json={
-                    "returnNestedData": True,
-                    "siteId": site_id,
-                    "startDate": today.strftime("%Y-%m-%d"),
-                    "endDate": (today + timedelta(days=14)).strftime("%Y-%m-%d"),
-                    "locale": "en-GB",
+                    "operationName": "queryCandidate",
+                    "query": """query queryCandidate($bbCandidateId: String!) {
+                        queryCandidate(bbCandidateId: $bbCandidateId) {
+                            candidateId candidateSFId firstName lastName __typename
+                        }
+                    }""",
+                    "variables": {"bbCandidateId": candidate_id}
                 },
-                headers=headers,
-                step="NHE_SLOTS",
-                timeout=15,
-            )
-            slots_code = int(slots_res.status) if slots_res.status and slots_res.status.isdigit() else None
-            if slots_code == 200:
-                try:
-                    slots = json.loads(slots_res.message).get("data", [])
-                    if slots:
-                        virtual = [s for s in slots if s.get("locationType") == "VIRTUAL_CONNECT"]
-                        chosen = min(virtual or slots, key=lambda s: s.get("startTimestamp", 0))
-                        log.info(f"[NHE] Booking slot {chosen.get('timeSlotId')} on {chosen.get('title')}")
-                        await _request_text_with_retry(
-                            session,
-                            "PUT",
-                            f"{BASE_URL}/candidate-application/update-application",
-                            json={
-                                "applicationId": app_id,
-                                "payload": {"nheAppointment": chosen},
-                                "type": "nhe",
-                                "dspEnabled": True,
-                            },
-                            headers=headers,
-                            step="NHE_BOOK",
-                            timeout=15,
-                        )
+                headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status == 200:
+                    data      = await r.json()
+                    candidate = data.get("data",{}).get("queryCandidate",{}) or {}
+                    sf_id     = candidate.get("candidateSFId","")
+                    if sf_id:
+                        candidate_id = sf_id
+                    log.info(f"[CANDIDATE_ID] {candidate_id[:12]}...")
+        except Exception as e:
+            log.warning(f"[CANDIDATE_FAILED] {e}")
+
+        # Step 3: Check existing application
+        app_id = None
+        try:
+            async with session.get(
+                f"{BASE_URL}/applications?jobId={job_id}&locale=en-GB",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    apps = data if isinstance(data, list) else data.get("applications",[])
+                    for app in apps:
+                        if app.get("jobId") == job_id or app.get("active"):
+                            app_id = app.get("applicationId") or app.get("id")
+                            log.info(f"[APP_EXISTING] {app_id}")
+                            break
+        except Exception as e:
+            log.warning(f"[APP_CHECK_FAILED] {e}")
+
+        # Step 4: Create new application if needed
+        if not app_id:
+            try:
+                async with session.post(
+                    f"{BASE_URL}/application",
+                    json={"jobId": job_id, "locale": "en-GB"},
+                    headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+                ) as r:
+                    text = await r.text()
+                    if r.status in [200, 201]:
+                        data   = json.loads(text)
+                        app_id = data.get("applicationId") or data.get("id")
+                        log.info(f"[APP_CREATED] {app_id}")
                     else:
-                        log.warning(f"[NHE] No slots available for {site_id}")
-                except Exception as e:
-                    log.warning(f"[NHE] Slot booking error: {e} — continuing")
-            else:
-                log.warning(f"[NHE] Slots fetch failed {slots_res.status} — continuing")
-    else:
-        log.warning("[NHE] No schedule_id — skipping NHE slot booking")
+                        log.warning(f"[APP_CREATE_FAILED] {r.status}: {text[:200]}")
+                        result["message"] = f"Create app failed {r.status}"
+                        return result
+            except Exception as e:
+                log.error(f"[APP_CREATE_ERROR] {e}")
+                result["message"] = str(e)
+                return result
 
-    return StepResult(ok=True)
+        if not app_id:
+            result["message"] = "No application ID obtained"
+            return result
 
+        result["app_id"] = app_id
+        headers["referer"] = (
+            f"https://www.jobsatamazon.co.uk/application/uk/"
+            f"?applicationId={app_id}&jobId={job_id}"
+        )
 
-# ─────────────────────────────────────────────────────────────
-# CALL SITE CHANGE in prepare_application (~line 617)
-# ─────────────────────────────────────────────────────────────
-#
-# BEFORE:
-#   wf_res = await _advance_workflow(session, headers_with_app, app_id)
-#
-# AFTER:
-#   wf_res = await _advance_workflow(session, headers_with_app, app_id, schedule_id)
-#
-# Everything else stays the same.
-# _submit_application call signature is unchanged:
-#   submit_res = await _submit_application(session, headers_with_app, job_id, app_id, candidate_id, schedule_id)
+        # Step 5: Get schedules
+        schedule_id   = None
+        schedule_text = None
+        try:
+            async with session.post(
+                f"{BASE_URL}/job/get-all-schedules/{job_id}",
+                json={"applicationId": app_id, "locale": "en-GB"},
+                headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status == 200:
+                    data      = await r.json()
+                    schedules = data.get("availableSchedules",{}).get("schedules",[])
+                    if schedules:
+                        best = sorted(
+                            schedules,
+                            key=lambda s: shift_priority(
+                                s.get("scheduleText","") or s.get("externalJobTitle","")
+                            )
+                        )[0]
+                        schedule_id   = best.get("scheduleId") or best.get("scheduleID") or best.get("id")
+                        schedule_text = best.get("scheduleText","")
+                        result["schedule_id"] = schedule_id
+                        log.info(f"[SCHEDULE_SELECTED] {schedule_id} — {schedule_text}")
+                    else:
+                        log.warning("[NO_SCHEDULES] No shifts available for this job")
+                else:
+                    text = await r.text()
+                    log.warning(f"[SCHEDULE_FAILED] {r.status}: {text[:200]}")
+        except Exception as e:
+            log.warning(f"[SCHEDULE_ERROR] {e}")
+
+        # Step 6: Advance workflow
+        for step_name in ["job-opportunities", "additional-information", "review-submit"]:
+            try:
+                async with session.put(
+                    f"{BASE_URL}/update-workflow-step-name",
+                    json={"applicationId": app_id, "workflowStepName": step_name},
+                    headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
+                    log.info(f"[WORKFLOW] → {step_name} ({r.status})")
+            except Exception as e:
+                log.warning(f"[WORKFLOW_ERROR] {step_name}: {e}")
+
+        # Step 7: Full submit (owner only, explicit opt-in)
+        if ENABLE_FULL_SUBMIT:
+            log.info("[FULL_SUBMIT] ENABLE_FULL_SUBMIT=true — submitting now...")
+            submit_body = {
+                "applicationId": app_id,
+                "jobId":         job_id,
+                "candidateId":   candidate_id,
+            }
+            if schedule_id:
+                submit_body["scheduleId"] = schedule_id
+            try:
+                async with session.post(
+                    f"{BASE_URL}/submit-application",
+                    json=submit_body,
+                    headers=headers, timeout=aiohttp.ClientTimeout(total=20)
+                ) as r:
+                    text = await r.text()
+                    log.info(f"[SUBMIT_RESPONSE] ({r.status}): {text[:200]}")
+                    if r.status in [200, 201, 204]:
+                        log.info(f"[SUBMIT_SUCCESS] app_id={app_id}")
+                        result["status"]    = "submitted"
+                        result["apply_url"] = f"https://www.jobsatamazon.co.uk/checklist/{job_id}/{app_id}"
+                        save_application(job_id, app_id, "submitted")
+                        return result
+                    else:
+                        log.warning(f"[SUBMIT_FAILED] {r.status}: {text[:300]}")
+                        log_error("SUBMIT_FAILED", f"job={job_id} status={r.status}: {text[:200]}")
+            except Exception as e:
+                log.error(f"[SUBMIT_ERROR] {e}")
+                log_error("SUBMIT_ERROR", str(e))
+
+        # ── SAFE MODE: stop here, send button to owner ─────────────────────
+        checklist_url = f"https://www.jobsatamazon.co.uk/application/uk/?applicationId={app_id}&jobId={job_id}"
+        result["status"]    = "prepared"
+        result["apply_url"] = checklist_url
+        result["message"]   = schedule_text or "Shift selected"
+        save_application(job_id, app_id, "prepared")
+        log.info(f"[AUTO_PREPARE_SUCCESS] app_id={app_id} url={checklist_url}")
+        return result
+
+# ─── ORCHESTRATOR ─────────────────────────────────────────────────────────────
+async def run_auto_prepare(job: dict, account: dict, alert_fn, chat_id: str = CHAT_ID):
+    """Run prepare flow and fire Telegram alerts."""
+    if is_fresh_job(job):
+        await alert_fn(job, "fresh_alert", chat_id=chat_id)
+        return
+
+    await alert_fn(job, "applying", chat_id=chat_id, account_id=account.get("id"))
+
+    result = await prepare_application(job, account)
+    status = result["status"]
+
+    if status == "cookie_expired":
+        await alert_fn(job, "cookie_expired", chat_id=chat_id)
+        return
+
+    if status in ["prepared", "submitted"]:
+        alert_status = "applied" if status == "submitted" else "prepared"
+        await alert_fn(
+            job, alert_status,
+            chat_id=chat_id,
+            account_id=account.get("id"),
+            apply_url=result.get("apply_url"),
+        )
+        return
+
+    # Fallback — something went wrong, send manual alert
+    log.warning(f"[PREPARE_FALLBACK] {result.get('message')}")
+    await alert_fn(job, "ready", chat_id=chat_id)
