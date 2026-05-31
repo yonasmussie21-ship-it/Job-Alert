@@ -1,0 +1,591 @@
+"""
+Smart Auto-Submit using queryApplicationsByBBCandidateIdV2
+==========================================================
+This approach is MUCH more reliable than the old flow because:
+
+1. We query ALL pending applications in ONE call
+2. We get applicationId, jobId, scheduleId all at once
+3. We can check submit status before attempting
+4. We don't need to search for jobs separately
+
+Flow:
+  queryApplicationsByBBCandidateIdV2
+       ↓
+  Filter: submitted=False + state=REVIEW_AND_SUBMIT_PENDING
+       ↓
+  For each pending app:
+    → update-workflow-step-name
+    → submit-application
+    → verify
+"""
+
+import requests
+import json
+import time
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+BASE_URL = "https://www.jobsatamazon.co.uk"
+GRAPHQL_URL = f"{BASE_URL}/candidate/graphql"
+
+HEADERS_BASE = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/148.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Origin": BASE_URL,
+    "Referer": f"{BASE_URL}/",
+    "bb-ui-version": "bb-ui-v2",
+}
+
+# ── Full query from HAR capture ────────────────────────────
+QUERY_APPLICATIONS_V2 = """
+query queryApplicationsByBBCandidateIdV2(
+    $locale: String!, 
+    $bbCandidateId: String!
+) {
+  queryApplicationsByBBCandidateIdV2(
+    locale: $locale
+    bbCandidateId: $bbCandidateId
+  ) {
+    didAllApplicationsLoaded
+    applications {
+      active
+      submitted
+      applicationId
+      applicationState
+      candidateId
+      sfCandidateId
+      workflowName
+      step
+      subStep
+      lastModificationDate
+      continueApplicationLink
+      allowedActionsList
+      applicationLevelPayRate
+      sfShift {
+        shiftCode
+        shiftDescription
+        hoursPerWeek
+        daysOfTheWeek
+        startTime
+        endTime
+        basePayRate
+        firstDayOnSite
+        reportTime
+      }
+      scheduleInfo {
+        scheduleId
+        city
+        state
+        postalCode
+        basePay
+        surgePay
+        employmentType
+        externalJobTitle
+        hoursPerWeek
+        startTime
+        firstDayOnSite
+      }
+      jobDetail {
+        jobId
+        jobTitle
+        jobType
+        employmentType
+        city
+        postalCode
+        totalPayRateMin
+        totalPayRateMax
+        currencyCode
+        locationName
+      }
+      stepper {
+        stepOrder
+        active
+        completed
+        applicationCompleted
+        messageCode
+      }
+      jobData {
+        jobId
+        scheduleId
+        basePay
+        totalPayRate
+        city
+        postalCode
+        employmentType
+        siteId
+      }
+    }
+  }
+}
+"""
+
+
+# ─────────────────────────────────────────────────────────
+# CORE FUNCTION: Get all pending applications
+# ─────────────────────────────────────────────────────────
+
+def get_pending_applications(
+    session: requests.Session,
+    candidate_id: str,
+    locale: str = "en-GB"
+) -> list:
+    """
+    Get all applications that are ready to submit.
+    Uses the V2 query confirmed from HAR analysis.
+    
+    Returns list of applications with submitted=False
+    and applicationState=REVIEW_AND_SUBMIT_PENDING
+    """
+    resp = session.post(
+        GRAPHQL_URL,
+        headers={**HEADERS_BASE, "Content-Type": "application/json"},
+        json={
+            "operationName": "queryApplicationsByBBCandidateIdV2",
+            "variables": {
+                "locale": locale,
+                "bbCandidateId": candidate_id
+            },
+            "query": QUERY_APPLICATIONS_V2
+        },
+        timeout=15
+    )
+    resp.raise_for_status()
+
+    data = resp.json()
+    all_apps = (
+        data.get("data", {})
+        .get("queryApplicationsByBBCandidateIdV2", {})
+        .get("applications", [])
+    )
+
+    # Filter to only pending submit applications
+    pending = [
+        app for app in all_apps
+        if not app.get("submitted", True)
+        and app.get("active", False)
+        and app.get("applicationState") in [
+            "REVIEW_AND_SUBMIT_PENDING",
+            "NHE_APPOINTMENT_SELECTED",
+            "ASSESSMENT_PASSED",
+        ]
+    ]
+
+    logger.info(
+        f"Found {len(all_apps)} total apps, "
+        f"{len(pending)} pending submit"
+    )
+    return pending
+
+
+def extract_ids_from_app(app: dict) -> dict:
+    """
+    Extract all IDs needed for submission from application object.
+    Uses multiple fallback sources since data can be in different fields.
+    """
+    application_id = app.get("applicationId", "")
+
+    # jobId — try multiple sources
+    job_id = (
+        app.get("jobDetail", {}).get("jobId")
+        or app.get("jobData", {}).get("jobId")
+        or ""
+    )
+
+    # scheduleId — try multiple sources
+    schedule_id = (
+        app.get("scheduleInfo", {}).get("scheduleId")
+        or app.get("jobData", {}).get("scheduleId")
+        or app.get("sfShift", {}).get("shiftCode")
+        or ""
+    )
+
+    # Pay info
+    pay = (
+        app.get("scheduleInfo", {}).get("basePay")
+        or app.get("jobData", {}).get("basePay")
+        or app.get("applicationLevelPayRate")
+        or 0
+    )
+
+    # Location
+    city = (
+        app.get("scheduleInfo", {}).get("city")
+        or app.get("jobDetail", {}).get("city")
+        or app.get("jobData", {}).get("city")
+        or "Unknown"
+    )
+
+    # Job title
+    title = (
+        app.get("scheduleInfo", {}).get("externalJobTitle")
+        or app.get("jobDetail", {}).get("jobTitle")
+        or "Warehouse Operative"
+    )
+
+    # Shift time
+    start_time = (
+        app.get("scheduleInfo", {}).get("startTime")
+        or app.get("sfShift", {}).get("startTime")
+        or ""
+    )
+
+    return {
+        "applicationId": application_id,
+        "jobId": job_id,
+        "scheduleId": schedule_id,
+        "pay": pay,
+        "city": city,
+        "title": title,
+        "startTime": start_time,
+        "applicationState": app.get("applicationState", ""),
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# SUBMIT FLOW
+# ─────────────────────────────────────────────────────────
+
+def get_csrf_token(session: requests.Session) -> str:
+    resp = session.get(
+        f"{BASE_URL}/authorize/api/csrf?countryCode=UK",
+        headers=HEADERS_BASE,
+        timeout=10
+    )
+    resp.raise_for_status()
+    return resp.json().get("token", "")
+
+
+def authorize(session: requests.Session, amazon_token: str) -> dict:
+    resp = session.post(
+        f"{BASE_URL}/authorize/api/authorize?countryCode=UK",
+        headers={**HEADERS_BASE, "Content-Type": "application/json"},
+        json={
+            "redirectUrl": "www.jobsatamazon.co.uk",
+            "token": amazon_token
+        },
+        timeout=10
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def update_workflow_step(
+    session: requests.Session,
+    application_id: str,
+    csrf_token: str
+) -> bool:
+    try:
+        resp = session.put(
+            f"{BASE_URL}/application/api/candidate-application"
+            f"/update-workflow-step-name",
+            headers={
+                **HEADERS_BASE,
+                "Content-Type": "application/json;charset=UTF-8",
+                "x-csrf-token": csrf_token,
+            },
+            json={
+                "applicationId": application_id,
+                "workflowStepName": "review-submit"
+            },
+            timeout=10
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        logger.error(f"Workflow update failed: {e}")
+        return False
+
+
+def submit_application(
+    session: requests.Session,
+    ids: dict,
+    csrf_token: str
+) -> bool:
+    """
+    Submit with multiple payload variants.
+    Tries minimal first, then extended.
+    """
+    application_id = ids["applicationId"]
+    job_id = ids["jobId"]
+    schedule_id = ids["scheduleId"]
+
+    headers = {
+        **HEADERS_BASE,
+        "Content-Type": "application/json;charset=UTF-8",
+        "x-csrf-token": csrf_token,
+        "Referer": (
+            f"{BASE_URL}/application/uk/"
+            f"?applicationId={application_id}"
+            f"&jobId={job_id}"
+            f"#/review-submit"
+        )
+    }
+
+    # Payload variants to try
+    payloads = [
+        # Variant 1: minimal
+        {"applicationId": application_id},
+        # Variant 2: with jobId
+        {"applicationId": application_id, "jobId": job_id},
+        # Variant 3: full
+        {
+            "applicationId": application_id,
+            "jobId": job_id,
+            "scheduleId": schedule_id
+        },
+    ]
+
+    for i, payload in enumerate(payloads, 1):
+        try:
+            resp = session.post(
+                f"{BASE_URL}/application/api/candidate-application"
+                f"/submit-application",
+                headers=headers,
+                json=payload,
+                timeout=15
+            )
+            if resp.status_code == 200:
+                logger.info(f"✅ Submitted (variant {i})")
+                return True
+            elif resp.status_code == 403:
+                logger.error("❌ WAF blocked — need Playwright")
+                return False
+            logger.warning(f"Variant {i}: {resp.status_code}")
+        except Exception as e:
+            logger.error(f"Submit variant {i} error: {e}")
+
+    return False
+
+
+def verify_submission(
+    session: requests.Session,
+    application_id: str,
+    candidate_id: str
+) -> bool:
+    """Verify by re-querying applications list"""
+    try:
+        resp = session.get(
+            f"{BASE_URL}/selfservice/api/schedule/details"
+            f"/application/{application_id}",
+            headers=HEADERS_BASE,
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            submitted = (
+                data.get("legacyStatus") == "APPLICATION_SUBMITTED"
+            )
+            logger.info(
+                f"Verify: {data.get('legacyStatus')} "
+                f"→ submitted={submitted}"
+            )
+            return submitted
+    except Exception as e:
+        logger.warning(f"Primary verify failed: {e}")
+
+    # Fallback: re-query applications
+    try:
+        resp = session.post(
+            GRAPHQL_URL,
+            headers={**HEADERS_BASE, "Content-Type": "application/json"},
+            json={
+                "operationName": "queryApplicationsByBBCandidateIdV2",
+                "variables": {
+                    "locale": "en-GB",
+                    "bbCandidateId": candidate_id
+                },
+                "query": QUERY_APPLICATIONS_V2
+            },
+            timeout=15
+        )
+        apps = (
+            resp.json()
+            .get("data", {})
+            .get("queryApplicationsByBBCandidateIdV2", {})
+            .get("applications", [])
+        )
+        for app in apps:
+            if app.get("applicationId") == application_id:
+                return app.get("submitted", False)
+    except Exception as e:
+        logger.warning(f"Fallback verify failed: {e}")
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────
+# MAIN SMART AUTO-SUBMIT
+# ─────────────────────────────────────────────────────────
+
+def smart_auto_submit(
+    cookies: dict,
+    amazon_token: str,
+    candidate_id: str,
+    target_application_id: Optional[str] = None
+) -> list:
+    """
+    Smart auto-submit using V2 applications query.
+
+    Args:
+        cookies:              Amazon session cookies
+        amazon_token:         JWT auth token
+        candidate_id:         bbCandidateId (UUID)
+        target_application_id: Submit specific app, or None = all pending
+
+    Returns:
+        List of results:
+        [{"applicationId": "...", "success": True/False, 
+          "title": "...", "city": "...", "error": None}]
+    """
+    session = requests.Session()
+    session.cookies.update(cookies)
+    results = []
+
+    try:
+        # Step 1: Auth
+        csrf = get_csrf_token(session)
+        time.sleep(0.3)
+
+        auth = authorize(session, amazon_token)
+        if not auth.get("isValid"):
+            return [{"success": False, "error": "Auth failed"}]
+        time.sleep(0.3)
+
+        # Step 2: Get all pending applications
+        pending = get_pending_applications(session, candidate_id)
+
+        if not pending:
+            logger.info("No pending applications to submit")
+            return [{"success": False, "error": "No pending applications"}]
+
+        # Filter to specific app if requested
+        if target_application_id:
+            pending = [
+                a for a in pending
+                if a.get("applicationId") == target_application_id
+            ]
+
+        logger.info(f"Processing {len(pending)} application(s)")
+
+        # Step 3: Submit each pending application
+        for app in pending:
+            ids = extract_ids_from_app(app)
+            app_id = ids["applicationId"]
+
+            logger.info(
+                f"Submitting: {ids['title']} in {ids['city']} "
+                f"(£{ids['pay']}/hr)"
+            )
+
+            try:
+                # Update workflow step
+                update_workflow_step(session, app_id, csrf)
+                time.sleep(0.8)
+
+                # Submit
+                success = submit_application(session, ids, csrf)
+                time.sleep(1)
+
+                # Verify
+                if success:
+                    confirmed = verify_submission(
+                        session, app_id, candidate_id
+                    )
+                else:
+                    confirmed = False
+
+                results.append({
+                    "applicationId": app_id,
+                    "jobId": ids["jobId"],
+                    "scheduleId": ids["scheduleId"],
+                    "title": ids["title"],
+                    "city": ids["city"],
+                    "pay": ids["pay"],
+                    "startTime": ids["startTime"],
+                    "success": confirmed,
+                    "error": None if confirmed else "Submit failed"
+                })
+
+            except Exception as e:
+                logger.error(f"Failed {app_id}: {e}")
+                results.append({
+                    "applicationId": app_id,
+                    "title": ids.get("title", "Unknown"),
+                    "city": ids.get("city", "Unknown"),
+                    "success": False,
+                    "error": str(e)
+                })
+
+            time.sleep(1)  # Delay between applications
+
+    except Exception as e:
+        logger.error(f"Smart auto-submit failed: {e}")
+        results.append({"success": False, "error": str(e)})
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────
+# BOT INTEGRATION
+# ─────────────────────────────────────────────────────────
+
+async def handle_smart_auto_submit(bot, subscriber: dict):
+    """
+    Called from bot polling loop for auto-submit tier subscribers.
+    Checks for pending applications and submits them automatically.
+
+    subscriber = {
+        "chat_id": "123456",
+        "candidate_id": "48de4e40-39d2-11f1-...",
+        "amazon_cookies": {...},
+        "amazon_token": "eyJ...",
+        "tier": "auto_submit"
+    }
+    """
+    chat_id = subscriber["chat_id"]
+    candidate_id = subscriber.get("candidate_id", "")
+    cookies = subscriber.get("amazon_cookies", {})
+    token = subscriber.get("amazon_token", "")
+
+    if not all([candidate_id, cookies, token]):
+        return
+
+    import asyncio
+    results = await asyncio.to_thread(
+        smart_auto_submit,
+        cookies,
+        token,
+        candidate_id
+    )
+
+    for result in results:
+        if result.get("success"):
+            await bot.send_message(
+                chat_id=int(chat_id),
+                text=(
+                    f"🤖 *Auto-Submitted!*\n\n"
+                    f"✅ {result['title']}\n"
+                    f"📍 {result['city']}\n"
+                    f"💰 £{result.get('pay', 'N/A')}/hr\n"
+                    f"🕐 {result.get('startTime', 'N/A')}\n\n"
+                    f"Check your Amazon Jobs account for next steps."
+                ),
+                parse_mode="Markdown"
+            )
+        elif result.get("error") != "No pending applications":
+            await bot.send_message(
+                chat_id=int(chat_id),
+                text=(
+                    f"⚠️ Auto-submit failed for "
+                    f"{result.get('title', 'a job')}\n"
+                    f"Error: {result.get('error', 'Unknown')}\n\n"
+                    f"Please apply manually at jobsatamazon.co.uk"
+                ),
+                parse_mode="Markdown"
+            )
