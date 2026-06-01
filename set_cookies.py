@@ -1,0 +1,20 @@
+import json
+
+cookies = [
+    {"name": "HVH_ACCESS_TOKEN", "value": "AQICAHgRVX6yB5HaOXG%2F6jWEErD4AnJUVlc3se%2B5PoiAFFV3IgFYMyi27oIC6%2FCqKRE2acZ%2FAAAEkzCCBI8GCSqGSIb3DQEHBqCCBIAwggR8AgEAMIIEdQYJKoZIhvcNAQcBMB4GCWCGSAFlAwQBLjARBAxIIVGOgywe7GFNMRYCARCAggRGyGSyh%2FpflI9g63HcX5WojqjBmba%2FrR1YFaKFwVO%2FOswTFKevbQ95flLy%2BaoS%2BgWdEqOPFFKVGB6p7ejOuLSYKkK6roqbUE9joB%2Bxdu1nnn4xXMZnyMD%2BK1AdpZkre8NK%2BSeJBLLPCeFsIYnAZtDQ1R7bLNaKEn2UkM39LrF8WOiL1R%2Bn83cGQKbs3JqE73rppmVtPY7bbygPQu1Wv6cD7cWb51TTsm7ttv0amD%2B6T4gFMFdWdEgJbYyi6QiHaVZN%2Fa66pcQ4i0OEgtZJsO1d%2FGD6cHSblRdcKWzH4bc8iMxw5kfkSejuR0qgHOj9ZJY5OL05HA8GaHULKrQFlmdLGv2WanG%2BjFf7yFUdn2FcuzVwJxwHo1sAiYcG%2BJdpF61Z3Qlngd5PiG8oIPYmga3IbABrIy67%2BPGNJObhJwpePkIjYmLzQ8oEiaZ5wNTzWKC7olTSMeCx%2Ba0IMBkoMztGQlXziBU82LXhTYLynoQT9RKELDgc4rdwamKQL7d2L0h3VqZt71yXbO2VflfTcOC%2FW7lxqXpil0APTq8RZy872qtzEsi7ALusDGl%2FzmzCymFy2tV%2FDwcgvKifTAqQz7TuN9KK89EXCePSon7kmNi28xom%2FhRfSEITaqkNVOyyhc23vMyge52haxNmSTOaDSzpbvNmW3tThjUXB18p5aNTXhbdlQZ36%2FvqTR3aRaNtuJJilaSSaz1vql8nbO5%2B5K7X251mlN%2B5hgaN0X5m1RA6PxoS%2BkLS4mCNONbK5pmOMB5i%2FbJoAYEIY2sVaOjEWGwQSqaRr1bLKz7S6XXWM0utu6GMNIHoNReRGCz6K4EMRi6ZKLyvm6ORT6DJSiWB5jo6ruzWLXOnXN8KFKLbXHQlnBqh%2FJ3bbcITVIWO4b4NGR9Tw43Fa1k5DFpBDoDAQ45emVne%2F8Z8JsyzsIsUGLeyuBFbfp%2FuFcTtYQZbFlWEwTWeDONwEiVKa9n3vq70c4uCIcXTlcxhxghSxAkfM%2B2%2F%2Bmlm%2FD6zQ5qCImNOR0SF8cSs%2BQq4LtVCmX4lZA7x%2F2dWDL8HmU5fpLbizTWnKtdPhAD3lB0uzEDvvLKmc8OVNeyMYdz8lbCFwzks2vnhYdwzz%2BsxHtL4rPndjbh1jgBaX4MbIQmJXSW%2FdDUKUwrCCwbQU%2FENhLS5QoEvtK%2BGfV5VGp5mTF2DK0vXeAw9bxu4h1R3QwPPzI6PKgFj8JPfRh3V7FboznYbL4AH9H8Z81ZZz%2FAf4Y2jao4ViR4qSS5oQeadNJOefv%2FevEqIQZ9B4UWZNGMgnq50l4jZbPItNMMle2FFv025Ml2fgJWFvuket2xDXEAFKJC%2F6%2BU%2FMIhUOxfqFvR5MNeU0cqYaak%2FwfzPx%2FR2ri5Tfs19Va9t8NERTTU4l8hKsGd4Il88zChIqs0LJdjM4QbPB6PxjkxvN5DRpvQuJsPXH5nVpwkvQUgAhTJOkN9qLFo%3D"},
+    {"name": "hvhcid", "value": "b5868b60-5d4b-11f1-a344-b9e3a6ec5260"},
+    {"name": "aws-waf-token", "value": "12ae8f8b-7b91-4c30-9186-954df2eb401e:CwoAgocG0kUDAAAA:xoaYI2EeqT5CP82rR2sgOxnt4dpKL8uzJPAwpv41fzZVeMzy5oXo5Xb6US2GAX3WArQavP2ekeM/Q+S1027EoFS5Q5edbO2tq/1DdHScSM8Nhgt+f6MzbGJVYBmN9NmM3fiOIrO+gbaZeYGbB/N8OQKUriS4/bTMvcnKaN7SMbDkUI9tfpZ6/Q+3lkO5lWD7miekohwQRxgWEiH++EsJ+J7+/JzEcWiiekawnL5WVUFLytyJLI2N0p7q1z+nTT27Ng/71VYpWjc="},
+    {"name": "JSESSIONID", "value": "09DDFEEC80FD51A79B761DDA1D58D99D"}
+]
+
+env_path = "/home/ubuntu/Job-Alert/.env"
+with open(env_path, "r") as f:
+    content = f.read()
+
+cookies_line = "AMAZON_COOKIES=" + json.dumps(cookies)
+lines = [l for l in content.splitlines() if not l.startswith("AMAZON_COOKIES")]
+content = "\n".join(lines) + "\n" + cookies_line + "\n"
+
+with open(env_path, "w") as f:
+    f.write(content)
+print("Cookies written OK")
