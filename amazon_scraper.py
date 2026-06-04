@@ -54,6 +54,22 @@ SEARCH_RESULT_KEYS = (
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=45, connect=12)
 RAW_DEBUG_DIR = Path("data/debug")
 
+# ── WAF evasion: rotate on every outbound request ─────────────────────────────
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+_ACCEPT_LANGUAGES = [
+    "en-GB,en;q=0.9",
+    "en-GB,en;q=0.9,en-US;q=0.8",
+    "en-GB,en-US;q=0.9,en;q=0.8",
+]
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass(frozen=True)
 class CapturedGraphQL:
@@ -288,6 +304,11 @@ class AmazonScanner:
 
         session = await self.get_session()
         headers = clean_headers(captured.headers)
+        headers.setdefault("accept", "application/json")
+        headers.setdefault("content-type", "application/json")
+        headers.setdefault("origin", "https://www.jobsatamazon.co.uk")
+        headers.setdefault("referer", "https://www.jobsatamazon.co.uk/")
+
         all_cards: list[dict[str, Any]] = []
         next_token: Optional[str] = None
 
@@ -461,6 +482,10 @@ async def trigger_search_loading(page: Page) -> None:
 
 
 def clean_headers(headers: dict[str, str]) -> dict[str, str]:
+    """
+    Strip hop-by-hop / pseudo headers and rotate User-Agent + Accept-Language
+    on every call to reduce WAF fingerprint consistency.
+    """
     blocked = {
         "content-length",
         "host",
@@ -471,7 +496,13 @@ def clean_headers(headers: dict[str, str]) -> dict[str, str]:
         ":scheme",
         ":authority",
     }
-    return {k: v for k, v in dict(headers).items() if k.lower() not in blocked}
+    cleaned = {k: v for k, v in dict(headers).items() if k.lower() not in blocked}
+
+    # Rotate on every request — WAFs flag identical UA strings hammering one endpoint
+    cleaned["user-agent"] = random.choice(_USER_AGENTS)
+    cleaned["accept-language"] = random.choice(_ACCEPT_LANGUAGES)
+
+    return cleaned
 
 
 def looks_like_search_body(body: str) -> bool:
@@ -596,28 +627,44 @@ def extract_next_token(data: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def patch_search_payload(body_json: dict[str, Any], next_token: Optional[str] = None) -> dict[str, Any]:
+def patch_search_payload(
+    body_json: dict[str, Any],
+    next_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Patch the captured GraphQL payload before replay.
+
+    KEY FIX: orFilters was previously set to bonus/featured only (via setdefault),
+    which excluded ~95% of real warehouse shifts. Now explicitly cleared to []
+    so all job types are returned. The parser (job_parser.py) handles filtering.
+
+    Also preserves the original variable key (searchJobRequest / input / request)
+    rather than always overwriting to searchJobRequest.
+    """
     payload = copy.deepcopy(body_json)
     variables = payload.setdefault("variables", {})
 
-    search_req = (
-        variables.get("searchJobRequest")
-        or variables.get("input")
-        or variables.get("request")
-        or {}
-    )
+    # Preserve whichever key the original request used
+    if "searchJobRequest" in variables:
+        req_key = "searchJobRequest"
+    elif "input" in variables:
+        req_key = "input"
+    elif "request" in variables:
+        req_key = "request"
+    else:
+        req_key = "searchJobRequest"
+        variables[req_key] = {}
 
-    # ── Core fields ───────────────────────────────────────
+    search_req = variables[req_key]
+
+    # ── Core fields ───────────────────────────────────────────────────────────
     search_req["locale"] = "en-GB"
-    search_req["country"] = "United Kingdom"  # FIXED: was "GBR"
+    search_req["country"] = "United Kingdom"
     search_req["keyWords"] = ""
     search_req["pageSize"] = PAGE_SIZE
 
-    # ── CONFIRMED geoQueryClause from HAR analysis ────────
-    # Old wrong approach used top-level lat/lng/radius.
-    # Confirmed correct structure is nested geoQueryClause.
+    # ── Geo clause (only inject if not already present from browser capture) ──
     if "geoQueryClause" not in search_req:
-        # Only inject if not already present from browser capture
         search_req["geoQueryClause"] = {
             "lat": search_req.pop("lat", 52.4862),
             "lng": search_req.pop("lng", -1.8904),
@@ -625,21 +672,23 @@ def patch_search_payload(body_json: dict[str, Any], next_token: Optional[str] = 
             "distance": search_req.pop("radius", search_req.pop("distance", 30)),
         }
 
-    # ── CONFIRMED filters from HAR analysis ──────────────
-    search_req.setdefault("containFilters", [
+    # ── Filters ───────────────────────────────────────────────────────────────
+    # FIXED: was setdefault(orFilters, [bonusJob, featuredJob]) which:
+    #   1. Never overrode browser-captured orFilters (even empty [])
+    #   2. When it did apply, limited to bonus/featured only — ~95% of real
+    #      warehouse shifts excluded, causing persistent 0 jobs in logs.
+    # Now hard-assigned to [] so all job types pass through to the parser.
+    search_req["containFilters"] = [
         {"key": "isPrivateSchedule", "val": ["true", "false"]}
-    ])
-    search_req.setdefault("orFilters", [
-        {"key": "bonusJob", "val": ["true"]},
-        {"key": "featuredJob", "val": ["true"]}
-    ])
-    search_req.setdefault("equalFilters", [])
-    search_req.setdefault("rangeFilters", [])
-    search_req.setdefault("dateFilters", [])
+    ]
+    search_req["orFilters"] = []
+    search_req["equalFilters"] = []
+    search_req["rangeFilters"] = []
+    search_req["dateFilters"] = []
     search_req.setdefault("sorters", [])
     search_req.setdefault("consolidateSchedule", True)
 
-    # ── Pagination ────────────────────────────────────────
+    # ── Pagination ────────────────────────────────────────────────────────────
     if next_token:
         search_req["nextToken"] = next_token
         search_req["nextPageToken"] = next_token
@@ -647,7 +696,7 @@ def patch_search_payload(body_json: dict[str, Any], next_token: Optional[str] = 
         search_req.pop("nextToken", None)
         search_req.pop("nextPageToken", None)
 
-    variables["searchJobRequest"] = search_req
+    variables[req_key] = search_req
     return payload
 
 
